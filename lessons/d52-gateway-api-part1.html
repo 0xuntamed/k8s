@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 52 · Gateway API 1: GatewayClass, Gateway & Routes · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d52" data-root="../" data-related="d49,d53,d39">
+<article class="lesson">
+<p class="lead">Ingress has two structural problems: everything beyond host/path routing lives in controller-specific annotations, and one object mixes the infrastructure operator's concerns (which load balancer, which ports, which certs) with the developer's (which path goes where). The <strong>Gateway API</strong> — GA since 2023, in the CKA curriculum since 2025 — splits those into three resources with clear owners, and specifies matching, header manipulation, traffic splitting and more in the API itself. This lesson is the model; Day 53 runs it with NGINX Gateway Fabric.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Why Ingress reached its limits</li>
+<li>The role-oriented model: GatewayClass (provider), Gateway (infra), HTTPRoute (app)</li>
+<li>Listeners, hostnames, parentRefs, matches, filters, backendRefs</li>
+<li>Cross-namespace attachment and ReferenceGrant</li>
+<li>The other route kinds (GRPCRoute, TCPRoute, TLSRoute, UDPRoute) and the implementation landscape</li>
+</ul></div>
+
+<h2>What Ingress cannot express</h2>
+<ul>
+<li>Header- or method-based routing, traffic splitting by weight (canary), request/response header modification, redirects and rewrites — all only via annotations that differ per controller.</li>
+<li>Non-HTTP: TCP/UDP/TLS passthrough have no Ingress representation.</li>
+<li>Roles: the same object holds the cert reference and LB config (platform team) and the routes (app team). RBAC cannot separate them.</li>
+<li>Cross-namespace: an Ingress can only point at Services in its own namespace.</li>
+</ul>
+
+<h2>Three resources, three owners</h2>
+<figure data-anim="gateway-model"></figure>
+<dl class="kv">
+<dt>GatewayClass (cluster-scoped)</dt><dd>Names an implementation, like IngressClass: <code>controllerName: gateway.nginx.org/nginx-gateway-controller</code>. Installed by whoever installs the controller. Owner: <em>infrastructure provider</em>.</dd>
+<dt>Gateway (namespaced)</dt><dd>An actual entry point: "a load balancer of class X with these <strong>listeners</strong> (port, protocol, hostname, TLS cert), accepting routes from these namespaces". Creating one makes the implementation provision the data plane (an LB, or proxy Pods). Owner: <em>cluster/platform operator</em>.</dd>
+<dt>HTTPRoute (namespaced)</dt><dd>Routing rules that <strong>attach</strong> to a Gateway (<code>parentRefs</code>) for some hostnames: matches on path/header/method/query → filters → backend Services with weights. Owner: <em>application developer</em>, in their own namespace.</dd>
+</dl>
+
+<h3>GatewayClass</h3>
+<pre><code class="lang-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller</code></pre>
+
+<h3>Gateway</h3>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main
+  namespace: infra
+spec:
+  gatewayClassName: nginx
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All              # Same (default) · All · Selector
+  - name: https
+    protocol: HTTPS
+    port: 443
+    hostname: "*.example.com"
+    tls:
+      mode: Terminate          # or Passthrough (TLSRoute)
+      certificateRefs:
+      - name: wildcard-tls     # kubernetes.io/tls Secret in infra
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels: {gateway-access: "true"}
+  # addresses: [{type: IPAddress, value: 203.0.113.7}]   # request a specific IP if supported</code></pre>
+<ul class="notes">
+<li><b>listeners[]</b> — one per port/protocol/hostname combination. Each has a name that routes can target with <code>sectionName</code>.</li>
+<li><b>tls</b> — certs belong to the Gateway (platform), not the route (app). <code>Terminate</code> decrypts; <code>Passthrough</code> forwards raw TLS to backends by SNI.</li>
+<li><b>allowedRoutes</b> — which namespaces may attach routes. This is the multi-tenancy control Ingress lacks.</li>
+<li><b>status.addresses</b> — filled in by the implementation with the LB IP/hostname; <code>status.listeners[].attachedRoutes</code> counts routes.</li>
+</ul>
+</div>
+
+<h3>HTTPRoute</h3>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop
+  namespace: shop
+spec:
+  parentRefs:
+  - name: main
+    namespace: infra
+    sectionName: https        # attach to one listener (optional)
+  hostnames: [shop.example.com]
+  rules:
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+      headers:
+      - name: X-Version
+        value: v2
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        add: [{name: X-Gateway, value: main}]
+    backendRefs:
+    - name: api-v2
+      port: 8080
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+    backendRefs:
+    - name: api
+      port: 8080
+      weight: 90
+    - name: api-canary
+      port: 8080
+      weight: 10
+  - matches:
+    - path: {type: PathPrefix, value: /old}
+    filters:
+    - type: RequestRedirect
+      requestRedirect: {path: {type: ReplacePrefixMatch, replacePrefixMatch: /new}, statusCode: 301}
+  - matches:
+    - path: {type: PathPrefix, value: /}
+    backendRefs:
+    - name: web
+      port: 80</code></pre>
+<ul class="notes">
+<li><b>parentRefs</b> — the Gateway(s) to attach to, possibly in another namespace. Attachment succeeds only if the Gateway allows this namespace; check <code>status.parents[].conditions</code> (Accepted, ResolvedRefs).</li>
+<li><b>hostnames</b> — must intersect the listener's hostname; the route only applies to these.</li>
+<li><b>matches[]</b> — path (<code>Exact</code>, <code>PathPrefix</code>, <code>RegularExpression</code>), headers, query params, method. Multiple matches in one rule are OR; conditions within a match are AND. Precedence is specified: longest path, then most headers/query, then… — no controller-specific surprises.</li>
+<li><b>filters[]</b> — <code>RequestHeaderModifier</code>, <code>ResponseHeaderModifier</code>, <code>RequestRedirect</code>, <code>URLRewrite</code>, <code>RequestMirror</code>, <code>ExtensionRef</code> (implementation CRDs).</li>
+<li><b>backendRefs[]</b> — Services with optional <b>weight</b> for traffic splitting. Cross-namespace refs require a ReferenceGrant in the target namespace.</li>
+</ul>
+</div>
+
+<h2>Cross-namespace and ReferenceGrant</h2>
+<p>A route in <code>shop</code> may attach to a Gateway in <code>infra</code> if the Gateway's <code>allowedRoutes</code> permits it — the <em>target</em> decides. For a route to send traffic to a Service in <em>another</em> namespace, that namespace must publish a <strong>ReferenceGrant</strong> saying "HTTPRoutes from namespace X may reference my Services". Same for a Gateway referencing a TLS Secret in another namespace. Nothing can reach into a namespace without that namespace's consent.</p>
+<pre><code class="lang-yaml">apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-shop-routes
+  namespace: backend            # the namespace being referenced
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: shop
+  to:
+  - group: ""
+    kind: Service</code></pre>
+
+<h2>Other route kinds and the landscape</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Kind</th><th>For</th><th>Status</th></tr>
+<tr><td>HTTPRoute</td><td>HTTP/HTTPS (terminated)</td><td>GA</td></tr>
+<tr><td>GRPCRoute</td><td>gRPC by service/method</td><td>GA</td></tr>
+<tr><td>TLSRoute</td><td>TLS passthrough by SNI</td><td>Experimental channel</td></tr>
+<tr><td>TCPRoute / UDPRoute</td><td>L4 forwarding</td><td>Experimental channel</td></tr>
+</table></div>
+<p>Implementations: NGINX Gateway Fabric, Envoy Gateway, Istio, Cilium, Traefik, Kong, Contour, and every major cloud (AWS LB Controller, GKE Gateway, AKS AGC). The <em>Gateway API CRDs</em> are installed separately from the implementation (standard vs experimental channel), then the implementation registers its GatewayClass. Ingress is not deprecated, but new features land only in Gateway API; the <code>ingress2gateway</code> tool converts existing Ingresses.</p>
+
+<div class="callout mental"><div class="ct">Mental model</div><p>Ingress: "here is a routing table and, in annotations, whatever else this controller understands". Gateway API: "the platform owns the <em>door</em> (Gateway: address, ports, certs, who may use it); each team owns its <em>routes</em> through that door; the spec, not the vendor, defines what a route can do." Same data plane underneath — a proxy watching objects and reprogramming itself.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Expect to create an HTTPRoute for an existing Gateway: <code>parentRefs</code> (name + namespace), <code>hostnames</code>, <code>rules[].matches[].path</code>, <code>backendRefs</code> (name + port). Copy the skeleton from the docs.</li>
+<li>Route not working → <code>kubectl describe httproute</code>: <code>Accepted=False</code> (namespace not allowed / no such listener / hostname mismatch) or <code>ResolvedRefs=False</code> (Service missing / cross-namespace without ReferenceGrant).</li>
+<li><code>kubectl get gateway -o wide</code> shows ADDRESS and PROGRAMMED; <code>kubectl get gatewayclass</code> shows ACCEPTED.</li>
+</ul></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Gateway API = GatewayClass (which implementation) + Gateway (listeners, certs, address — platform-owned) + routes (matches, filters, weighted backends — app-owned).</li>
+<li>Routes attach via <code>parentRefs</code>; the Gateway controls which namespaces may attach; ReferenceGrant controls cross-namespace backends and Secrets.</li>
+<li>Matching precedence, header manipulation, redirects, rewrites, splitting and mirroring are in the spec — portable across implementations.</li>
+<li>HTTPRoute and GRPCRoute are GA; L4 routes are experimental. Ingress remains, but Gateway API is where features go.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.zone('z1', 20, 20, 680, 60, 'infrastructure provider')
+    + S.box('gc', 40, 32, 300, 36, ['GatewayClass nginx → controllerName gateway.nginx.org/…'], { fs: 9.5, cls: 'soft' })
+    + S.zone('z2', 20, 95, 680, 110, 'platform team · namespace infra')
+    + S.box('gw', 40, 118, 300, 74, ['Gateway main (class nginx)', 'listener http :80 · allowedRoutes: All', 'listener https :443 *.example.com · tls: wildcard-tls'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.box('addr', 380, 130, 300, 50, ['status.addresses: 203.0.113.7', 'provisioned data plane (LB / proxy pods)'], { subfs: 8.5, subcls: 'mono muted', hidden: true })
+    + S.zone('z3', 20, 220, 330, 110, 'app team · namespace shop') + S.zone('z4', 370, 220, 330, 110, 'app team · namespace billing')
+    + S.box('r1', 40, 245, 290, 70, ['HTTPRoute shop → parentRefs: infra/main', 'shop.example.com  /api → api:8080 (90) · api-canary (10)', '                  /    → web:80'], { subfs: 8, subcls: 'mono muted', hidden: true })
+    + S.box('r2', 390, 245, 290, 70, ['HTTPRoute billing → parentRefs: infra/main', 'billing.example.com  / → invoices:8080', 'header X-Debug → invoices-debug'], { subfs: 8, subcls: 'mono muted', hidden: true })
+    + S.arrow('a0', 190, 118, 190, 70, { cls: 'dashed' }) + S.arrow('a1', 190, 245, 190, 194, { cls: 'hid' }) + S.arrow('a2', 500, 245, 340, 170, { d: 'M 500 245 L 342 172', cls: 'hid' })
+    + S.text('m', 360, 345, '', { cls: 'sm b' });
+  Anim.define('gateway-model', { w: 720, h: 360, title: 'Role-oriented model', ms: 2800, svg, steps: [
+    { c: 'The implementation (NGINX Gateway Fabric, Envoy Gateway, a cloud) registers a <b>GatewayClass</b>. It is cluster-scoped and says which controller handles Gateways of this class.', on(q){ q('#gc rect').set('hl'); } },
+    { c: 'The platform team creates a <b>Gateway</b> in their own namespace: listeners for HTTP and HTTPS, the wildcard certificate, and which namespaces may attach routes. The controller provisions the data plane and writes the address to status.', on(q){ q('#gw rect').set('pur'); q('#addr').show(); q('#m').text('one entry point, owned by the platform'); } },
+    { c: 'The shop team creates an <b>HTTPRoute</b> in <code>shop</code> that attaches to <code>infra/main</code> for <code>shop.example.com</code>: path matches, a weighted canary split. They never touch certs, ports or the LB.', on(q){ q('#r1').show(); q('#a1').show().set('ok'); q('#m').text('routes attach to the door; the Gateway allowed namespace shop'); } },
+    { c: 'The billing team does the same in their namespace, with a header-based match. Both routes share one Gateway, one address, one certificate. RBAC: each team has rights to HTTPRoutes in their namespace only.', on(q){ q('#r2').show(); q('#a2').show().set('ok'); q('#m').text('multi-tenant by design'); } },
+    { c: 'If the Gateway said <code>allowedRoutes: Same</code>, both routes would show <code>Accepted=False</code>. If a route referenced a Service in another namespace, it would need that namespace\'s ReferenceGrant. Consent flows from the target.', on(q){ q('#m').text('attachment and references are permission-checked'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

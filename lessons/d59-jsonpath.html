@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 59 · JSONPath with kubectl · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d59" data-root="../" data-linux="l10" data-related="d09,d13">
+<article class="lesson">
+<p class="lead">Every <code>kubectl get</code> is a JSON document; <code>-o wide</code> and <code>describe</code> are just two views of it. <strong>JSONPath</strong> lets you pick any field, iterate lists, filter by condition and format the result — which is how you answer "which node is each Pod on", "list every image in the cluster", "which PVs are Released", or produce exactly the file an exam task asks for. Together with <code>--sort-by</code> and <code>custom-columns</code>, it turns kubectl into a query tool; where it runs out, <code>jq</code> takes over.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Reading the JSON first: <code>-o json</code> / <code>-o yaml</code> and the <code>.items[]</code> envelope</li>
+<li>JSONPath syntax: paths, <code>[*]</code>, <code>range</code>/<code>end</code>, filters <code>[?(@…)]</code>, escaping</li>
+<li><code>-o custom-columns</code> and <code>--sort-by</code> for tables</li>
+<li>Field selectors and label selectors vs JSONPath filters</li>
+<li>When to switch to <code>jq</code> / <code>yq</code>, with equivalents</li>
+</ul></div>
+
+<h2>Step 0: look at the JSON</h2>
+<pre><code class="lang-bash">$ kubectl get pod web -o json | head -30              # metadata, spec, status
+$ kubectl get pods -o json | jq '.items | length'      # a LIST: the pods are under .items[]
+$ kubectl get pod web -o yaml | grep -n nodeName       # find the path you want, then express it</code></pre>
+<p>Single object: paths start at the root (<code>.metadata.name</code>). A list (<code>get pods</code>, no name): paths start with <code>.items[*]</code>. Forgetting <code>.items</code> is the most common empty result.</p>
+
+<h2>JSONPath syntax</h2>
+<figure data-anim="jsonpath"></figure>
+<div class="tbl-wrap"><table>
+<tr><th>Expression</th><th>Meaning</th><th>Example</th></tr>
+<tr><td><code>{.a.b}</code></td><td>Field access</td><td><code>{.metadata.name}</code></td></tr>
+<tr><td><code>{.items[*].x}</code></td><td>Every element's x, space-separated</td><td><code>{.items[*].metadata.name}</code></td></tr>
+<tr><td><code>{.items[0]}</code> / <code>{.items[-1:]}</code></td><td>Index / slice</td><td><code>{.items[0].spec.nodeName}</code></td></tr>
+<tr><td><code>{range .items[*]}…{end}</code></td><td>Loop with a template per element</td><td><code>{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}</code></td></tr>
+<tr><td><code>{"\n"}</code>, <code>{"\t"}</code>, <code>{" "}</code></td><td>Literal text inside the template</td><td>separators</td></tr>
+<tr><td><code>[?(@.x=="y")]</code></td><td>Filter elements by a condition on the current element <code>@</code></td><td><code>{.items[?(@.status.phase=="Running")].metadata.name}</code></td></tr>
+<tr><td><code>[?(@.type=="Ready")]</code></td><td>Filter inside a nested list</td><td><code>{.status.conditions[?(@.type=="Ready")].status}</code></td></tr>
+<tr><td><code>{.metadata.labels.app}</code></td><td>Map key</td><td>labels, annotations</td></tr>
+<tr><td><code>{.metadata.labels.app\.kubernetes\.io/name}</code></td><td>Escape dots in keys with <code>\.</code></td><td>also <code>{.data.tls\.crt}</code></td></tr>
+<tr><td><code>{..name}</code></td><td>Recursive descent (every <code>name</code> at any depth) — rarely what you want</td><td></td></tr>
+<tr><td><code>{@}</code></td><td>The current object</td><td><code>{range .items[*]}{@.metadata.name}</code></td></tr>
+</table></div>
+<p>kubectl's JSONPath is Kubernetes' own implementation: no arithmetic, no functions, comparisons limited to <code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&gt;</code>, and <code>&&</code>/<code>||</code> unsupported in most versions. Wrap the whole expression in single quotes on the shell to protect <code>$</code>, <code>*</code>, <code>@</code>, and quotes.</p>
+
+<h2>Worked examples</h2>
+<pre><code class="lang-bash"># names only
+$ kubectl get pods -o jsonpath='{.items[*].metadata.name}'; echo
+# pod → node, one per line
+$ kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+# every image running in the cluster, unique
+$ kubectl get pods -A -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u
+# node internal IPs
+$ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+# nodes that are Ready
+$ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+# PVs by capacity — no arithmetic in jsonpath, so sort with --sort-by
+$ kubectl get pv --sort-by=.spec.capacity.storage -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.capacity.storage}{"\t"}{.status.phase}{"\n"}{end}'
+# the one field you need in a script
+$ TOKEN=$(kubectl get secret sa-token -o jsonpath='{.data.token}' | base64 -d)
+$ NODEPORT=$(kubectl get svc web -o jsonpath='{.spec.ports[0].nodePort}')
+$ kubectl get pod web -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'   # OOMKilled?
+# context / kubeconfig fields
+$ kubectl config view -o jsonpath='{.contexts[*].name}'
+$ kubectl config view -o jsonpath='{.contexts[?(@.name=="prod")].context.user}'
+# write to a file as an exam task might demand
+$ kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.osImage}' &gt; /opt/outputs/os.txt</code></pre>
+
+<h2>custom-columns and sort-by</h2>
+<pre><code class="lang-bash">$ kubectl get pods -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,IP:.status.podIP,IMAGE:.spec.containers[0].image'
+$ kubectl get pods -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,RESTARTS:.status.containerStatuses[0].restartCount'
+$ kubectl get pv -o custom-columns='NAME:.metadata.name,CAP:.spec.capacity.storage,CLAIM:.spec.claimRef.name' --sort-by=.spec.capacity.storage
+$ kubectl get pods -A --sort-by=.metadata.creationTimestamp | tail -5      # newest pods
+$ kubectl get events --sort-by=.lastTimestamp
+$ kubectl get pods -o custom-columns-file=cols.txt                          # reusable column definitions</code></pre>
+<p><code>custom-columns</code> uses the same path syntax without the outer braces and applies per item automatically (no <code>range</code>). <code>--sort-by</code> takes one path; it sorts numerically for numbers and quantities, lexically otherwise. <code>--no-headers</code> for scripts.</p>
+
+<h2>Selectors: filter on the server</h2>
+<pre><code class="lang-bash">$ kubectl get pods --field-selector status.phase=Running,spec.nodeName=worker-1     # only a few fields supported: metadata.name/namespace, status.phase, spec.nodeName, spec.restartPolicy…
+$ kubectl get events --field-selector type=Warning,involvedObject.kind=Pod
+$ kubectl get pods -l app=web,tier!=cache
+$ kubectl get pods -l 'env in (dev,staging)' --show-labels</code></pre>
+<p>Field and label selectors are evaluated by the API server (cheap, works with <code>-w</code>); JSONPath filters are evaluated by kubectl after fetching everything. Prefer selectors when they can express the condition.</p>
+
+<h2>When JSONPath runs out: jq and yq</h2>
+<pre><code class="lang-bash">$ kubectl get pods -A -o json | jq -r '.items[] | select(.status.containerStatuses[]?.restartCount &gt; 3) | "\(.metadata.namespace)/\(.metadata.name)"'
+$ kubectl get pods -o json | jq -r '.items[] | [.metadata.name, (.spec.containers | length)] | @tsv'
+$ kubectl get nodes -o json | jq '[.items[].status.allocatable.cpu] '           # arrays, math, grouping — jq has it all
+$ kubectl get pods -o json | jq -r '.items[] | select(.spec.containers[].resources.limits == null) | .metadata.name'   # pods without limits
+$ kubectl get deploy web -o yaml | yq '.spec.template.spec.containers[0].image'
+$ kubectl get cm app -o yaml | yq '.data."app.yaml"'                            # yq (mikefarah) for YAML, same idea</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Task</th><th>jsonpath</th><th>jq</th></tr>
+<tr><td>All names</td><td><code>{.items[*].metadata.name}</code></td><td><code>.items[].metadata.name</code></td></tr>
+<tr><td>Filter by field</td><td><code>{.items[?(@.status.phase=="Running")].metadata.name}</code></td><td><code>.items[] | select(.status.phase=="Running") | .metadata.name</code></td></tr>
+<tr><td>Count</td><td>—</td><td><code>.items | length</code></td></tr>
+<tr><td>Numeric compare / math</td><td>—</td><td><code>select(.restartCount &gt; 3)</code>, <code>add</code>, <code>group_by</code></td></tr>
+<tr><td>Nested filter</td><td><code>{.status.conditions[?(@.type=="Ready")].status}</code></td><td><code>.status.conditions[] | select(.type=="Ready") | .status</code></td></tr>
+</table></div>
+
+<div class="callout linux" data-ref="l10"><div class="ct">Under the hood · Linux</div><p>kubectl fetches the JSON over HTTPS and applies the template client-side — you can see the raw document with <code>kubectl get --raw /api/v1/pods | jq .</code>. Everything after that is text processing, and the Unix toolbox composes: <code>| tr ' ' '\n' | sort | uniq -c | sort -rn</code> for histograms, <code>| column -t</code> for alignment, <code>| tee file</code> to save and see, <code>| xargs -n1 kubectl delete pod</code> to act on the result. The <a href="../linux/l10-shell-toolkit.html">shell toolkit</a> page covers jq/yq/awk in depth.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Exam wording: "list … and save to /opt/x.txt" — use <code>-o jsonpath</code> or <code>custom-columns</code>, redirect, then <code>cat</code> the file to check. Match the requested format exactly (one per line? sorted?).</li>
+<li>"Sorted by X" → <code>--sort-by=.path</code>. It is available on <code>get</code> for any resource.</li>
+<li>Always <code>echo</code> after a jsonpath command — no trailing newline is emitted; add <code>{"\n"}</code> in templates.</li>
+<li>jq is usually installed on exam nodes, but do not depend on it: know <code>range</code>/<code>end</code> and <code>[?()]</code>.</li>
+<li>Find paths quickly with <code>kubectl get X -o yaml | grep -n field</code> or <code>kubectl explain X.spec.field</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx:1.26 --replicas=3 && kubectl create deploy api --image=nginx:1.27 --replicas=2
+$ kubectl get pods -o jsonpath='{.items[*].metadata.name}'; echo
+$ kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{" → "}{.spec.nodeName}{"\n"}{end}'
+$ kubectl get pods -o jsonpath='{.items[?(@.metadata.labels.app=="api")].spec.containers[0].image}'; echo
+$ kubectl get pods -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[0].image,NODE:.spec.nodeName' --sort-by=.spec.nodeName
+$ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.capacity.cpu}{" cpu\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' | column -t
+$ kubectl get pods -o json | jq -r '.items[] | "\(.metadata.name) \(.status.podIP)"'
+$ kubectl get pods -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort | uniq -c
+$ kubectl delete deploy web api</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Look at <code>-o json</code> first; lists live under <code>.items[]</code>.</li>
+<li>JSONPath: <code>{.path}</code>, <code>[*]</code>, <code>range…end</code> with <code>{"\n"}</code>, filters <code>[?(@.x=="y")]</code>, escape dots in keys.</li>
+<li><code>custom-columns</code> for tables, <code>--sort-by</code> for order, field/label selectors for server-side filtering.</li>
+<li>No math or counting in JSONPath — pipe to jq/yq/sort/uniq.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.term('doc', 20, 20, 330, 270, ['{ "items": [', '  { "metadata": {"name": "web-a"},', '    "spec": {"nodeName": "w1"},', '    "status": {"phase": "Running"} },', '  { "metadata": {"name": "web-b"},', '    "spec": {"nodeName": "w2"},', '    "status": {"phase": "Pending"} },', '  { "metadata": {"name": "api-c"},', '    "spec": {"nodeName": "w1"},', '    "status": {"phase": "Running"} }', ']}'], { fs: 9.5 })
+    + S.term('expr', 370, 20, 330, 60, ['-o jsonpath=', ''], { fs: 9.5 })
+    + S.term('out', 370, 100, 330, 120, ['output:', '', '', '', ''], { fs: 9.5 })
+    + S.text('m', 535, 260, '', { cls: 'sm b' });
+  const hl = (q, lines, c) => { for (let i = 0; i < 11; i++) q('#doc-l' + i).style('fill', lines.includes(i) ? (c || 'var(--green)') : 'var(--faint)'); };
+  const out = (q, lines) => { for (let i = 1; i <= 4; i++) q('#out-l' + i).text(lines[i - 1] || '').style('fill', 'var(--green)'); };
+  Anim.define('jsonpath', { w: 720, h: 280, title: 'JSONPath over a pod list', ms: 3200, svg, steps: [
+    { c: 'The document <code>kubectl get pods -o json</code> returns: a wrapper with <code>items</code>, one object per Pod. Every expression starts from here.', on(q){ hl(q, [0, 10], 'var(--accent)'); } },
+    { c: '<code>{.items[*].metadata.name}</code> — walk into items, take every element, pick its name. Results are space-separated.', on(q){ q('#expr-l1').text("'{.items[*].metadata.name}'").style('fill', 'var(--accent)'); hl(q, [1, 4, 7]); out(q, ['web-a web-b api-c']); } },
+    { c: '<code>{range .items[*]}{.metadata.name}{"\\t"}{.spec.nodeName}{"\\n"}{end}</code> — a template per element with literal separators. One line per Pod.', on(q){ q('#expr-l1').text("'{range .items[*]}{.metadata.name}{\"\\t\"}{.spec.nodeName}{\"\\n\"}{end}'"); hl(q, [1, 2, 4, 5, 7, 8]); out(q, ['web-a   w1', 'web-b   w2', 'api-c   w1']); } },
+    { c: '<code>{.items[?(@.status.phase=="Running")].metadata.name}</code> — a <b>filter</b>: keep elements where the condition on <code>@</code> (the element) holds, then pick the name.', on(q){ q('#expr-l1').text("'{.items[?(@.status.phase==\"Running\")].metadata.name}'"); hl(q, [1, 3, 7, 9]); out(q, ['web-a api-c']); q('#m').text('web-b is Pending → excluded'); } },
+    { c: '<code>{.items[?(@.spec.nodeName=="w1")].metadata.name}</code> — same shape, different field. Note: a label selector or <code>--field-selector spec.nodeName=w1</code> would do this server-side.', on(q){ q('#expr-l1').text("'{.items[?(@.spec.nodeName==\"w1\")].metadata.name}'"); hl(q, [1, 2, 7, 8]); out(q, ['web-a api-c']); q('#m').text('prefer --field-selector when it exists'); } },
+    { c: 'Counting, math, sorting inside the expression? Not in JSONPath. Pipe to <code>jq</code> (<code>.items | length</code>) or use <code>--sort-by</code> — or <code>custom-columns</code> for the same paths as a table.', on(q){ q('#expr-l1').text("-o json | jq '.items | map(select(.status.phase==\"Running\")) | length'"); hl(q, [3, 9]); out(q, ['2']); q('#m').text('jq for anything beyond selection'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 0 · Course Roadmap · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d00" data-root="../">
+<article class="lesson">
+<p class="lead">Kubernetes has a reputation for being hard. Most of that difficulty is <em>vocabulary</em> and <em>layering</em>: dozens of nouns that all depend on each other. This course removes the difficulty by teaching the layers in order — containers first, then the cluster, then everything that runs on it — and these notes go one layer lower still, to the Linux features that make each Kubernetes idea real.</p>
+
+<div class="objectives"><h4>This page covers</h4><ul>
+<li>What the CKA exam actually tests, and how the 60 lessons map to it</li>
+<li>How each lesson page on this site is structured</li>
+<li>A realistic study schedule and the lab environment you need</li>
+</ul></div>
+
+<h2>What the CKA is</h2>
+<p>The <strong>Certified Kubernetes Administrator</strong> (CKA) is a 2-hour, hands-on, terminal-only exam from the Linux Foundation / CNCF. There are no multiple-choice questions: you get SSH access to several real clusters and 15–20 tasks such as "create a Deployment with three replicas exposed on NodePort 30080", "the worker node is NotReady — fix it", or "upgrade the control plane to version X". You pass at 66%.</p>
+<p>The current curriculum weights the domains like this:</p>
+<div class="tbl-wrap"><table>
+<tr><th>Domain</th><th>Weight</th><th>Covered in</th></tr>
+<tr><td>Troubleshooting</td><td>30%</td><td>Modules 12 + everything before it (you cannot fix what you don't understand)</td></tr>
+<tr><td>Cluster Architecture, Installation & Configuration</td><td>25%</td><td>Modules 2, 8, 9, 12</td></tr>
+<tr><td>Services & Networking</td><td>20%</td><td>Modules 3, 11</td></tr>
+<tr><td>Workloads & Scheduling</td><td>15%</td><td>Modules 4, 5, 7, 9, 10</td></tr>
+<tr><td>Storage</td><td>10%</td><td>Module 6</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>The exam is open-book for <a href="https://kubernetes.io/docs/">kubernetes.io/docs</a> only. Speed comes from knowing the <em>shape</em> of every YAML object and generating skeletons with <code>kubectl ... --dry-run=client -o yaml</code>, not from memorising fields. Every lesson here shows the imperative shortcut next to the declarative manifest for that reason.</p></div>
+
+<h2>The road, module by module</h2>
+<div id="roadmap-anim"><figure data-anim="roadmap"></figure></div>
+<ol class="steps">
+<li><strong>Containers &amp; Docker (Days 1–5)</strong> Images, layers, Dockerfiles, CMD vs ENTRYPOINT, multi-stage builds. Kubernetes runs containers; if a container is a mystery, everything above it is too. The Linux track's <a href="../linux/l02-namespaces.html">Namespaces</a>, <a href="../linux/l03-cgroups.html">cgroups</a> and <a href="../linux/l04-filesystems-overlayfs.html">OverlayFS</a> pages belong here.</li>
+<li><strong>Kubernetes Core (Days 6–10)</strong> Why orchestration exists, the control-plane components, a local KIND cluster, YAML, ReplicaSets and Deployments.</li>
+<li><strong>Services, Networking Basics &amp; Namespaces (Days 11–14)</strong> How traffic reaches Pods and how a cluster is carved up.</li>
+<li><strong>Scheduling &amp; Resources (Days 15–20)</strong> Where Pods land and why; CPU/memory accounting; autoscaling.</li>
+<li><strong>Pod Design &amp; Lifecycle (Days 21–23)</strong> Multi-container patterns, what "restart" and "terminate" really mean, probes.</li>
+<li><strong>Storage (Days 24–27)</strong> Volumes from Docker to CSI-backed PersistentVolumes.</li>
+<li><strong>Configuration &amp; Workload Controllers (Days 28–29)</strong> ConfigMaps, Secrets, DaemonSets, Jobs, CronJobs.</li>
+<li><strong>Security (Days 30–38)</strong> The longest module: encryption from scratch, TLS, the PKI every cluster carries, kubeconfig, RBAC, ServiceAccounts, admission control.</li>
+<li><strong>Extending &amp; Packaging (Days 39–43)</strong> CRDs, Operators, Pod security, Kustomize, Helm.</li>
+<li><strong>Advanced Workloads (Days 44–46)</strong> StatefulSets, private registries, priority and preemption.</li>
+<li><strong>Networking Deep Dive (Days 47–53)</strong> NetworkPolicies, DNS/CoreDNS, Ingress on AWS, Gateway API.</li>
+<li><strong>Cluster Operations (Days 54–59)</strong> kubeadm install and upgrade, monitoring, control-plane and node troubleshooting, JSONPath.</li>
+</ol>
+
+<h2>How every lesson page is built</h2>
+<div class="grid-2">
+<div class="card"><h4>Concept first</h4><p>Plain-language explanation with a <em>mental model</em> box. Diagrams and animations wherever a process has more than two moving parts.</p></div>
+<div class="card"><h4>The YAML and the shortcut</h4><p>A complete manifest, annotated field by field, plus the imperative <code>kubectl</code> one-liner that generates it.</p></div>
+<div class="card"><h4>Under the hood · Linux</h4><p>An orange box tracing the Kubernetes feature to the kernel or userland mechanism (cgroups, netns, iptables, signals…), linking to the Linux track.</p></div>
+<div class="card"><h4>Exam tips, lab, takeaways</h4><p>What examiners like to ask, a lab you can do in 10 minutes on KIND, and a bulleted summary for revision.</p></div>
+</div>
+
+<h2>Lab environment</h2>
+<p>You need three things, all free:</p>
+<ul>
+<li><strong>Docker Desktop</strong> (or Docker Engine on Linux) for Days 1–5 and for KIND.</li>
+<li><strong>KIND</strong> ("Kubernetes in Docker") from Day 8 onward — a real multi-node cluster in seconds, thrown away just as fast.</li>
+<li><strong>Two or three VMs</strong> (VirtualBox/Multipass locally, or small cloud instances) for the kubeadm lessons in Module 12. Days 44 and 50–51 use Amazon EKS for realism; the concepts transfer to any cloud and the notes say what is cloud-specific.</li>
+</ul>
+<div class="callout tip"><div class="ct">Tip</div><p>Also bookmark <a href="https://killercoda.com/">killercoda.com</a> playgrounds and the official <a href="https://killer.sh/">killer.sh</a> simulator (two sessions are included with the exam registration). Use them for the troubleshooting module — breaking a real control plane is the only way to learn to fix one.</p></div>
+
+<h2>A schedule that works</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Pace</th><th>Plan</th></tr>
+<tr><td>Steady (6 weeks)</td><td>Two lessons per weekday, labs on the weekend, one full mock exam in weeks 5 and 6.</td></tr>
+<tr><td>Intensive (3 weeks)</td><td>Three lessons per day, lab the same evening, mock exams in the last four days.</td></tr>
+<tr><td>Reference only</td><td>Use <kbd>Ctrl</kbd> <kbd>K</kbd> search and the <a href="../cheatsheet.html">cheatsheet</a>; read the Linux track when a concept feels magical.</td></tr>
+</table></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>CKA is performance-based: practise in a terminal, not with flashcards.</li>
+<li>The course teaches bottom-up — containers → cluster → workloads → networking → security → operations. Follow the order the first time.</li>
+<li>When something feels like magic, it is a Linux feature you have not met yet. Follow the orange box.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const mods = [['Containers',1,5],['Core',6,10],['Services',11,14],['Scheduling',15,20],['Pods',21,23],['Storage',24,27],['Config',28,29],['Security',30,38],['Extend',39,43],['Adv.',44,46],['Network',47,53],['Ops',54,59]];
+  const colors = ['#0ea5e9','#2f6fe4','#0891b2','#7c3aed','#16a34a','#d97706','#db2777','#dc2626','#7c3aed','#0ea5e9','#0891b2','#dc2626'];
+  let svg = S.zone('base', 10, 200, 700, 60, 'Linux fundamentals: namespaces · cgroups · overlayfs · veth/iptables · signals · capabilities · DNS · TLS · systemd', {});
+  svg += S.text('bt', 360, 240, 'Every Kubernetes feature above is built on one of these', { cls: 'sm muted' });
+  const w = 54, gap = 4;
+  mods.forEach((m, i) => {
+    const x = 12 + i * (w + gap);
+    svg += `<g id="m${i}" style="opacity:.25"><rect class="nb" x="${x}" y="110" width="${w}" height="70" rx="8" style="stroke:${colors[i]}"/><text class="lb xs b" x="${x + w/2}" y="140">${m[0]}</text><text class="lb xs muted mono" x="${x + w/2}" y="158">D${m[1]}–${m[2]}</text></g>`;
+  });
+  svg += S.text('title', 360, 50, 'Day 0 → Day 59', { cls: 'lg b' });
+  svg += S.text('sub', 360, 72, '', { cls: 'sm muted' });
+  svg += S.arrow('arr', 30, 95, 690, 95, {});
+  const steps = mods.map((m, i) => ({ c: `<b>Module ${i + 1}: ${m[0]}</b> — Days ${m[1]}–${m[2]}. ${['Learn what a container is before orchestrating one.','The control plane, your first cluster, YAML, Deployments.','Services, imperative commands, Namespaces.','Steering the scheduler; requests, limits and autoscaling.','Multi-container patterns, lifecycle, probes.','From Docker volumes to PV/PVC/StorageClass.','ConfigMaps, Secrets, DaemonSets, Jobs, CronJobs.','Encryption, TLS, kubeconfig, RBAC, admission.','CRDs, Operators, Pod security, Kustomize, Helm.','StatefulSets, private images, priority.','NetworkPolicy, DNS, Ingress, Gateway API.','kubeadm, upgrades, monitoring, troubleshooting, JSONPath.'][i]}`, ms: 1700, on(q){ q(`#m${i}`).style('opacity','1'); q(`#m${i} rect`).add('hl'); if (i>0) q(`#m${i-1} rect`).rm('hl'); q('#sub').text(`Module ${i+1} of 12`); } }));
+  steps.push({ c: 'Twelve modules, one direction: containers → cluster → workloads → networking → security → operations. The orange band is the Linux track you can dip into at any point.', ms: 4000, on(q){ q('#m11 rect').rm('hl'); q('#base rect').add('hl'); } });
+  Anim.define('roadmap', { w: 720, h: 270, title: 'Roadmap', svg, steps });
+})();
+</script>
+</body>
+</html>

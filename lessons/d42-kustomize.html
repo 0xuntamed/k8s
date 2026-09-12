@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 42 · Kustomize · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d42" data-root="../" data-linux="l10" data-related="d09,d28,d43">
+<article class="lesson">
+<p class="lead">The same application runs in dev, staging and prod with a different namespace, replica count, image tag and ConfigMap — and you do not want three copies of every manifest. <strong>Kustomize</strong> solves this without templates: keep one <em>base</em> of plain YAML, and write small <em>overlays</em> that patch it. It is built into kubectl (<code>kubectl apply -k</code>), it never invents syntax inside your manifests, and the output is always plain YAML you can inspect before applying.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The <code>kustomization.yaml</code> file: resources, namespace, namePrefix, commonLabels, images, replicas</li>
+<li>Bases and overlays; how the directory layout expresses environments</li>
+<li>Patches: strategic merge and JSON 6902, and targeting by kind/name</li>
+<li>configMapGenerator / secretGenerator and the hash suffix that forces rollouts</li>
+<li><code>kubectl kustomize</code> to render, <code>apply -k</code> to deploy, and how it relates to Helm</li>
+</ul></div>
+
+<h2>The idea: base + overlays</h2>
+<figure data-anim="kustomize"></figure>
+<pre data-title="directory layout"><code>app/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── configmap.yaml
+└── overlays/
+    ├── dev/
+    │   ├── kustomization.yaml
+    │   └── replicas.yaml
+    └── prod/
+        ├── kustomization.yaml
+        ├── replicas.yaml
+        └── resources-patch.yaml</code></pre>
+
+<h2>The base</h2>
+<pre data-title="base/kustomization.yaml"><code class="lang-yaml">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:                # plain manifests (or other kustomizations / URLs)
+- deployment.yaml
+- service.yaml
+commonLabels:             # added to every object AND every selector — set once, never change
+  app.kubernetes.io/name: web
+configMapGenerator:
+- name: web-config
+  literals:
+  - LOG_LEVEL=info
+  files:
+  - app.properties       # key = filename</code></pre>
+<pre data-title="base/deployment.yaml"><code class="lang-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+      - name: web
+        image: ghcr.io/acme/web:1.0.0
+        envFrom:
+        - configMapRef: {name: web-config}     # kustomize will rewrite this to the hashed name
+        ports: [{containerPort: 8080}]</code></pre>
+
+<h2>An overlay</h2>
+<pre data-title="overlays/prod/kustomization.yaml"><code class="lang-yaml">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base                     # inherit everything
+namespace: prod                  # set metadata.namespace on all objects
+namePrefix: prod-                # web → prod-web (and fixes references: Service selectors, configMapRef…)
+commonAnnotations:
+  owner: platform-team
+images:                          # change image name/tag without touching the Deployment
+- name: ghcr.io/acme/web
+  newTag: 1.4.2
+replicas:                        # shortcut for the most common patch
+- name: web
+  count: 5
+configMapGenerator:
+- name: web-config
+  behavior: merge                # merge / replace / create
+  literals:
+  - LOG_LEVEL=warn
+patches:
+- path: resources-patch.yaml     # strategic merge patch (a partial object)
+- target:                        # JSON 6902 patch, targeted by kind/name/labels
+    kind: Deployment
+    name: web
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: ENV, value: prod}
+    - op: replace
+      path: /spec/strategy/rollingUpdate/maxUnavailable
+      value: 0</code></pre>
+<pre data-title="overlays/prod/resources-patch.yaml"><code class="lang-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web                      # matched by kind + name; only the fields below are merged in
+spec:
+  template:
+    spec:
+      containers:
+      - name: web                # lists of containers merge by "name" — that is the "strategic" part
+        resources:
+          requests: {cpu: 500m, memory: 512Mi}
+          limits: {cpu: "2", memory: 1Gi}</code></pre>
+
+<h2>Render, diff, apply</h2>
+<pre><code class="lang-bash">$ kubectl kustomize overlays/prod                # print the final YAML — always look first
+$ kubectl kustomize overlays/prod | grep -E 'name:|namespace:|image:|replicas:' | head
+$ kubectl diff -k overlays/prod                  # what would change in the cluster
+$ kubectl apply -k overlays/prod
+$ kubectl delete -k overlays/prod
+$ kustomize build overlays/prod                  # standalone binary: newer features, same output</code></pre>
+<p>The rendered output for prod: a Deployment named <code>prod-web</code> in namespace <code>prod</code>, 5 replicas, image <code>:1.4.2</code>, resources set, an extra env var, and <code>envFrom</code> pointing at <code>prod-web-config-7f8g9h2k4m</code> — the generated ConfigMap with a hash of its contents in the name.</p>
+
+<h2>Generators and the hash suffix</h2>
+<p><code>configMapGenerator</code> and <code>secretGenerator</code> create the object <em>and</em> append a content hash to its name, then rewrite every reference. Change a value → new name → the Deployment's template changes → a rollout happens. That is the clean fix for Day 28's "editing a ConfigMap does nothing to running Pods". Old generations are left behind (harmless; prune with <code>kubectl apply -k … --prune -l app=web</code> or a GitOps tool). Disable with <code>generatorOptions: {disableNameSuffixHash: true}</code> when an external tool needs a stable name.</p>
+<pre><code class="lang-yaml">secretGenerator:
+- name: db-creds
+  envs: [.env.prod]              # KEY=VALUE file, kept out of git
+  type: Opaque
+generatorOptions:
+  labels: {generated: "true"}</code></pre>
+
+<h2>Strategic merge vs JSON patch</h2>
+<div class="compare">
+<div><h4>Strategic merge patch</h4><p>A partial YAML object. Maps merge; lists of objects merge by a key field (<code>name</code> for containers, env, volumes). Readable, good for "set these fields". Delete a field with <code>$patch: delete</code> or set it to <code>null</code>.</p></div>
+<div><h4>JSON 6902 patch</h4><p>Explicit operations (<code>add</code>, <code>remove</code>, <code>replace</code>, <code>move</code>, <code>test</code>) on JSON-pointer paths. Precise, works on CRDs whose list-merge keys kustomize does not know, can append to arrays (<code>/-</code>). Less readable.</p></div>
+</div>
+
+<h2>Other useful features</h2>
+<dl class="kv">
+<dt>components</dt><dd>Reusable feature bundles (e.g. "add a sidecar", "enable TLS") that any overlay can include: <code>components: [../../components/tls]</code>.</dd>
+<dt>replacements</dt><dd>Copy a value from one object's field into another's (successor to <code>vars</code>): e.g. Service name into an Ingress backend.</dd>
+<dt>Remote bases</dt><dd><code>resources: [github.com/org/repo/base?ref=v1.2]</code> — reuse a vendor's manifests and overlay your changes.</dd>
+<dt>helmCharts</dt><dd>Render a Helm chart inside a kustomization (<code>--enable-helm</code>) and patch its output — a common hybrid.</dd>
+<dt>labels vs commonLabels</dt><dd><code>labels: [{pairs: {...}, includeSelectors: false}]</code> adds labels without touching selectors, which <code>commonLabels</code> does (and selectors are immutable — changing commonLabels on a live Deployment fails).</dd>
+</dl>
+
+<div class="callout mental"><div class="ct">Kustomize vs Helm</div><p>Kustomize <em>patches</em> real YAML; Helm <em>templates</em> YAML with a values file. Kustomize is better for your own apps across environments (no templating language, output is greppable, no release state); Helm is better for distributing software to strangers (parameters, hooks, versioned packages, rollback). Many teams use both: Helm to install third-party charts, Kustomize overlays (sometimes patching Helm output) for their own services. <a href="d43-helm.html">Day 43</a>.</p></div>
+
+<div class="callout linux" data-ref="l10"><div class="ct">Under the hood · Linux</div><p>Kustomize is a pure text transformation — there is no cluster interaction until <code>apply</code>. That makes it script-friendly: <code>kubectl kustomize overlay | yq '.spec.replicas' -</code>, <code>kubectl kustomize a &gt; a.yaml; kubectl kustomize b &gt; b.yaml; diff a.yaml b.yaml</code> to compare environments, and <code>kubectl kustomize . | kubectl apply --dry-run=server -f -</code> to validate against the live API including admission. The <a href="../linux/l10-shell-toolkit.html">shell toolkit</a> page covers <code>yq</code> and <code>diff</code>.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Kustomize is in the CKA curriculum ("understand Helm and Kustomize"). Expect: render a given overlay (<code>kubectl kustomize dir</code>), apply it (<code>-k</code>), or fix a broken kustomization (wrong <code>resources</code> path, patch name not matching).</li>
+<li><code>kubectl apply -k</code> takes a <em>directory</em>, not a file. <code>-f</code> on a kustomization.yaml does not work.</li>
+<li>If a patch "does nothing", the target <code>kind</code>/<code>name</code> does not match — remember <code>namePrefix</code> applies <em>after</em> patches target the base name.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ mkdir -p app/base app/overlays/dev app/overlays/prod && cd app
+$ kubectl create deploy web --image=nginx:1.26 --port=80 $do &gt; base/deployment.yaml
+$ kubectl create svc clusterip web --tcp=80:80 $do &gt; base/service.yaml
+$ cat &gt; base/kustomization.yaml &lt;&lt;EOF
+resources: [deployment.yaml, service.yaml]
+configMapGenerator:
+- name: web-config
+  literals: [GREETING=hello]
+EOF
+$ cat &gt; overlays/dev/kustomization.yaml &lt;&lt;EOF
+resources: [../../base]
+namespace: dev
+namePrefix: dev-
+replicas: [{name: web, count: 1}]
+EOF
+$ cat &gt; overlays/prod/kustomization.yaml &lt;&lt;EOF
+resources: [../../base]
+namespace: prod
+namePrefix: prod-
+images: [{name: nginx, newTag: "1.27"}]
+replicas: [{name: web, count: 3}]
+configMapGenerator:
+- name: web-config
+  behavior: merge
+  literals: [GREETING=bonjour]
+patches:
+- target: {kind: Deployment, name: web}
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/envFrom
+      value: [{configMapRef: {name: web-config}}]
+EOF
+$ kubectl kustomize overlays/prod                       # note the hashed ConfigMap name and rewritten envFrom
+$ kubectl create ns dev prod
+$ kubectl apply -k overlays/dev && kubectl apply -k overlays/prod
+$ kubectl get deploy,svc,cm -n prod
+$ sed -i 's/bonjour/hola/' overlays/prod/kustomization.yaml && kubectl apply -k overlays/prod && kubectl rollout status deploy/prod-web -n prod   # new hash → rollout
+$ kubectl delete ns dev prod; cd ..</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Base = plain manifests + a kustomization.yaml; overlays inherit the base and change namespace, names, images, replicas, labels, and apply patches.</li>
+<li>Strategic merge for "set these fields", JSON 6902 for precise or list-append operations; target by kind/name.</li>
+<li>Generators add a content hash to ConfigMap/Secret names and rewrite references → config changes trigger rollouts.</li>
+<li><code>kubectl kustomize</code> to see, <code>diff -k</code> to compare, <code>apply -k dir</code> to deploy. No templating, no state, plain YAML out.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.term('base', 20, 20, 220, 130, ['base/deployment.yaml', 'name: web', 'namespace: (none)', 'replicas: 1', 'image: web:1.0.0', 'envFrom: web-config'], { fs: 9.5 })
+    + S.term('ov', 20, 170, 220, 120, ['overlays/prod/kustomization', 'namespace: prod', 'namePrefix: prod-', 'images: web → :1.4.2', 'replicas: web → 5', 'configMapGenerator: LOG=warn'], { fs: 9.5 })
+    + S.box('k', 300, 120, 130, 60, ['kustomize', 'build'], { subfs: 9, subcls: 'muted', cls: 'pur' })
+    + S.arrow('a1', 240, 85, 298, 140, { d: 'M 240 85 L 298 140' }) + S.arrow('a2', 240, 230, 298, 160, { d: 'M 240 230 L 298 160' }) + S.arrow('a3', 430, 150, 478, 150)
+    + S.term('out', 480, 20, 220, 270, ['rendered (prod)', 'name: web', 'namespace: (none)', 'replicas: 1', 'image: web:1.0.0', 'envFrom: web-config', '', '', ''], { fs: 9.5 })
+    + S.text('m', 360, 300, '', { cls: 'sm b' });
+  const L = (q, i, t, c) => q('#out-l' + i).text(t).style('fill', c || 'var(--green)');
+  Anim.define('kustomize', { w: 720, h: 315, title: 'Base + overlay → rendered YAML', ms: 2600, svg, steps: [
+    { c: 'The base is plain, valid Kubernetes YAML — you can <code>kubectl apply -f base/</code> it as-is. The prod overlay is a list of transformations, not a copy.', on(q){} },
+    { c: '<code>namespace: prod</code> sets metadata.namespace on every object; <code>namePrefix: prod-</code> renames them <b>and</b> rewrites references (Service selectors stay in sync because commonLabels touch both).', on(q){ q('#ov-l1,#ov-l2').style('fill', 'var(--accent)'); L(q, 1, 'name: prod-web'); L(q, 2, 'namespace: prod'); } },
+    { c: '<code>images</code> and <code>replicas</code> are shorthand patches for the two fields that differ most between environments.', on(q){ q('#ov-l3,#ov-l4').style('fill', 'var(--accent)'); L(q, 3, 'replicas: 5'); L(q, 4, 'image: web:1.4.2'); } },
+    { c: 'The generator merges <code>LOG=warn</code> into the base ConfigMap, emits it as <code>prod-web-config-&lt;hash&gt;</code>, and rewrites the Deployment\'s <code>envFrom</code> to the hashed name.', on(q){ q('#ov-l5').style('fill', 'var(--accent)'); L(q, 5, 'envFrom: prod-web-config-7f8g9h2k4m'); L(q, 6, '---', 'var(--muted)'); L(q, 7, 'ConfigMap prod-web-config-7f8g9h2k4m'); L(q, 8, '  LOG=warn  (merged)'); } },
+    { c: 'The output is ordinary YAML: <code>kubectl kustomize</code> prints it, <code>diff -k</code> compares it with the cluster, <code>apply -k</code> applies it. Change LOG again → new hash → new template → rollout.', on(q){ q('#k rect').set('ok'); q('#m').text('no templates, no release state — just transformed YAML'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

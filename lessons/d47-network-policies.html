@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 47 · Network Policies · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d47" data-root="../" data-linux="l05" data-related="d14,d25,d48">
+<article class="lesson">
+<p class="lead">By default every Pod can talk to every other Pod in the cluster, across namespaces, on every port. A <strong>NetworkPolicy</strong> is a firewall rule attached to a set of Pods: once any policy <em>selects</em> a Pod, that Pod only accepts (or sends) the traffic some policy explicitly allows. The rules are enforced by the CNI plugin, not by Kubernetes itself — and that one fact explains the most common surprise: policies that do nothing because the CNI ignores them.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The model: allow-all until selected, then default-deny plus allow rules; policies are additive</li>
+<li><code>podSelector</code>, <code>policyTypes</code>, <code>ingress</code>/<code>egress</code> with <code>podSelector</code>, <code>namespaceSelector</code>, <code>ipBlock</code>, ports</li>
+<li>The AND/OR semantics of <code>from</code>/<code>to</code> lists that trip everyone</li>
+<li>Standard patterns: default deny, allow DNS, allow from ingress controller, tier-to-tier</li>
+<li>Testing policies and knowing whether your CNI enforces them</li>
+</ul></div>
+
+<h2>The model</h2>
+<figure data-anim="netpol"></figure>
+<ul>
+<li>A Pod is <strong>unrestricted</strong> until at least one NetworkPolicy in its namespace selects it (via <code>spec.podSelector</code>) for a given direction.</li>
+<li>Once selected for <em>ingress</em>, only connections matching some policy's ingress rule are accepted. Same for <em>egress</em>. The directions are independent.</li>
+<li>Policies are <strong>additive</strong>: the allowed set is the union of all matching policies' rules. There is no deny rule and no ordering.</li>
+<li>Policies are namespaced and can only select Pods in their own namespace — but their rules can refer to peers in other namespaces.</li>
+<li>Established connections are stateful: allowing ingress to port 80 also allows the replies out, without an egress rule.</li>
+</ul>
+
+<h2>The spec</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-policy
+  namespace: shop
+spec:
+  podSelector:                  # WHICH pods this policy applies to
+    matchLabels: {app: api}
+  policyTypes: [Ingress, Egress] # which directions this policy restricts
+  ingress:
+  - from:                       # a list of PEERS (OR-ed)
+    - podSelector:              # same namespace, label app=web
+        matchLabels: {app: web}
+    - namespaceSelector:        # any pod in namespaces labelled team=ops
+        matchLabels: {team: ops}
+    - namespaceSelector:        # AND within one item: pods labelled app=monitor
+        matchLabels: {name: monitoring}
+      podSelector:              #   IN namespaces labelled name=monitoring
+        matchLabels: {app: prometheus}
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels: {app: db}
+    ports:
+    - port: 5432
+  - to:                         # DNS: without this, name resolution breaks
+    - namespaceSelector: {}     # any namespace
+      podSelector:
+        matchLabels: {k8s-app: kube-dns}
+    ports:
+    - {protocol: UDP, port: 53}
+    - {protocol: TCP, port: 53}
+  - to:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+        except: [10.0.5.0/24]</code></pre>
+<ul class="notes">
+<li><b>podSelector</b> — <code>{}</code> selects <em>every</em> Pod in the namespace. Required (may be empty).</li>
+<li><b>policyTypes</b> — if omitted, <code>Ingress</code> is implied, plus <code>Egress</code> only if an <code>egress</code> section exists. Set it explicitly.</li>
+<li><b>ingress[].from / egress[].to</b> — each list item is a peer. Items are <b>OR</b>-ed. Inside one item, <code>namespaceSelector</code> + <code>podSelector</code> are <b>AND</b>-ed ("pods matching X in namespaces matching Y"). Note the YAML: a <code>-</code> before <code>podSelector</code> starts a new item (OR); no dash means same item (AND).</li>
+<li><b>ports</b> — apply to that rule; omitted = all ports. <code>endPort</code> for ranges. Named ports allowed.</li>
+<li><b>ipBlock</b> — CIDR for traffic outside the cluster (or node IPs). Pod IPs are unreliable here because of NAT; use selectors for Pods.</li>
+<li>An empty rule (<code>ingress: [{}]</code>) allows everything in that direction; an empty list (<code>ingress: []</code>) or a missing key with the type set allows nothing.</li>
+</ul>
+</div>
+
+<h2>Patterns you will actually write</h2>
+<div class="grid-2">
+<div><pre data-title="default deny all (per namespace)"><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: shop}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]</code></pre></div>
+<div><pre data-title="allow DNS egress for everyone"><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: shop}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: kube-system}
+      podSelector:
+        matchLabels: {k8s-app: kube-dns}
+    ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]</code></pre></div>
+<div><pre data-title="allow from the ingress controller"><code class="lang-yaml">spec:
+  podSelector: {matchLabels: {app: web}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+    ports: [{port: 8080}]</code></pre></div>
+<div><pre data-title="allow all ingress within the namespace"><code class="lang-yaml">spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector: {}     # any pod in THIS namespace</code></pre></div>
+</div>
+<p>The label <code>kubernetes.io/metadata.name=&lt;ns&gt;</code> is set automatically on every namespace, so you can select a namespace by name without adding your own labels.</p>
+
+<h2>Does your CNI enforce policies?</h2>
+<div class="tbl-wrap"><table>
+<tr><th>CNI</th><th>NetworkPolicy</th><th>Notes</th></tr>
+<tr><td>Calico</td><td>Yes</td><td>Plus its own richer CRDs (GlobalNetworkPolicy, deny rules, ordering).</td></tr>
+<tr><td>Cilium</td><td>Yes</td><td>Plus CiliumNetworkPolicy with L7 (HTTP path/method) rules; Hubble shows verdicts.</td></tr>
+<tr><td>Weave, Antrea, kube-router</td><td>Yes</td><td></td></tr>
+<tr><td><strong>Flannel</strong></td><td><strong>No</strong></td><td>Policies are accepted by the API and silently ignored. Pair with Calico for policy ("Canal").</td></tr>
+<tr><td><strong>kindnet</strong> (KIND default)</td><td>No*</td><td>*Recent KIND versions ship kube-network-policies; older ones ignore policies. Build your KIND cluster with Calico for this lesson (below).</td></tr>
+<tr><td>AWS VPC CNI</td><td>Yes (with the network-policy agent enabled)</td><td>Off by default on older EKS versions.</td></tr>
+</table></div>
+<pre data-title="kind-calico.yaml"><code class="lang-yaml">kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true       # no kindnet
+  podSubnet: 192.168.0.0/16     # Calico's default
+nodes: [{role: control-plane}, {role: worker}, {role: worker}]</code></pre>
+<pre><code class="lang-bash">$ kind create cluster --name np --config kind-calico.yaml
+$ kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+$ kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+$ kubectl get pods -n calico-system -w     # wait for calico-node Running; nodes become Ready</code></pre>
+
+<div class="callout linux" data-ref="l05"><div class="ct">Under the hood · Linux</div><p>A NetworkPolicy becomes packet-filter rules on every node hosting a selected Pod. Calico (iptables mode) programs chains named <code>cali-pi-…</code>/<code>cali-po-…</code> per policy, attached to the Pod's veth via the <code>cali-fw-</code>/<code>cali-tw-</code> chains, using <strong>ipsets</strong> that Calico keeps updated with the IPs of Pods matching each selector — so a new Pod matching <code>app=web</code> is allowed within milliseconds without touching the rules. Cilium does the same with eBPF programs attached to the veth, matching on <em>identities</em> (numeric labels-sets carried in packets) instead of IPs. Either way, the policy is enforced at the Pod's network interface on the node — which is why it applies to traffic that never leaves the node, and why <code>iptables -L</code> / <code>cilium policy get</code> on the node is the ground truth when debugging.</p></div>
+
+<h2>Testing</h2>
+<pre><code class="lang-bash">$ kubectl get netpol -n shop; kubectl describe netpol api-policy -n shop        # human-readable rule summary
+$ kubectl run t --rm -it --image=nicolaka/netshoot -n shop -- sh                # then: curl -m2 api:8080 / nc -zv db 5432 / nslookup api
+$ kubectl run t --rm -it --image=busybox:1.36 -n other --labels=app=web -- wget -qO- --timeout=2 http://api.shop:8080
+# a policy "not working": is the CNI enforcing? does podSelector match? (kubectl get pods --show-labels) — dash vs no-dash in from:?
+# with Calico: kubectl logs -n calico-system -l k8s-app=calico-node | grep -i denied   (if flow logging is enabled)
+# with Cilium: hubble observe --verdict DROPPED</code></pre>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Exam clusters use a policy-capable CNI. The classic task: "allow only Pods with label X in namespace Y to reach the db Pods on port 5432". Write <code>podSelector</code> for db, <code>policyTypes: [Ingress]</code>, one <code>from</code> item with <code>namespaceSelector</code> + <code>podSelector</code> <em>in the same item</em> (no dash between them), and <code>ports</code>.</li>
+<li>Always set <code>policyTypes</code> explicitly. If omitted it defaults to <code>[Ingress]</code> (plus <code>Egress</code> only when an <code>egress</code> section exists) — so a policy with only egress rules and no <code>policyTypes</code> <em>also</em> default-denies ingress to the selected Pods, which is rarely what you meant.</li>
+<li>Default-deny questions: <code>podSelector: {}</code> + <code>policyTypes</code>, nothing else. Then remember DNS.</li>
+<li>Copy the YAML skeleton from the docs "Network Policies" page — the from/to indentation is the whole difficulty.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (25 min) — needs a policy-capable CNI</h3>
+<pre><code class="lang-bash">$ kubectl create ns shop && kubectl label ns shop tier=app
+$ kubectl create deploy web --image=nginx -n shop && kubectl expose deploy web --port=80 -n shop
+$ kubectl create deploy api --image=nginx -n shop && kubectl expose deploy api --port=80 -n shop
+$ kubectl run t --rm -it --image=busybox:1.36 -n shop -- wget -qO- --timeout=2 http://api | head -1     # works: allow-all
+$ kubectl apply -n shop -f - &lt;&lt;EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny}
+spec: {podSelector: {}, policyTypes: [Ingress, Egress]}
+EOF
+$ kubectl run t --rm -it --image=busybox:1.36 -n shop -- wget -qO- --timeout=2 http://api      # times out (and DNS fails too)
+$ kubectl apply -n shop -f - &lt;&lt;EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: web-to-api}
+spec:
+  podSelector: {matchLabels: {app: api}}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: web}}}]
+    ports: [{port: 80}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: web-egress}
+spec:
+  podSelector: {matchLabels: {app: web}}
+  policyTypes: [Egress]
+  egress:
+  - to: [{podSelector: {matchLabels: {app: api}}}]
+    ports: [{port: 80}]
+EOF
+$ kubectl exec -n shop deploy/web -- curl -s -m2 http://api | head -1        # works: web → api allowed both ways
+$ kubectl run t --rm -it --image=busybox:1.36 -n shop -- wget -qO- --timeout=2 http://api   # still blocked: t is not app=web
+$ kubectl run t --rm -it --image=busybox:1.36 -n shop --labels=app=web -- wget -qO- --timeout=2 http://api | head -1   # works
+$ kubectl delete ns shop</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>No policy = allow all. Any policy selecting a Pod = default deny for that direction + the union of allow rules.</li>
+<li><code>from</code>/<code>to</code> items are OR; namespaceSelector + podSelector in one item are AND. Watch the dash.</li>
+<li>Start with default-deny, then allow DNS, then allow tier-to-tier and from the ingress controller.</li>
+<li>Enforcement is the CNI's job (Calico, Cilium yes; Flannel, old kindnet no). Test with a throwaway Pod.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.zone('ns', 20, 20, 480, 280, 'namespace shop')
+    + S.pod('web', 110, 100, 'web', { cls: 'ok', w: 70, sub: 'app=web' }) + S.pod('api', 300, 100, 'api', { cls: 'pur', w: 70, sub: 'app=api' }) + S.pod('db', 300, 230, 'db', { cls: 'warn', w: 70, sub: 'app=db' })
+    + S.pod('rogue', 110, 230, 'debug', { cls: 'gray', w: 70, sub: 'no labels' })
+    + S.zone('other', 530, 20, 170, 280, 'namespace other')
+    + S.pod('ext', 615, 160, 'scanner', { cls: 'gray', w: 70, sub: 'other ns' })
+    + S.arrow('a1', 145, 100, 265, 100, { cls: 'ok' }) + S.arrow('a2', 300, 115, 300, 215, { cls: 'ok' }) + S.arrow('a3', 145, 230, 265, 230, { cls: 'ok' }) + S.arrow('a4', 580, 150, 335, 108, { d: 'M 580 150 L 336 108', cls: 'ok' }) + S.arrow('a5', 145, 215, 265, 115, { d: 'M 145 215 L 265 115', cls: 'ok' })
+    + S.term('pol', 20, 305, 680, 40, ['policies: (none) — every arrow allowed'], { fs: 9.5 })
+    + S.text('m', 360, 12, '', { cls: 'sm b' });
+  Anim.define('netpol', { w: 720, h: 355, title: 'NetworkPolicy semantics', ms: 3000, svg, steps: [
+    { c: 'No policies: every Pod can reach every other Pod, in any namespace, on any port. The debug Pod can hit db; the scanner in another namespace can hit api.', on(q){} },
+    { c: 'Apply <b>default-deny</b> (<code>podSelector: {}</code>, both types) in shop. Every Pod in shop is now selected → all ingress <i>to</i> them and all egress <i>from</i> them is dropped. Even web → api.', on(q){ q('.ar').set('bad'); q('#pol-l0').text('default-deny: podSelector {} · Ingress+Egress  → everything dropped').style('fill', 'var(--red)'); } },
+    { c: 'Add a policy on <b>api</b>: ingress from <code>podSelector app=web</code>, port 80. api now accepts web. But web\'s <i>egress</i> is still denied by default-deny — a second policy must allow web → api on the egress side.', on(q){ q('#pol-l0').text('+ api: ingress from app=web:80   (egress from web still blocked)').style('fill', 'var(--amber)'); q('#a1').set('warn'); } },
+    { c: 'Add egress on web to app=api:80. Now both directions are allowed for that pair → the arrow works. Replies ride the established connection; no rule needed for them.', on(q){ q('#a1').set('ok'); q('#pol-l0').text('+ web: egress to app=api:80   → web ⇄ api allowed').style('fill', 'var(--green)'); } },
+    { c: 'The scanner in <code>other</code> still cannot reach api (not app=web, and namespaceSelector was not given). The debug Pod cannot reach db (db has no allow rule at all). api cannot reach db either — until you add api → db egress and db ← api ingress.', on(q){ q('#a4,#a3,#a5').set('bad'); q('#a2').set('bad'); } },
+    { c: 'Add api → db (5432) both sides, and allow DNS egress for everyone (kube-dns in kube-system), and you have the minimal three-tier policy set. Everything else stays denied.', on(q){ q('#a2').set('ok'); q('#pol-l0').text('+ api ⇄ db:5432 · + DNS egress for all → minimal working policy set').style('fill', 'var(--green)'); q('#m').text('additive allows on top of default deny'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

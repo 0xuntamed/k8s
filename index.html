@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>K8s Notes · Kubernetes from zero to CKA</title>
+<meta name="description" content="Complete Kubernetes notes following the CKA 2025 course (Day 0 → Day 59), with animations for the hard parts and Linux fundamentals to explain what happens under the hood.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<script src="js/theme.js"></script>
+</head>
+<body data-page="home" data-root="">
+<main>
+  <section class="hero">
+    <div>
+      <span class="badge">Free · 60 lessons · CKA 2025 track</span>
+      <h1 style="margin-top:.6rem">Kubernetes, <span>from zero to CKA</span> — with the Linux underneath.</h1>
+      <p class="sub">Structured notes for every lesson of the <em>CKA Certification Course 2025</em> playlist, rewritten as a reference you can actually come back to. Hard concepts get step-by-step animations; every abstraction is traced down to the Linux feature that implements it.</p>
+      <div class="hero-cta">
+        <a class="btn primary" href="lessons/d00-roadmap.html">Start at Day 0 →</a>
+        <a class="btn" href="linux/l02-namespaces.html">Linux fundamentals</a>
+        <a class="btn" href="cheatsheet.html">kubectl cheatsheet</a>
+      </div>
+      <div class="stats">
+        <div><b>60</b><span>Course lessons</span></div>
+        <div><b>10</b><span>Linux modules</span></div>
+        <div><b>90+</b><span>Animations</span></div>
+        <div><b>13</b><span>Modules</span></div>
+      </div>
+    </div>
+    <div class="hero-art"><figure data-anim="hero-reconcile"></figure></div>
+  </section>
+
+  <div id="resume"></div>
+
+  <div class="section-title"><h2>How this site is organised</h2><p>Three tracks that reference each other.</p></div>
+  <div class="track-cards">
+    <div class="track"><h3><span class="ic" style="background:var(--accent-soft);color:var(--accent);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">K</span>The course · Day 0 → 59</h3><p>One page per video, in playlist order. Each page has the concept, the YAML, the commands, an "under the hood" box, exam tips, a hands-on lab and key takeaways.</p></div>
+    <div class="track"><h3><span class="ic" style="background:var(--linux-soft);color:var(--linux);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">L</span>Linux fundamentals</h3><p>Namespaces, cgroups, OverlayFS, veth/iptables, signals, capabilities, DNS, OpenSSL, systemd. Read them when a lesson links to them — or up front if you like knowing why.</p></div>
+    <div class="track"><h3><span class="ic" style="background:var(--purple-soft);color:var(--purple);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">R</span>Reference</h3><p>A kubectl cheatsheet organised by task and a glossary of every term used in the course. Press <kbd>Ctrl</kbd> <kbd>K</kbd> anywhere to search.</p></div>
+  </div>
+
+  <div class="section-title"><h2>The roadmap</h2><p>Follow it in order; progress is saved in your browser.</p></div>
+  <div class="mod-grid" id="mods"></div>
+
+  <div class="section-title"><h2>Linux fundamentals</h2><p>The kernel features Kubernetes is built on.</p></div>
+  <div class="mod-grid" id="linux-mods"></div>
+
+  <div class="section-title"><h2>Suggested study plan</h2><p>How to use the playlist and these notes together.</p></div>
+  <div class="grid-3">
+    <div class="card"><h4><span class="ic">1</span>Watch, then read</h4><p>Watch the day's video once at normal speed. Then read the page here — it is organised for retention, not for narration, so it will fill gaps the video moved past quickly.</p></div>
+    <div class="card"><h4><span class="ic">2</span>Type every command</h4><p>Each page ends with a lab. Use a local <a href="lessons/d08-kind-cluster.html">KIND cluster</a>; from Day 54 onward, build a real <a href="lessons/d54-kubeadm-cluster.html">kubeadm cluster</a> on VMs.</p></div>
+    <div class="card"><h4><span class="ic">3</span>Chase the Linux links</h4><p>When a page says <em>Under the hood</em>, follow the link once. Understanding the primitive (a cgroup, a veth pair, a signal) makes the Kubernetes concept obvious and permanent.</p></div>
+  </div>
+
+  <footer class="site-footer">
+    <p>Notes follow the structure of the <a href="https://www.youtube.com/playlist?list=PLmPit9IIdzwRjqD-l_sZBDdPlcSfKqpAt">CKA Certification Course 2025</a> by Cloud With VarJosh. Video links open on YouTube. Content on this site is an independent set of study notes — verify commands against the <a href="https://kubernetes.io/docs/">Kubernetes documentation</a> for your version.</p>
+  </footer>
+</main>
+
+<script src="js/curriculum.js"></script>
+<script src="js/anim.js"></script>
+<script src="js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  // Hero: the reconcile loop in one picture
+  Anim.define('hero-reconcile', { w: 520, h: 300, title: 'Desired vs actual', ms: 2000,
+    svg: `
+      ${S.box('desired', 20, 20, 200, 78, ['Desired state', 'replicas: 3'], { cls: 'soft', subfs: 11, subcls: 'mono muted' })}
+      ${S.box('actual', 300, 20, 200, 78, ['Actual state', '3 running'], { cls: 'soft', subfs: 11, subcls: 'mono muted' })}
+      ${S.box('ctrl', 170, 140, 180, 54, ['Controller', 'observe · diff · act'], { subfs: 10, subcls: 'muted' })}
+      ${S.arrow('a1', 120, 98, 190, 140, { cls: 'dashed' })}
+      ${S.arrow('a2', 400, 98, 330, 140, { cls: 'dashed' })}
+      ${S.pod('p1', 330, 240, 'pod', { cls: 'ok' })}
+      ${S.pod('p2', 400, 240, 'pod', { cls: 'ok' })}
+      ${S.pod('p3', 470, 240, 'pod', { cls: 'ok' })}
+      ${S.text('t1', 260, 285, 'The whole of Kubernetes is this loop, repeated.', { cls: 'sm muted' })}`,
+    steps: [
+      { c: 'You declare <b>what you want</b> (3 replicas). Kubernetes continuously compares it with <b>what exists</b>.', on(q){ q('#desired rect').set('hl'); } },
+      { c: 'A pod dies — a node crashes, a process crashes, someone deletes it.', on(q){ q('#p2').add('hid'); q('#actual').text('Actual state'); q('#actual text:nth-of-type(2)').text('2 running'); q('#actual rect').set('bad'); } },
+      { c: 'The controller sees desired ≠ actual and <b>acts</b>: it creates a replacement.', on(q){ q('#ctrl rect').set('hl'); q('#a1,#a2').set('hl'); } },
+      { c: 'Actual state converges back to desired. Nobody was paged. This is <b>self-healing</b>.', on(q){ q('#p2').rm('hid'); q('#actual text:nth-of-type(2)').text('3 running'); q('#actual rect').set('ok'); q('#ctrl rect').set(); q('#a1,#a2').set(); } },
+    ]
+  });
+
+  const K = window.K8N;
+  const mods = document.getElementById('mods');
+  window.CURRICULUM.modules.forEach(m => {
+    const dn = m.lessons.filter(l => K.done.has(l.id)).length;
+    const el = document.createElement('div'); el.className = 'mod-card'; el.style.setProperty('--mc', m.color);
+    el.innerHTML = `<h3><span class="mnum">M${m.num}</span>${m.title}</h3><p>${m.blurb}</p><ol>${m.lessons.map(l => `<li><a class="${K.done.has(l.id) ? 'done' : ''}" href="${K.href(l)}"><span class="d">${l.day === '+' ? '+' : 'D' + l.day}</span><span>${l.title}</span></a></li>`).join('')}</ol><div class="mprog" title="${dn}/${m.lessons.length} done"><i style="width:${dn / m.lessons.length * 100}%"></i></div>`;
+    mods.appendChild(el);
+  });
+  const lm = document.getElementById('linux-mods');
+  window.CURRICULUM.linux.forEach((l, i) => {
+    const el = document.createElement('div'); el.className = 'mod-card'; el.style.setProperty('--mc', 'var(--linux)');
+    el.innerHTML = `<h3><span class="mnum">L${i + 1}</span><a href="${K.href(l)}" style="color:inherit">${l.title}</a></h3><p>${l.blurb}</p><div class="mprog"><i style="width:${K.done.has(l.id) ? 100 : 0}%"></i></div>`;
+    lm.appendChild(el);
+  });
+  try {
+    const last = localStorage.getItem('k8s-notes:last');
+    const e = last && K.byId[last];
+    if (e) { const r = document.getElementById('resume'); r.className = 'resume'; r.innerHTML = `<span>Pick up where you left off:</span><a href="${K.href(e)}">${e.day != null ? 'Day ' + e.day + ' · ' : ''}${e.title} →</a>`; }
+  } catch (err) { }
+})();
+</script>
+</body>
+</html>

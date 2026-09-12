@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 41 · Pod Security: Security Context & Linux Capabilities · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d41" data-root="../" data-linux="l06,l02" data-related="d38,d03,d28">
+<article class="lesson">
+<p class="lead">A container is a process on a shared kernel, so "container security" is mostly "process security": which user does it run as, which of root's powers does it keep, can it write its own filesystem, can it gain privileges after starting. The Pod <code>securityContext</code> maps directly onto those Linux knobs — UIDs, <strong>capabilities</strong>, seccomp, AppArmor, <code>no_new_privs</code> — and the <strong>Pod Security Standards</strong> package them into three profiles a namespace can enforce. This lesson explains the knobs by what they do to the process.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Pod-level vs container-level <code>securityContext</code>, and which fields live where</li>
+<li>Users and groups: runAsUser, runAsGroup, runAsNonRoot, fsGroup, supplementalGroups</li>
+<li>Linux capabilities: what root really is, why <code>privileged</code> is "all of them plus more", drop ALL / add one</li>
+<li>readOnlyRootFilesystem, allowPrivilegeEscalation, seccomp and AppArmor profiles</li>
+<li>Pod Security Admission: privileged / baseline / restricted, enforce / audit / warn per namespace</li>
+</ul></div>
+
+<h2>Where the fields go</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened
+spec:
+  securityContext:                      # POD level: applies to all containers (+ volumes)
+    runAsUser: 1000
+    runAsGroup: 3000
+    runAsNonRoot: true
+    fsGroup: 2000                       # volumes are chowned to this GID; files created get it
+    supplementalGroups: [4000]
+    seccompProfile:
+      type: RuntimeDefault
+    sysctls:
+    - name: net.ipv4.ip_unprivileged_port_start
+      value: "80"
+  containers:
+  - name: app
+    image: myapp:2.1
+    securityContext:                    # CONTAINER level: overrides the Pod level for this container
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+        add: ["NET_BIND_SERVICE"]
+      privileged: false
+      runAsUser: 1000                   # may repeat/override pod-level
+      appArmorProfile:
+        type: RuntimeDefault
+    volumeMounts:
+    - {name: tmp, mountPath: /tmp}
+  volumes:
+  - {name: tmp, emptyDir: {}}</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Field</th><th>Level</th><th>Effect on the process</th></tr>
+<tr><td><code>runAsUser</code> / <code>runAsGroup</code></td><td>Pod, Container</td><td>UID/GID the first process starts as (overrides the image's <code>USER</code>). Numeric only.</td></tr>
+<tr><td><code>runAsNonRoot: true</code></td><td>Pod, Container</td><td>Kubelet refuses to start the container if the effective UID is 0 — or if the image says <code>USER</code> by name and the UID cannot be determined.</td></tr>
+<tr><td><code>fsGroup</code></td><td>Pod</td><td>Volumes that support it are recursively chowned to this group at mount time; the process gets it as a supplementary group. This is how a non-root app writes to a PVC.</td></tr>
+<tr><td><code>capabilities.drop/add</code></td><td>Container</td><td>Remove/add Linux capabilities from the bounding set (below).</td></tr>
+<tr><td><code>privileged: true</code></td><td>Container</td><td>All capabilities, all devices, no seccomp/AppArmor, writable /sys — effectively root on the node. For CNI/CSI/monitoring agents only.</td></tr>
+<tr><td><code>allowPrivilegeEscalation: false</code></td><td>Container</td><td>Sets <code>no_new_privs</code>: setuid binaries and file capabilities cannot raise privileges. Implied false when privileged is false and CAP_SYS_ADMIN is not added… but set it explicitly.</td></tr>
+<tr><td><code>readOnlyRootFilesystem: true</code></td><td>Container</td><td>The image's filesystem is mounted read-only; writes only to mounted volumes. Blocks an intruder from modifying binaries or dropping tools.</td></tr>
+<tr><td><code>seccompProfile</code></td><td>Pod, Container</td><td>Syscall filter: <code>RuntimeDefault</code> (containerd's profile, blocks ~40 dangerous syscalls), <code>Localhost</code> (a JSON profile on the node), <code>Unconfined</code>.</td></tr>
+<tr><td><code>appArmorProfile</code></td><td>Pod, Container</td><td>MAC profile on AppArmor kernels (Ubuntu/Debian): file/network access rules.</td></tr>
+<tr><td><code>procMount</code>, <code>sysctls</code>, <code>windowsOptions</code>, <code>seLinuxOptions</code></td><td>various</td><td>Rarer; SELinux on RHEL-family nodes.</td></tr>
+</table></div>
+
+<h2>Users: root is UID 0, nothing more</h2>
+<p>Most images run as root because their Dockerfile never said otherwise. Inside a container root is still UID 0 <em>on the host kernel</em>; only namespaces and capabilities limit what it can do. If an attacker escapes the container (a runtime bug, a hostPath mount), being root on the host is game over. So: run as a non-root UID, and make the kubelet enforce it.</p>
+<pre><code class="lang-bash">$ kubectl exec app -- id                       # uid=1000 gid=3000 groups=2000,4000
+$ kubectl exec app -- ps -o user,pid,comm      # every process as 1000
+$ kubectl run r --image=nginx --overrides='{"spec":{"securityContext":{"runAsNonRoot":true}}}'
+$ kubectl get pod r                            # CreateContainerConfigError: container has runAsNonRoot and image will run as root
+# fix: runAsUser: 101 (nginx's uid) + use the unprivileged nginx image (nginxinc/nginx-unprivileged listens on 8080)</code></pre>
+
+<h2>Capabilities: root, split into pieces</h2>
+<p>Since Linux 2.2 "root" is not one bit but ~40 <strong>capabilities</strong>: <code>CAP_NET_BIND_SERVICE</code> (bind ports &lt; 1024), <code>CAP_CHOWN</code>, <code>CAP_NET_RAW</code> (raw sockets — ping, but also ARP spoofing), <code>CAP_SYS_ADMIN</code> (mount, and a grab-bag so large it is "the new root"), <code>CAP_SYS_PTRACE</code>, <code>CAP_NET_ADMIN</code> (interfaces, routes, iptables)… A container runtime gives a root container a <em>default subset</em> of about 14; <code>privileged</code> gives all of them. The safe pattern is <strong>drop ALL, add back the one you need</strong>.</p>
+<figure data-anim="capabilities"></figure>
+<pre><code class="lang-bash">$ kubectl exec app -- cat /proc/1/status | grep Cap          # CapEff: 0000000000000400 = only NET_BIND_SERVICE
+$ kubectl exec app -- sh -c 'apk add -q libcap 2&gt;/dev/null; capsh --decode=0000000000000400'
+$ kubectl exec app -- ping -c1 1.1.1.1                       # fails without NET_RAW (modern ping may use ICMP sockets instead)</code></pre>
+<div class="callout linux" data-ref="l06,l02"><div class="ct">Under the hood · Linux</div><p>Every field above becomes something in the OCI runtime spec that runc applies before <code>exec</code>ing your process: <code>process.user.uid/gid/additionalGids</code> (<code>setuid/setgid/setgroups</code>), <code>process.capabilities.{bounding,effective,permitted,inheritable}</code> (<code>capset</code>), <code>process.noNewPrivileges</code> (<code>prctl(PR_SET_NO_NEW_PRIVS)</code>), <code>linux.seccomp</code> (a BPF filter loaded with <code>seccomp(2)</code>), <code>process.apparmorProfile</code>, and <code>root.readonly</code> (a read-only bind remount). See them with <code>crictl inspect &lt;id&gt; | jq .info.runtimeSpec.process</code> on the node. Capabilities are per-thread attributes the kernel checks on privileged syscalls — <code>bind()</code> to port 80 asks for <code>CAP_NET_BIND_SERVICE</code>; without it, even UID 0 gets <code>EACCES</code>. <code>privileged</code> simply sets every capability and skips the seccomp/AppArmor/masked-paths setup, which is why it is equivalent to root on the node.</p></div>
+
+<h2>Pod Security Standards and Admission</h2>
+<p>Three profiles, defined by the project, enforced by the built-in <strong>PodSecurity</strong> admission plugin per namespace via labels (PodSecurityPolicy, its predecessor, was removed in 1.25):</p>
+<div class="grid-3">
+<div class="card"><h4>privileged</h4><p>No restrictions. For system namespaces running CNI/CSI/agents.</p></div>
+<div class="card"><h4>baseline</h4><p>Blocks the known privilege escalations: no <code>privileged</code>, no hostNetwork/hostPID/hostIPC, no hostPath, no dangerous capabilities added (SYS_ADMIN, NET_ADMIN…), no unconfined seccomp/AppArmor, restricted sysctls. Most apps pass unchanged.</p></div>
+<div class="card"><h4>restricted</h4><p>Baseline plus: <code>runAsNonRoot: true</code>, <code>allowPrivilegeEscalation: false</code>, <code>capabilities.drop: [ALL]</code> (only NET_BIND_SERVICE may be added), <code>seccompProfile</code> RuntimeDefault or Localhost, volumes limited to the safe types. The hardened Pod above passes.</p></div>
+</div>
+<pre><code class="lang-bash">$ kubectl label ns prod pod-security.kubernetes.io/enforce=restricted \
+                        pod-security.kubernetes.io/enforce-version=latest \
+                        pod-security.kubernetes.io/warn=restricted \
+                        pod-security.kubernetes.io/audit=restricted
+$ kubectl run root --image=nginx -n prod
+# Error: pods "root" is forbidden: violates PodSecurity "restricted:latest": allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
+$ kubectl label ns dev pod-security.kubernetes.io/warn=baseline     # warn only: prints violations, still admits
+$ kubectl label --dry-run=server --overwrite ns prod pod-security.kubernetes.io/enforce=restricted   # preview: which existing pods would fail</code></pre>
+<dl class="kv">
+<dt>enforce</dt><dd>Reject violating Pods (Deployments are accepted, but their Pods fail to appear — watch <code>kubectl get events</code> and the ReplicaSet).</dd>
+<dt>warn</dt><dd>Admit, but return a warning to the client.</dd>
+<dt>audit</dt><dd>Admit, but annotate the audit log entry.</dd>
+<dt>Exemptions</dt><dd>Configured cluster-wide in the API server's admission config (usernames, RuntimeClasses, namespaces like kube-system).</dd>
+</dl>
+<p>For anything finer (e.g. "only images from our registry", "must have resource limits") use a policy engine — Kyverno or Gatekeeper — or a ValidatingAdmissionPolicy (<a href="d38-admission-controllers.html">Day 38</a>).</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Typical: "run the Pod as UID 1010 with capabilities SYS_TIME added" → <code>securityContext.runAsUser</code> at Pod level, <code>capabilities.add</code> at <em>container</em> level (there is no Pod-level capabilities field — a classic trap).</li>
+<li><code>runAsNonRoot</code> + root image → <code>CreateContainerConfigError</code>. Either set <code>runAsUser</code> to a non-zero UID or pick an unprivileged image.</li>
+<li>Pods silently not appearing for a Deployment in a namespace with <code>enforce</code> labels → <code>kubectl describe rs</code> shows the PodSecurity rejection.</li>
+<li>Remember the label key: <code>pod-security.kubernetes.io/enforce</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl run asroot --image=busybox --command -- sleep 3600
+$ kubectl exec asroot -- id; kubectl exec asroot -- grep CapEff /proc/1/status          # uid 0, default caps
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: locked}
+spec:
+  securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, fsGroup: 2000, seccompProfile: {type: RuntimeDefault}}
+  containers:
+  - name: c
+    image: busybox
+    command: [sleep, "3600"]
+    securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+    volumeMounts: [{name: data, mountPath: /data}]
+  volumes: [{name: data, emptyDir: {}}]
+EOF
+$ kubectl exec locked -- id                          # uid=1000 gid=1000 groups=2000
+$ kubectl exec locked -- grep CapEff /proc/1/status  # 0000000000000000
+$ kubectl exec locked -- touch /etc/x                # Read-only file system
+$ kubectl exec locked -- touch /data/x && kubectl exec locked -- ls -l /data   # group 2000 via fsGroup
+$ kubectl create ns strict && kubectl label ns strict pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
+$ kubectl run x --image=busybox -n strict --command -- sleep 1      # forbidden, with the list of violations
+$ kubectl get pod locked -o yaml | grep -v 'status:' | sed 's/name: locked/name: locked2\n  namespace: strict/' | kubectl apply -f -   # passes restricted
+$ kubectl delete pod asroot locked $now; kubectl delete ns strict</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>securityContext = Linux process attributes: UID/GID, capabilities, no_new_privs, read-only rootfs, seccomp, AppArmor. Pod level for user/group/fsGroup/seccomp; container level for capabilities/privileged/readOnlyRootFilesystem/allowPrivilegeEscalation.</li>
+<li>Root in a container is UID 0 on the node's kernel. Run non-root, enforce it with <code>runAsNonRoot</code>, use <code>fsGroup</code> for volume writes.</li>
+<li>Capabilities split root's power; drop ALL and add back only what is needed. <code>privileged</code> = everything = root on the node.</li>
+<li>Pod Security Admission enforces privileged/baseline/restricted per namespace via labels; use warn/audit before enforce.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const caps = ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'FSETID', 'KILL', 'SETGID', 'SETUID', 'SETPCAP', 'NET_BIND_SERVICE', 'NET_RAW', 'SYS_CHROOT', 'MKNOD', 'AUDIT_WRITE', 'SETFCAP', 'SYS_ADMIN', 'NET_ADMIN', 'SYS_PTRACE', 'SYS_MODULE', 'SYS_TIME', 'DAC_READ_SEARCH', 'SYS_RAWIO', 'BPF', 'PERFMON', 'SYS_BOOT'];
+  let svg = S.text('t', 360, 22, '', { cls: 'sm b' });
+  caps.forEach((c, i) => { const col = i % 6, row = Math.floor(i / 6); svg += S.box(`c${i}`, 20 + col * 115, 40 + row * 40, 108, 32, c, { fs: 9, lcls: 'mono', cls: i < 14 ? 'hl' : 'soft' }); });
+  svg += S.text('m', 360, 215, '', { cls: 'sm muted' }) + S.text('m2', 360, 235, '', { cls: 'xs muted' });
+  const all = (q, cls) => caps.forEach((_, i) => q(`#c${i} rect`).set(cls));
+  Anim.define('capabilities', { w: 720, h: 250, title: 'Linux capabilities', ms: 3000, svg, steps: [
+    { c: '"Root" is ~40 separate capabilities. A container started as root by containerd gets the <b>default set</b> — the 14 highlighted — not all of them.', on(q){ q('#t').text('default container capabilities (root, no securityContext)'); q('#m').text('CapEff = 00000000a80425fb'); } },
+    { c: 'Even so, this default set includes <b>NET_RAW</b> (raw sockets → ARP/DNS spoofing inside the Pod network) and <b>SYS_CHROOT</b>, <b>MKNOD</b>, <b>SETUID</b> — more than a web app needs.', on(q){ q('#c9 rect,#c10 rect,#c11 rect,#c6 rect').set('warn'); } },
+    { c: '<code>privileged: true</code> grants <b>every</b> capability, including SYS_ADMIN (mount, and dozens of other operations), NET_ADMIN, SYS_PTRACE, SYS_MODULE (load kernel modules!). Plus device access and no seccomp. This is root on the node.', on(q){ all(q, 'bad'); q('#t').text('privileged: true — all capabilities, all devices, no seccomp'); q('#m').text('CapEff = 000001ffffffffff'); } },
+    { c: '<code>capabilities: {drop: [ALL]}</code> removes everything. The process is UID 0 in name only; it cannot chown, cannot bind port 80, cannot ptrace, cannot mount.', on(q){ all(q, 'soft'); q('#t').text('drop: [ALL]'); q('#m').text('CapEff = 0000000000000000'); } },
+    { c: '…then <code>add: [NET_BIND_SERVICE]</code> gives back exactly the one thing a web server needs: binding a port below 1024. Combined with a non-root UID, this is the <b>restricted</b> profile\'s requirement.', on(q){ q('#c8 rect').set('ok'); q('#t').text('drop: [ALL], add: [NET_BIND_SERVICE]'); q('#m').text('CapEff = 0000000000000400'); q('#m2').text('cat /proc/1/status | grep CapEff · capsh --decode=…'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

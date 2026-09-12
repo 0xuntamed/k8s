@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 26 · Ephemeral Volumes: emptyDir & downwardAPI · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d26" data-root="../" data-linux="l04" data-related="d21,d24,d28">
+<article class="lesson">
+<p class="lead">Not all storage needs to outlive the Pod. Scratch space for a build, a buffer shared between an app and its sidecar, a copy of the Pod's own labels for a config file — these need a volume that appears with the Pod and disappears with it. Kubernetes calls these <strong>ephemeral volumes</strong>. They share the same <code>volumes</code>/<code>volumeMounts</code> shape as everything else, so learning them here makes PersistentVolumes on Day 27 a small step.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The Pod-level <code>volumes</code> + container-level <code>volumeMounts</code> model</li>
+<li><code>emptyDir</code>: lifetime, <code>medium: Memory</code>, <code>sizeLimit</code>, and what survives a container restart</li>
+<li><code>downwardAPI</code>: exposing Pod metadata and resources as files or env vars</li>
+<li><code>projected</code> volumes and a preview of ConfigMap/Secret volumes</li>
+<li>Generic ephemeral volumes: a PVC that lives and dies with the Pod</li>
+</ul></div>
+
+<h2>The model: declare at Pod level, mount per container</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: builder
+spec:
+  volumes:                         # 1. what volumes exist (Pod scope)
+  - name: scratch
+    emptyDir: {}
+  - name: podinfo
+    downwardAPI:
+      items:
+      - path: labels
+        fieldRef: {fieldPath: metadata.labels}
+  containers:
+  - name: app
+    image: myapp
+    volumeMounts:                  # 2. where each container sees them
+    - name: scratch
+      mountPath: /tmp/work
+    - name: podinfo
+      mountPath: /etc/podinfo
+      readOnly: true
+  - name: helper
+    image: busybox
+    volumeMounts:
+    - name: scratch
+      mountPath: /shared           # same volume, different path
+      subPath: helper              # only a subdirectory of it</code></pre>
+<p>A volume's <em>type</em> is the one key under it (<code>emptyDir</code>, <code>hostPath</code>, <code>persistentVolumeClaim</code>, <code>configMap</code>, …). <code>subPath</code> mounts a sub-directory or single file; <code>readOnly</code> is per mount; <code>mountPropagation</code> is only for host-mount tricks.</p>
+
+<h2>emptyDir</h2>
+<figure data-anim="emptydir"></figure>
+<pre><code class="lang-yaml">volumes:
+- name: cache
+  emptyDir:
+    sizeLimit: 500Mi        # exceeding it evicts the Pod (counts as ephemeral-storage)
+- name: fast
+  emptyDir:
+    medium: Memory          # tmpfs: RAM-backed, counts against the container's MEMORY limit
+    sizeLimit: 64Mi</code></pre>
+<ul>
+<li>Created empty when the Pod is <em>assigned to a node</em>; deleted when the Pod is <em>removed from that node</em>. Container crashes and restarts do <strong>not</strong> clear it — that is its main advantage over the container's own filesystem.</li>
+<li>Lives on the node's disk under <code>/var/lib/kubelet/pods/&lt;pod-uid&gt;/volumes/kubernetes.io~empty-dir/&lt;name&gt;</code>. Node disk fills → DiskPressure → evictions; set <code>sizeLimit</code>.</li>
+<li><code>medium: Memory</code> gives a tmpfs. Fast, never touches disk (good for secrets in flight), but every byte counts against the Pod's memory limit and is lost on node reboot.</li>
+<li>Typical uses: scratch/temp space, shared buffer between containers (Day 21's sidecar log pattern), checkpoints for long computations, disk-backed caches.</li>
+</ul>
+
+<h2>downwardAPI</h2>
+<p>The application often needs to know things about its own Pod — its name, namespace, labels, the node it runs on, its CPU limit for sizing thread pools. Instead of calling the API server (which needs RBAC and a client library), the <strong>downward API</strong> pushes those values into the container as environment variables or files.</p>
+<div class="grid-2">
+<div><pre data-title="as environment variables"><code class="lang-yaml">containers:
+- name: app
+  env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef: {fieldPath: metadata.name}
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef: {fieldPath: metadata.namespace}
+  - name: POD_IP
+    valueFrom:
+      fieldRef: {fieldPath: status.podIP}
+  - name: NODE_NAME
+    valueFrom:
+      fieldRef: {fieldPath: spec.nodeName}
+  - name: CPU_LIMIT
+    valueFrom:
+      resourceFieldRef:
+        containerName: app
+        resource: limits.cpu
+        divisor: 1m           # → "500" for 500m
+  - name: MEM_REQUEST
+    valueFrom:
+      resourceFieldRef:
+        containerName: app
+        resource: requests.memory
+        divisor: 1Mi</code></pre></div>
+<div><pre data-title="as files (updated live)"><code class="lang-yaml">volumes:
+- name: podinfo
+  downwardAPI:
+    items:
+    - path: "labels"
+      fieldRef: {fieldPath: metadata.labels}
+    - path: "annotations"
+      fieldRef: {fieldPath: metadata.annotations}
+    - path: "cpu_limit"
+      resourceFieldRef:
+        containerName: app
+        resource: limits.cpu
+        divisor: 1m
+containers:
+- name: app
+  volumeMounts:
+  - name: podinfo
+    mountPath: /etc/podinfo
+    readOnly: true
+# /etc/podinfo/labels →
+#   app="web"
+#   tier="frontend"</code></pre></div>
+</div>
+<p>Env vars are set once at container start; <strong>files are updated</strong> when labels/annotations change (the kubelet re-syncs them, with a short delay). Only a fixed set of fields is available through <code>fieldRef</code> (<code>metadata.name/namespace/uid/labels/annotations</code>, <code>spec.nodeName/serviceAccountName</code>, <code>status.podIP/podIPs/hostIP</code>) — labels and annotations only as volumes, single values only as env.</p>
+
+<h2>ConfigMap and Secret volumes (preview)</h2>
+<pre><code class="lang-yaml">volumes:
+- name: config
+  configMap:
+    name: app-config
+    items: [{key: app.yaml, path: app.yaml}]   # optional: pick keys and rename
+- name: creds
+  secret:
+    secretName: db-creds
+    defaultMode: 0400</code></pre>
+<p>Each key becomes a file. Like downwardAPI files, they are <strong>updated in place</strong> when the object changes (unless mounted with <code>subPath</code>, which freezes them). <a href="d28-configmaps-secrets.html">Day 28</a> goes deep.</p>
+
+<h2>projected: several sources, one directory</h2>
+<pre><code class="lang-yaml">volumes:
+- name: all-in-one
+  projected:
+    sources:
+    - configMap: {name: app-config}
+    - secret: {name: db-creds, items: [{key: password, path: db/password}]}
+    - downwardAPI:
+        items: [{path: labels, fieldRef: {fieldPath: metadata.labels}}]
+    - serviceAccountToken:
+        path: token
+        expirationSeconds: 3600
+        audience: vault</code></pre>
+<p>This is how the automatic ServiceAccount token is mounted at <code>/var/run/secrets/kubernetes.io/serviceaccount</code> — a projected volume of the token, the cluster CA and the namespace (<a href="d37-service-accounts.html">Day 37</a>).</p>
+
+<h2>Generic ephemeral volumes</h2>
+<pre><code class="lang-yaml">volumes:
+- name: scratch-disk
+  ephemeral:
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: fast-ssd
+        resources: {requests: {storage: 100Gi}}</code></pre>
+<p>A real PVC (and CSI-provisioned disk) created with the Pod and deleted with it — for workloads that need more scratch space or IOPS than the node disk offers but no persistence. The PVC is named <code>&lt;pod&gt;-&lt;volume&gt;</code> and owned by the Pod.</p>
+
+<div class="callout linux" data-ref="l04"><div class="ct">Under the hood · Linux</div><p>All of these are directories the kubelet prepares under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/&lt;plugin&gt;/&lt;name&gt;</code> and bind-mounts into the container's mount namespace. <code>emptyDir</code> is a plain directory (or a fresh <code>tmpfs</code> mount for <code>medium: Memory</code>). ConfigMap, Secret, downwardAPI and projected volumes are also tmpfs — and the "live update" is implemented with a symlink swap: files live in a timestamped directory <code>..2024_06_01_10_00_00.123/</code>, with <code>..data</code> symlinked to it; the kubelet writes the new version into a new directory and atomically repoints <code>..data</code>. That atomic swap is why <code>subPath</code> mounts (which bind-mount a specific file, bypassing the symlink) never see updates.</p>
+<pre><code class="lang-bash">$ kubectl exec app -- ls -la /etc/podinfo/     # labels -> ..data/labels, ..data -> ..2024_…
+$ kubectl exec app -- df -h /etc/podinfo /tmp/work
+# on the node
+$ ls /var/lib/kubelet/pods/&lt;uid&gt;/volumes/</code></pre></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Share a directory between two containers" → <code>emptyDir</code>, mounted in both. Fastest to type: <code>emptyDir: {}</code>.</li>
+<li>"Expose the Pod name as an env var" → <code>valueFrom.fieldRef.fieldPath: metadata.name</code>.</li>
+<li>Volumes are under <code>spec.volumes</code> (Pod) and mounts under <code>spec.containers[].volumeMounts</code>; the names must match exactly — a mismatch fails validation with a clear error.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: eph, labels: {app: eph, tier: demo}}
+spec:
+  volumes:
+  - {name: scratch, emptyDir: {}}
+  - {name: mem, emptyDir: {medium: Memory, sizeLimit: 16Mi}}
+  - name: podinfo
+    downwardAPI:
+      items: [{path: labels, fieldRef: {fieldPath: metadata.labels}}]
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ['sh','-c','echo started &gt;&gt; /scratch/log; sleep 3600']
+    env:
+    - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+    - {name: NODE, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+    volumeMounts: [{name: scratch, mountPath: /scratch}, {name: mem, mountPath: /mem}, {name: podinfo, mountPath: /etc/podinfo}]
+EOF
+$ kubectl exec eph -- sh -c 'env | grep -E "POD_NAME|NODE"; cat /etc/podinfo/labels; df -h /mem /scratch'
+$ kubectl exec eph -- kill 1; sleep 5; kubectl get pod eph          # container restarted (RESTARTS 1)
+$ kubectl exec eph -- cat /scratch/log                               # two "started" lines: emptyDir survived the restart
+$ kubectl label pod eph tier=changed --overwrite; sleep 70; kubectl exec eph -- cat /etc/podinfo/labels   # file updated
+$ kubectl delete pod eph $now                                        # emptyDir gone with the Pod</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li><code>spec.volumes</code> declares; <code>volumeMounts</code> attaches per container by name and path.</li>
+<li><code>emptyDir</code> lives as long as the Pod is on the node; survives container restarts; <code>medium: Memory</code> = tmpfs counted against memory limits.</li>
+<li><code>downwardAPI</code> injects Pod metadata/resources as env (static) or files (live-updated).</li>
+<li>ConfigMap, Secret, downwardAPI and SA tokens can be combined in one <code>projected</code> volume.</li>
+<li>Live updates work via an atomic symlink swap; <code>subPath</code> mounts never update.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.node('node', 20, 20, 680, 270, 'worker-2', { sub: '/var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~empty-dir/scratch' })
+    + S.zone('pod', 60, 70, 600, 190, 'pod builder', { cls: 'hl' })
+    + S.box('c1', 90, 110, 180, 60, ['container: app', 'writes /tmp/work/out.bin'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('c2', 450, 110, 180, 60, ['container: helper', 'reads /shared/out.bin'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('ed', 260, 200, 200, 40, ['emptyDir: scratch', '(empty)'], { subfs: 9, subcls: 'mono muted', cls: 'warn' })
+    + S.arrow('m1', 180, 170, 300, 200, { d: 'M 180 170 L 300 198', cls: 'hl' }) + S.arrow('m2', 540, 170, 420, 200, { d: 'M 540 170 L 420 198', cls: 'hl' })
+    + S.text('m', 360, 280, '', { cls: 'sm b' });
+  Anim.define('emptydir', { w: 720, h: 300, title: 'emptyDir lifetime', ms: 2600, svg, steps: [
+    { c: 'The Pod is scheduled to worker-2. The kubelet creates an <b>empty directory</b> for the volume and bind-mounts it into both containers at their chosen paths.', on(q){} },
+    { c: 'The app writes a file. The helper sees it immediately — same directory, two mount points.', on(q){ q('#ed text:nth-of-type(2)').text('out.bin (120 MB)'); } },
+    { c: 'The app container crashes and the kubelet restarts it. The <b>volume is untouched</b> — it belongs to the Pod, not the container. The new app process finds out.bin still there.', on(q){ q('#c1 rect').set('bad'); q('#c1 text:nth-of-type(2)').text('restarted (restarts: 1)'); q('#m').text('container restart → emptyDir kept'); } },
+    { c: 'With <code>medium: Memory</code> the same directory would be a tmpfs: faster, gone on node reboot, and every megabyte counted against the container\'s memory limit.', on(q){ q('#c1 rect').set('ok'); q('#ed').text('emptyDir: scratch (medium: Memory)'); q('#m').text('tmpfs variant: RAM, counts toward memory limit'); } },
+    { c: 'The Pod is deleted (or evicted, or moved). The kubelet removes the directory. A replacement Pod — even on the same node — starts with a fresh, empty one.', on(q){ q('#pod rect').set('bad'); q('#ed').add('hid'); q('#m').text('pod removed from node → emptyDir deleted'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

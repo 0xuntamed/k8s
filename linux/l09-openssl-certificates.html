@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L9 · Certificates with OpenSSL · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l09" data-root="../" data-related="d31,d32,d33,d34,d51">
+<article class="lesson">
+<p class="lead">Every certificate in <code>/etc/kubernetes/pki</code>, every kubeconfig blob, every Ingress TLS Secret is a PEM file that <code>openssl</code> can read, verify, create and sign. This page is the reference: the dozen commands that inspect any cert, check expiry and chains, generate keys and CSRs, run a private CA, and debug a live TLS endpoint — plus the format conversions that trip people up.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Formats: PEM vs DER, what the BEGIN lines mean, base64 in kubeconfigs and Secrets</li>
+<li>Inspecting: subject, issuer, SANs, dates, key usage, fingerprint</li>
+<li>Verifying: chains, key/cert matching, live endpoints with <code>s_client</code></li>
+<li>Creating: keys, CSRs with SANs, self-signed certs, a private CA that signs CSRs</li>
+<li>Expiry checks in scripts and the Kubernetes files to run them on</li>
+</ul></div>
+
+<h2>Formats</h2>
+<pre><code class="lang-bash">$ head -1 /etc/kubernetes/pki/ca.crt          # -----BEGIN CERTIFICATE-----          PEM = base64 of DER between BEGIN/END lines
+$ head -1 /etc/kubernetes/pki/ca.key          # -----BEGIN RSA PRIVATE KEY-----      (PKCS#1) or -----BEGIN PRIVATE KEY----- (PKCS#8) or EC PRIVATE KEY
+$ head -1 jane.csr                            # -----BEGIN CERTIFICATE REQUEST-----
+$ openssl x509 -in cert.pem -outform DER -out cert.der          # PEM → DER (binary; Java/Windows)
+$ openssl x509 -inform DER -in cert.der -out cert.pem            # DER → PEM
+$ openssl pkcs12 -export -in cert.pem -inkey key.pem -certfile chain.pem -out bundle.p12   # PKCS#12 for Java keystores/browsers
+$ base64 -w0 ca.crt                            # what goes into kubeconfig certificate-authority-data / Secret .data
+$ kubectl get secret web-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject   # and back</code></pre>
+<p>Kubernetes only ever wants PEM. A file with several <code>BEGIN CERTIFICATE</code> blocks is a <em>chain</em>: leaf first, then intermediates. <code>ca.crt</code> in a kubeconfig or a Secret may contain several roots.</p>
+
+<h2>Inspect</h2>
+<pre><code class="lang-bash">$ openssl x509 -in cert.pem -noout -text                         # everything
+$ openssl x509 -in cert.pem -noout -subject -issuer -dates -serial
+$ openssl x509 -in cert.pem -noout -ext subjectAltName            # the names it is valid for (clients match these, not CN)
+$ openssl x509 -in cert.pem -noout -ext keyUsage,extendedKeyUsage # serverAuth? clientAuth? CA:TRUE?
+$ openssl x509 -in cert.pem -noout -ext basicConstraints          # CA:TRUE = can sign others
+$ openssl x509 -in cert.pem -noout -fingerprint -sha256           # pin / compare
+$ openssl x509 -in cert.pem -noout -checkend 604800 || echo "expires within 7 days"   # exit 1 if expiring — for scripts/alerts
+$ openssl req -in jane.csr -noout -text                           # a CSR: subject, public key, requested extensions
+$ openssl rsa -in key.pem -noout -check; openssl rsa -in key.pem -noout -text | head -3    # key sanity, size
+$ openssl ec -in key.pem -noout -text 2&gt;/dev/null | head -3        # EC keys
+$ for f in /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt; do printf '%-50s %s\n' "$f" "$(sudo openssl x509 -in $f -noout -enddate | cut -d= -f2)"; done</code></pre>
+
+<h2>Verify</h2>
+<pre><code class="lang-bash"># chain: does cert.pem chain to ca.pem?
+$ openssl verify -CAfile ca.pem cert.pem                                    # cert.pem: OK
+$ openssl verify -CAfile root.pem -untrusted intermediate.pem cert.pem      # with an intermediate
+$ openssl verify -CAfile ca.pem -purpose sslclient cert.pem                 # also check usage (clientAuth)
+# does this key belong to this cert? compare public keys (works for RSA and EC)
+$ diff &lt;(openssl x509 -in cert.pem -noout -pubkey) &lt;(openssl pkey -in key.pem -pubout) &amp;&amp; echo "key matches cert"
+# older RSA-only trick:
+$ openssl x509 -noout -modulus -in cert.pem | md5sum; openssl rsa -noout -modulus -in key.pem | md5sum
+# a live endpoint
+$ openssl s_client -connect 10.0.0.10:6443 -servername kubernetes -CAfile /etc/kubernetes/pki/ca.crt &lt; /dev/null 2&gt;/dev/null | grep -E 'Verify return|subject=|issuer='
+$ openssl s_client -connect example.com:443 -showcerts &lt; /dev/null 2&gt;/dev/null | openssl x509 -noout -dates   # first cert in the chain
+$ openssl s_client -connect example.com:443 -showcerts &lt; /dev/null 2&gt;/dev/null | grep -E '^ [0-9] s:| i:'         # the chain as sent
+$ openssl s_client -connect 10.0.0.10:6443 -cert admin.crt -key admin.key -CAfile ca.crt &lt; /dev/null   # mTLS: present a client cert
+$ echo | openssl s_client -connect host:443 -servername api.example.com 2&gt;/dev/null | openssl x509 -noout -ext subjectAltName   # SNI-selected cert
+$ curl -v --cacert ca.pem https://host:6443/version 2&gt;&1 | grep -E 'SSL connection|subject|issuer|expire'</code></pre>
+<figure data-anim="verify-chain"></figure>
+
+<h2>Create</h2>
+<pre><code class="lang-bash"># keys
+$ openssl genrsa -out key.pem 2048                              # RSA 2048 (Kubernetes default)
+$ openssl ecparam -name prime256v1 -genkey -noout -out key.pem  # EC P-256 (smaller, faster)
+$ chmod 600 key.pem
+# CSR with subject and SANs (modern openssl: -addext)
+$ openssl req -new -key key.pem -subj "/CN=api.internal/O=platform" -addext "subjectAltName=DNS:api.internal,DNS:api,IP:10.0.0.5" -out api.csr
+# self-signed cert in one go (labs, tests)
+$ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=test.local" -addext "subjectAltName=DNS:test.local"
+# a private CA
+$ openssl genrsa -out ca.key 4096
+$ openssl req -x509 -new -key ca.key -sha256 -days 3650 -subj "/CN=my-ca" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca.crt
+# sign a CSR with the CA, carrying over the requested SANs and setting usage
+$ cat &gt; ext.cnf &lt;&lt;EOF
+subjectAltName=DNS:api.internal,DNS:api,IP:10.0.0.5
+extendedKeyUsage=serverAuth
+keyUsage=digitalSignature,keyEncipherment
+basicConstraints=CA:FALSE
+EOF
+$ openssl x509 -req -in api.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -sha256 -extfile ext.cnf -out api.crt
+$ openssl x509 -in api.crt -noout -subject -issuer -ext subjectAltName,extendedKeyUsage
+$ openssl verify -CAfile ca.crt api.crt       # OK
+# client cert (for mTLS / a Kubernetes user): extendedKeyUsage=clientAuth, CN=user, O=group
+$ openssl req -new -key jane.key -subj "/CN=jane/O=developers" -out jane.csr
+$ printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' &gt; client.cnf
+$ openssl x509 -req -in jane.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -extfile client.cnf -out jane.crt</code></pre>
+<div class="callout warn"><div class="ct">Two things people forget</div><ul>
+<li><strong>SANs are not copied from a CSR by default.</strong> <code>openssl x509 -req</code> ignores requested extensions unless you pass <code>-extfile</code> (or <code>-copy_extensions copy</code> on OpenSSL 3.x). A server cert without SANs is rejected by Go clients (kubectl) and modern browsers.</li>
+<li><strong>Usage must match the role.</strong> A cert without <code>clientAuth</code> cannot authenticate to the API server; without <code>serverAuth</code> it cannot serve. Kubernetes' CSR signers enforce this via <code>usages:</code>.</li>
+</ul></div>
+
+<h2>The Kubernetes files, mapped</h2>
+<div class="tbl-wrap"><table>
+<tr><th>What</th><th>Inspect with</th></tr>
+<tr><td>Cluster CA</td><td><code>openssl x509 -in /etc/kubernetes/pki/ca.crt -noout -subject -dates -ext basicConstraints</code></td></tr>
+<tr><td>API server serving cert (SANs!)</td><td><code>openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -ext subjectAltName -dates</code></td></tr>
+<tr><td>Any client cert's identity</td><td><code>openssl x509 -in apiserver-kubelet-client.crt -noout -subject</code> → CN = user, O = group</td></tr>
+<tr><td>A kubeconfig's embedded cert</td><td><code>kubectl config view --raw -o jsonpath='{.users[0].user.client-certificate-data}' | base64 -d | openssl x509 -noout -subject -dates</code></td></tr>
+<tr><td>Kubelet client cert (rotating)</td><td><code>openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -subject -dates</code></td></tr>
+<tr><td>etcd certs</td><td><code>openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/etcd/server.crt</code></td></tr>
+<tr><td>An Ingress TLS Secret</td><td><code>kubectl get secret x -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -ext subjectAltName -dates</code></td></tr>
+<tr><td>A CSR object's request</td><td><code>kubectl get csr jane -o jsonpath='{.spec.request}' | base64 -d | openssl req -noout -subject</code></td></tr>
+<tr><td>All expiries at once</td><td><code>kubeadm certs check-expiration</code></td></tr>
+<tr><td>Live API server cert</td><td><code>openssl s_client -connect 127.0.0.1:6443 &lt; /dev/null 2&gt;/dev/null | openssl x509 -noout -dates -ext subjectAltName</code></td></tr>
+</table></div>
+
+<h2>Reading TLS errors</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Message</th><th>Meaning</th><th>Check</th></tr>
+<tr><td><code>certificate signed by unknown authority</code></td><td>Client's trust store lacks the issuer</td><td>Which CA signed the server cert vs which CA the client has (<code>-CAfile</code>, kubeconfig CA)</td></tr>
+<tr><td><code>certificate has expired or is not yet valid</code></td><td>Dates — or clock skew</td><td><code>-dates</code>; <code>date</code> on both machines</td></tr>
+<tr><td><code>certificate is valid for X, Y, not Z</code></td><td>SAN mismatch</td><td><code>-ext subjectAltName</code>; connect using a listed name/IP or reissue</td></tr>
+<tr><td><code>tls: bad certificate</code> / <code>alert bad certificate</code></td><td>Server rejected the client cert (wrong CA, expired, wrong usage)</td><td>Verify the client cert against the server's client CA; <code>-purpose sslclient</code></td></tr>
+<tr><td><code>unable to get local issuer certificate</code></td><td>Chain incomplete (server did not send the intermediate)</td><td><code>s_client -showcerts</code>; put the full chain in tls.crt</td></tr>
+<tr><td><code>key values mismatch</code></td><td>Key does not match cert</td><td>The pubkey diff above</td></tr>
+</table></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ mkdir -p /tmp/pki && cd /tmp/pki
+# CA + server cert with SANs + client cert, then prove each property
+$ openssl genrsa -out ca.key 2048 && openssl req -x509 -new -key ca.key -days 365 -subj "/CN=lab-ca" -addext "basicConstraints=critical,CA:TRUE" -out ca.crt
+$ openssl genrsa -out srv.key 2048 && openssl req -new -key srv.key -subj "/CN=srv" -addext "subjectAltName=DNS:srv.local,IP:127.0.0.1" -out srv.csr
+$ printf 'subjectAltName=DNS:srv.local,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' &gt; srv.cnf
+$ openssl x509 -req -in srv.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 -extfile srv.cnf -out srv.crt
+$ openssl x509 -in srv.crt -noout -subject -issuer -dates -ext subjectAltName,extendedKeyUsage
+$ openssl verify -CAfile ca.crt srv.crt; openssl verify srv.crt 2&gt;&1 | tail -1     # OK vs unknown authority
+$ diff &lt;(openssl x509 -in srv.crt -noout -pubkey) &lt;(openssl pkey -in srv.key -pubout) &amp;&amp; echo "key matches"
+$ openssl s_server -accept 8443 -cert srv.crt -key srv.key -www &amp; sleep 1
+$ openssl s_client -connect 127.0.0.1:8443 -CAfile ca.crt &lt; /dev/null 2&gt;/dev/null | grep 'Verify return'   # 0 (ok)
+$ curl -s --cacert ca.crt https://127.0.0.1:8443 | head -2; curl -s --cacert ca.crt https://localhost:8443 2&gt;&1 | head -1   # "localhost" is not in the SANs
+$ openssl x509 -in srv.crt -noout -checkend $((40*86400)) || echo "expires within 40 days"
+$ kill %1; cd -</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>PEM everywhere; base64 of PEM in kubeconfigs and Secrets; chains are concatenated PEM blocks, leaf first.</li>
+<li><code>x509 -noout -subject -issuer -dates -ext subjectAltName</code> answers 90% of questions; <code>-checkend</code> for expiry scripts.</li>
+<li><code>verify -CAfile</code> for chains, the pubkey diff for key/cert matching, <code>s_client</code> for live endpoints (with <code>-servername</code> for SNI, <code>-cert/-key</code> for mTLS).</li>
+<li>Create with <code>genrsa</code> → <code>req -new -addext subjectAltName</code> → <code>x509 -req -CA … -extfile</code>; SANs and usages must be set explicitly.</li>
+<li>Error text maps directly to a check: unknown authority (CA), expired (dates/clock), valid for X not Y (SANs), bad certificate (client cert), local issuer (chain).</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.term('cmd', 20, 20, 680, 40, ['$ openssl verify -CAfile ca.crt -untrusted intermediate.crt api.crt'], { fs: 10 })
+    + S.box('leaf', 40, 90, 200, 70, ['api.crt', 'subject CN=api.internal', 'issuer CN=intermediate'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('int', 260, 90, 200, 70, ['intermediate.crt', 'subject CN=intermediate', 'issuer CN=my-ca'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('root', 480, 90, 200, 70, ['ca.crt (trusted)', 'subject CN=my-ca', 'issuer CN=my-ca'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.arrow('s1', 240, 125, 258, 125, { cls: 'hid' }) + S.arrow('s2', 460, 125, 478, 125, { cls: 'hid' })
+    + S.term('chk', 20, 185, 680, 100, ['checks:', '', '', ''], { fs: 9.5 })
+    + S.text('m', 360, 305, '', { cls: 'sm b' });
+  Anim.define('verify-chain', { w: 720, h: 320, title: 'What openssl verify checks', ms: 2800, svg, steps: [
+    { c: 'Three files: the leaf to verify, an intermediate offered as <b>untrusted</b> (a helper, not an anchor), and the CA we trust.', on(q){} },
+    { c: 'Start at the leaf. Its issuer is <code>CN=intermediate</code>. Find a cert with that subject → intermediate.crt. Check the leaf\'s <b>signature</b> with the intermediate\'s public key.', on(q){ q('#s1').show().set('hl'); q('#leaf rect').set('hl'); q('#chk-l1').text('api.crt signature valid under intermediate public key ✓').style('fill', 'var(--green)'); } },
+    { c: 'The intermediate\'s issuer is <code>CN=my-ca</code> → ca.crt. Check its signature with the CA\'s public key, and that ca.crt has <code>CA:TRUE</code> and may sign (keyCertSign).', on(q){ q('#s2').show().set('hl'); q('#int rect').set('hl'); q('#chk-l2').text('intermediate.crt signature valid under ca.crt · ca.crt is CA:TRUE ✓').style('fill', 'var(--green)'); } },
+    { c: 'ca.crt is in the trust store (<code>-CAfile</code>): the chain <b>closes</b>. Then, for every link: not expired, not before validity, usages consistent (<code>-purpose</code>).', on(q){ q('#root rect').set('ok'); q('#chk-l3').text('anchor found · dates OK for all 3 · purpose OK → api.crt: OK').style('fill', 'var(--green)'); q('#m').text('OK'); } },
+    { c: 'Failure modes: missing intermediate → "unable to get local issuer certificate"; wrong CA → "unable to verify the first certificate"/"self signed certificate in chain"; past notAfter → "certificate has expired". Each names the broken link.', on(q){ q('#chk-l3').text('e.g. without -untrusted intermediate.crt: error 20: unable to get local issuer certificate').style('fill', 'var(--red)'); q('#m').text('the error names the missing link'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

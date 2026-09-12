@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 48 · DNS & CoreDNS in Kubernetes · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d48" data-root="../" data-linux="l08" data-related="d12,d14,d44">
+<article class="lesson">
+<p class="lead">Everything in a cluster finds everything else by name: <code>api</code>, <code>postgres-0.postgres</code>, <code>kubernetes.default.svc</code>. Those names are answered by <strong>CoreDNS</strong>, a small DNS server that watches Services and Pods and synthesises records for them. This lesson first covers how DNS works at all (the companion video), then exactly how a Pod's resolver is configured, which records exist, and how to debug the "it can't resolve" class of outage.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>DNS from scratch: resolvers, the hierarchy, record types, TTLs</li>
+<li>CoreDNS: the Deployment, the <code>kube-dns</code> Service, and the Corefile</li>
+<li>What the kubelet writes into every Pod's <code>/etc/resolv.conf</code> and why <code>ndots:5</code> matters</li>
+<li>The record set: Services, headless Services, Pods, SRV, ExternalName</li>
+<li><code>dnsPolicy</code>, <code>dnsConfig</code>, and a debugging checklist</li>
+</ul></div>
+
+<h2>Part 1 — How DNS works</h2>
+<figure data-anim="dns-basics"></figure>
+<dl class="kv">
+<dt>Stub resolver</dt><dd>The library code in every program (glibc/musl <code>getaddrinfo</code>) that reads <code>/etc/resolv.conf</code> and sends queries to the configured <code>nameserver</code>. It does not recurse.</dd>
+<dt>Recursive resolver</dt><dd>The server the stub asks (your ISP's, 8.8.8.8, systemd-resolved, CoreDNS). It walks the hierarchy on your behalf and <strong>caches</strong> answers for their TTL.</dd>
+<dt>Root → TLD → authoritative</dt><dd>Root servers know who serves <code>.com</code>; <code>.com</code> servers know who serves <code>example.com</code>; example.com's authoritative servers hold the actual records.</dd>
+<dt>Record types</dt><dd><code>A</code> name → IPv4; <code>AAAA</code> → IPv6; <code>CNAME</code> alias → name; <code>SRV</code> service → host+port; <code>PTR</code> IP → name; <code>NS</code>, <code>MX</code>, <code>TXT</code>.</dd>
+<dt>TTL</dt><dd>How long a cached answer is valid. Kubernetes records use a TTL of 30 s by default (CoreDNS <code>ttl</code>).</dd>
+<dt>Search list &amp; ndots</dt><dd>Client-side conveniences: for a name with fewer than <code>ndots</code> dots, the stub tries <code>name.&lt;search1&gt;</code>, <code>name.&lt;search2&gt;</code>… before the bare name. This is the key to Kubernetes short names.</dd>
+</dl>
+<pre><code class="lang-bash">$ dig +short kubernetes.io A                 # just the answer
+$ dig kubernetes.io +trace | tail -20        # walk root → TLD → authoritative
+$ dig @10.96.0.10 api.shop.svc.cluster.local # ask a specific server (CoreDNS)
+$ nslookup api.shop.svc.cluster.local        # simpler, available in busybox</code></pre>
+
+<h2>Part 2 — CoreDNS in the cluster</h2>
+<pre><code class="lang-bash">$ kubectl -n kube-system get deploy,svc,cm -l k8s-app=kube-dns
+NAME                      READY   UP-TO-DATE   AVAILABLE
+deployment.apps/coredns   2/2     2            2
+NAME               TYPE        CLUSTER-IP   PORT(S)
+service/kube-dns   ClusterIP   10.96.0.10   53/UDP,53/TCP,9153/TCP     # the IP every pod's resolv.conf points at
+configmap/coredns</code></pre>
+<pre data-title="Corefile (kubectl -n kube-system get cm coredns -o yaml)"><code>.:53 {
+    errors
+    health { lameduck 5s }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {   # synthesise records for the cluster domain
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+        ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf {                        # everything else → the node's upstream resolvers
+        max_concurrent 1000
+    }
+    cache 30                                            # cache upstream answers
+    loop
+    reload                                              # pick up ConfigMap changes
+    loadbalance
+}</code></pre>
+<p>The <code>kubernetes</code> plugin watches Services and EndpointSlices through the API and answers queries under <code>cluster.local</code> from memory. Anything outside that zone is forwarded to whatever the CoreDNS Pod's own <code>/etc/resolv.conf</code> says — the node's resolvers (since the Pod runs with <code>dnsPolicy: Default</code>). Edit the ConfigMap to add stub zones, rewrite rules or custom hosts; <code>reload</code> applies it within a couple of minutes.</p>
+
+<h2>What a Pod sees</h2>
+<pre><code class="lang-bash">$ kubectl run t --rm -it --image=busybox:1.36 -n shop -- cat /etc/resolv.conf
+nameserver 10.96.0.10
+search shop.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</code></pre>
+<p>The kubelet writes this file for every Pod with the default <code>dnsPolicy: ClusterFirst</code>. Three consequences:</p>
+<ol>
+<li><code>api</code> → tried as <code>api.shop.svc.cluster.local</code> first → found. Short names work within the namespace.</li>
+<li><code>api.prod</code> → <code>api.prod.shop.svc.cluster.local</code> (NXDOMAIN) → <code>api.prod.svc.cluster.local</code> → found. Two queries.</li>
+<li><code>www.google.com</code> has 2 dots &lt; ndots 5 → <strong>four failed lookups</strong> (<code>www.google.com.shop.svc.cluster.local</code>, …svc.cluster.local, …cluster.local, then bare) before the answer. Every external call from every Pod pays this unless the app uses FQDNs with a trailing dot (<code>www.google.com.</code>) or you lower ndots.</li>
+</ol>
+<figure data-anim="cluster-dns"></figure>
+
+<h2>The record set</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Object</th><th>Name</th><th>Record</th></tr>
+<tr><td>Service (ClusterIP)</td><td><code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>A → ClusterIP</td></tr>
+<tr><td>Headless Service</td><td><code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>A → every ready Pod IP (multiple answers)</td></tr>
+<tr><td>StatefulSet Pod (via headless svc)</td><td><code>&lt;pod&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>A → that Pod's IP</td></tr>
+<tr><td>Named port</td><td><code>_&lt;port&gt;._&lt;proto&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>SRV → port number + target</td></tr>
+<tr><td>ExternalName Service</td><td><code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>CNAME → the external name</td></tr>
+<tr><td>Any Pod (<code>pods insecure</code>)</td><td><code>10-244-1-7.&lt;ns&gt;.pod.cluster.local</code></td><td>A → 10.244.1.7 (dashes for dots)</td></tr>
+<tr><td>Pod with <code>hostname</code>+<code>subdomain</code></td><td><code>&lt;hostname&gt;.&lt;subdomain&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>A → Pod IP (needs a headless Service named like the subdomain)</td></tr>
+<tr><td>The API server</td><td><code>kubernetes.default.svc.cluster.local</code></td><td>A → 10.96.0.1</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ kubectl run t --rm -it --image=busybox:1.36 -- sh -c '
+  nslookup kubernetes.default;
+  nslookup api.shop;
+  nslookup postgres-0.postgres.shop.svc.cluster.local;
+  nslookup -type=srv _pg._tcp.postgres.shop.svc.cluster.local'</code></pre>
+
+<h2>dnsPolicy and dnsConfig</h2>
+<div class="tbl-wrap"><table>
+<tr><th>dnsPolicy</th><th>resolv.conf comes from</th><th>Use</th></tr>
+<tr><td><code>ClusterFirst</code> (default)</td><td>CoreDNS + cluster search list</td><td>Normal Pods</td></tr>
+<tr><td><code>ClusterFirstWithHostNet</code></td><td>Same, for Pods with <code>hostNetwork: true</code> (which would otherwise get Default)</td><td>Host-network Pods that need cluster names</td></tr>
+<tr><td><code>Default</code></td><td>The node's resolv.conf — no cluster DNS!</td><td>CoreDNS itself; node agents</td></tr>
+<tr><td><code>None</code></td><td>Only what <code>dnsConfig</code> specifies</td><td>Full control</td></tr>
+</table></div>
+<pre><code class="lang-yaml">spec:
+  dnsPolicy: ClusterFirst
+  dnsConfig:                  # merged into the generated resolv.conf
+    options:
+    - name: ndots
+      value: "2"              # fewer wasted lookups for external names
+    searches: [corp.example.internal]
+    nameservers: [10.0.0.53]  # appended (max 3 total)</code></pre>
+
+<h2>Debugging checklist</h2>
+<pre><code class="lang-bash"># 1. is CoreDNS up and does the Service have endpoints?
+$ kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+$ kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns
+# 2. can a pod reach it? (NetworkPolicy blocking port 53 is the #1 cause after "CoreDNS is down")
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup kubernetes.default 10.96.0.10
+# 3. what does the pod's resolv.conf say? (wrong dnsPolicy, hostNetwork)
+$ kubectl exec app -- cat /etc/resolv.conf
+# 4. does the record exist? (Service in the right namespace? selector matches → endpoints?)
+$ kubectl get svc,endpointslices -n shop
+# 5. CoreDNS logs — add "log" to the Corefile temporarily to see every query
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --tail=50
+# 6. upstream: can CoreDNS itself resolve external names? (node resolv.conf, egress firewall)
+$ kubectl -n kube-system exec deploy/coredns -- cat /etc/resolv.conf 2&gt;/dev/null || kubectl run t --rm -it --image=busybox:1.36 -- nslookup example.com
+# 7. kube-proxy / CNI: DNS traffic to the ClusterIP 10.96.0.10 is Service traffic — if all Services are broken, so is DNS (Day 12, Day 58)</code></pre>
+
+<div class="callout linux" data-ref="l08"><div class="ct">Under the hood · Linux</div><p>There is no DNS client in the kernel: resolution happens in the C library of each process, driven by <code>/etc/nsswitch.conf</code> (<code>hosts: files dns</code> — <code>/etc/hosts</code> first, then DNS) and <code>/etc/resolv.conf</code>. The kubelet writes those files into the container's rootfs at start (<code>/etc/hosts</code> gets the Pod's own hostname/IP plus <code>hostAliases</code>). Alpine's musl resolver behaves differently from glibc: it queries all nameservers in parallel and historically ignored some options — one reason "works in the Debian image, not in the Alpine one". <code>ndots</code> is purely a client-side rule; CoreDNS just sees a stream of NXDOMAIN-producing queries. A <strong>node-local DNS cache</strong> (NodeLocal DNSCache DaemonSet) puts a caching resolver on every node to cut that traffic and avoid conntrack races on UDP 53.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Know the FQDN pattern cold: <code>svc.ns.svc.cluster.local</code>; for StatefulSets <code>pod.svc.ns.svc.cluster.local</code>. Questions ask you to write these into a ConfigMap or test them with nslookup.</li>
+<li>"DNS resolution failing in namespace X" → check NetworkPolicies there, then CoreDNS Pods/endpoints, then the Pod's resolv.conf.</li>
+<li>CoreDNS config lives in the <code>coredns</code> ConfigMap in kube-system; the Service is <code>kube-dns</code> (historical name).</li>
+<li><code>busybox:1.36</code> has nslookup; <code>nicolaka/netshoot</code> has dig, curl, tcpdump and everything else.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl create ns shop && kubectl create deploy api --image=nginx -n shop && kubectl expose deploy api --port=80 -n shop
+$ kubectl run t --rm -it --image=busybox:1.36 -n shop -- sh -c 'cat /etc/resolv.conf; nslookup api; nslookup api.shop.svc.cluster.local; nslookup kubernetes.default'
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup api                 # default ns: fails (NXDOMAIN) — wrong search domain
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup api.shop           # works
+$ kubectl -n kube-system get cm coredns -o yaml | grep -A3 'kubernetes cluster'
+# watch queries: enable logging for a minute
+$ kubectl -n kube-system get cm coredns -o yaml | sed 's/    errors/    log\n    errors/' | kubectl apply -f -
+$ sleep 60; kubectl run t --rm -it --image=busybox:1.36 -- nslookup example.com &gt;/dev/null; kubectl -n kube-system logs -l k8s-app=kube-dns --tail=10   # see the ndots search attempts
+$ kubectl -n kube-system get cm coredns -o yaml | sed '/^    log$/d' | kubectl apply -f -
+$ kubectl run t --rm -it --image=busybox:1.36 --overrides='{"spec":{"dnsPolicy":"Default"}}' -- sh -c 'cat /etc/resolv.conf; nslookup api.shop || echo "no cluster DNS with dnsPolicy Default"'
+$ kubectl delete ns shop</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>DNS = stub resolver (resolv.conf) → recursive resolver → hierarchy; records are cached for their TTL.</li>
+<li>CoreDNS (Service <code>kube-dns</code>, 10.96.0.10) synthesises <code>cluster.local</code> records from Services/EndpointSlices and forwards the rest upstream. Config = the <code>coredns</code> ConfigMap.</li>
+<li>Pods get <code>search ns.svc.cluster.local svc.cluster.local cluster.local</code> + <code>ndots:5</code>: short names work in-namespace; external names cost extra lookups.</li>
+<li>Records: Service A, headless → Pod IPs, <code>pod.svc.ns.svc.cluster.local</code> for StatefulSets, SRV for named ports, CNAME for ExternalName.</li>
+<li>Debug: CoreDNS Pods/endpoints → NetworkPolicy on 53 → Pod resolv.conf/dnsPolicy → record exists → CoreDNS logs → upstream.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.icon('app', 50, 150, 'laptop', { label: 'browser', ly: 28 })
+    + S.box('stub', 110, 125, 110, 50, ['stub resolver', 'resolv.conf'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('rec', 270, 125, 130, 50, ['recursive resolver', 'cache'], { subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.box('root', 480, 30, 200, 40, ['root servers', '"ask .com at …"'], { subfs: 9, subcls: 'muted' })
+    + S.box('tld', 480, 125, 200, 40, ['.com servers', '"ask example.com at …"'], { subfs: 9, subcls: 'muted' })
+    + S.box('auth', 480, 220, 200, 40, ['example.com authoritative', 'www A 93.184.216.34 TTL 300'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.arrow('a1', 80, 150, 108, 150) + S.arrow('a2', 220, 150, 268, 150, { cls: 'hid', label: 'www.example.com?', ly: 140 })
+    + S.arrow('a3', 400, 140, 478, 55, { d: 'M 400 140 L 478 55', cls: 'hid' }) + S.arrow('a4', 400, 150, 478, 145, { cls: 'hid' }) + S.arrow('a5', 400, 160, 478, 235, { d: 'M 400 160 L 478 235', cls: 'hid' })
+    + S.text('m', 360, 290, '', { cls: 'sm b' });
+  Anim.define('dns-basics', { w: 720, h: 305, title: 'DNS resolution', ms: 2600, svg: s1, steps: [
+    { c: 'The app calls <code>getaddrinfo("www.example.com")</code>. The <b>stub resolver</b> in libc checks <code>/etc/hosts</code>, then sends the query to the <code>nameserver</code> in resolv.conf.', on(q){ q('#a2').show().set('hl'); } },
+    { c: 'The <b>recursive resolver</b> checks its cache. Miss → it asks a <b>root server</b>, which does not know the answer but knows who serves <code>.com</code>.', on(q){ q('#a3').show().set('hl'); q('#rec rect').set('hl'); } },
+    { c: 'The <code>.com</code> servers refer it to example.com\'s <b>authoritative</b> name servers.', on(q){ q('#a4').show().set('hl'); } },
+    { c: 'The authoritative server returns the A record with a TTL. The resolver caches it for 300 s and answers the stub, which returns the IP to the app.', on(q){ q('#a5').show().set('ok'); q('#auth rect').set('pur'); q('#m').text('www.example.com A 93.184.216.34 (cached 300 s)'); } },
+    { c: 'In a cluster, the "recursive resolver" every Pod points at is <b>CoreDNS</b>. It answers <code>cluster.local</code> names itself from its watch of Services and forwards everything else exactly like this.', on(q){ q('#rec').text('CoreDNS 10.96.0.10'); q('#rec rect').set('ok'); q('#m').text('CoreDNS = authoritative for cluster.local + recursive for the rest'); } },
+  ]});
+
+  let s2 = S.zone('pod', 20, 20, 300, 200, 'pod in namespace shop')
+    + S.term('rc', 35, 45, 270, 80, ['nameserver 10.96.0.10', 'search shop.svc.cluster.local', '  svc.cluster.local cluster.local', 'options ndots:5'], { fs: 9 })
+    + S.text('qn', 170, 160, '', { cls: 'sm mono b' }) + S.text('qn2', 170, 185, '', { cls: 'xs mono muted' })
+    + S.box('cd', 420, 60, 260, 60, ['CoreDNS', 'kubernetes plugin · forward .'], { subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.term('log', 420, 140, 280, 110, ['queries received:', '', '', '', ''], { fs: 8.5 })
+    + S.arrow('a1', 320, 100, 418, 90, { cls: 'hl' })
+    + S.text('m', 360, 290, '', { cls: 'sm b' });
+  const L = (q, lines, color) => lines.forEach((t, i) => q('#log-l' + (i + 1)).text(t).style('fill', color));
+  Anim.define('cluster-dns', { w: 720, h: 305, title: 'Search list and ndots in action', ms: 3200, svg: s2, steps: [
+    { c: 'The kubelet wrote this resolv.conf. <code>ndots:5</code> means: any name with fewer than 5 dots is <i>relative</i> — try the search domains first.', on(q){ } },
+    { c: 'App looks up <code>api</code> (0 dots). First candidate: <code>api.shop.svc.cluster.local</code>. CoreDNS finds Service api in shop → one query, one answer.', on(q){ q('#qn').text('api'); q('#qn2').text('→ api.shop.svc.cluster.local ✓'); L(q, ['api.shop.svc.cluster.local  A 10.96.4.7', '', '', ''], 'var(--green)'); q('#m').text('short name: 1 query'); } },
+    { c: '<code>api.prod</code> (1 dot): first <code>api.prod.shop.svc.cluster.local</code> → NXDOMAIN; then <code>api.prod.svc.cluster.local</code> → found. Two queries.', on(q){ q('#qn').text('api.prod'); q('#qn2').text('→ .shop.svc… ✗ → .svc.cluster.local ✓'); L(q, ['api.prod.shop.svc.cluster.local  NXDOMAIN', 'api.prod.svc.cluster.local  A 10.96.9.2', '', ''], 'var(--amber)'); q('#log-l2').style('fill', 'var(--green)'); q('#m').text('cross-namespace: 2 queries'); } },
+    { c: '<code>api.payments.example.com</code> (3 dots, still &lt; 5): three cluster-suffixed attempts fail before the bare name is forwarded upstream. <b>Four round trips</b> for every external call.', on(q){ q('#qn').text('api.payments.example.com'); q('#qn2').text('→ 3 × NXDOMAIN → forwarded ✓'); L(q, ['api.payments.example.com.shop.svc.cluster.local  NXDOMAIN', 'api.payments.example.com.svc.cluster.local  NXDOMAIN', 'api.payments.example.com.cluster.local  NXDOMAIN', 'api.payments.example.com  A 52.x.x.x  (forwarded)'], 'var(--red)'); q('#log-l4').style('fill', 'var(--green)'); q('#m').text('external names pay the ndots tax'); } },
+    { c: 'Fixes: use a trailing dot (<code>api.payments.example.com.</code> is absolute — 1 query), lower <code>ndots</code> with <code>dnsConfig</code>, or run NodeLocal DNSCache. For cluster names, prefer the FQDN in config files.', on(q){ q('#qn').text('api.payments.example.com.'); q('#qn2').text('absolute (trailing dot) → forwarded immediately'); L(q, ['api.payments.example.com  A 52.x.x.x', '', '', ''], 'var(--green)'); q('#m').text('trailing dot or ndots:2'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

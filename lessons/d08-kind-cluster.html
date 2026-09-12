@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 8 · KIND Cluster & Context · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d08" data-root="../" data-linux="l02,l07">
+<article class="lesson">
+<p class="lead">Reading about clusters only gets you so far. <strong>KIND</strong> (Kubernetes IN Docker) runs a real, multi-node, conformant Kubernetes cluster on your laptop in about a minute, using Docker containers as "nodes". This lesson installs the tools, creates a cluster with one control plane and two workers, and explains the kubeconfig file and <em>contexts</em> that kubectl uses to find it.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Installing <code>kubectl</code> and <code>kind</code></li>
+<li>Creating single- and multi-node clusters from a KIND config file, with port mappings for later lessons</li>
+<li>What a KIND "node" actually is (a container running systemd, kubelet and containerd)</li>
+<li>kubeconfig: clusters, users, contexts — and switching between them</li>
+</ul></div>
+
+<h2>Install the tools</h2>
+<pre><code class="lang-bash"># kubectl — the CLI (pick your platform from kubernetes.io/docs/tasks/tools)
+$ curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+$ sudo install -m 0755 kubectl /usr/local/bin/kubectl
+$ kubectl version --client
+
+# kind — needs Docker (or Podman) running
+$ go install sigs.k8s.io/kind@latest              # or: brew install kind / choco install kind
+$ kind version</code></pre>
+<p>On macOS/Windows use Docker Desktop; on Linux, Docker Engine. Everything KIND creates lives inside Docker, so <code>docker ps</code> shows your cluster.</p>
+
+<h2>Create a cluster</h2>
+<pre><code class="lang-bash">$ kind create cluster                     # one node, named "kind", ~60 s
+$ kubectl cluster-info --context kind-kind
+$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+kind-control-plane   Ready    control-plane   50s   v1.31.0
+$ kind delete cluster</code></pre>
+<p>For the rest of the course you want <strong>multiple nodes</strong> (scheduling, taints, DaemonSets and node troubleshooting all need them) and a couple of <strong>host port mappings</strong> so NodePort Services and an Ingress controller are reachable from your browser.</p>
+<pre data-title="kind-config.yaml"><code class="lang-yaml">kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: cka
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"   # for the ingress lessons
+  extraPortMappings:
+  - containerPort: 80        # host:80  → control-plane:80  (ingress)
+    hostPort: 80
+  - containerPort: 443
+    hostPort: 443
+  - containerPort: 30080     # host:30080 → NodePort 30080 (Day 12)
+    hostPort: 30080
+- role: worker
+- role: worker</code></pre>
+<pre><code class="lang-bash">$ kind create cluster --config kind-config.yaml
+$ kubectl get nodes -o wide
+NAME                STATUS   ROLES           AGE   VERSION   INTERNAL-IP
+cka-control-plane   Ready    control-plane   2m    v1.31.0   172.18.0.2
+cka-worker          Ready    &lt;none&gt;          90s   v1.31.0   172.18.0.3
+cka-worker2         Ready    &lt;none&gt;          90s   v1.31.0   172.18.0.4
+$ docker ps --format '{{.Names}}\t{{.Image}}'   # three containers = three nodes</code></pre>
+<div class="callout tip"><div class="ct">Pin the Kubernetes version</div><p><code>kind create cluster --image kindest/node:v1.31.0</code> selects the version. KIND publishes a node image per Kubernetes release, so you can practise <em>upgrades</em> too — but kubeadm on VMs (<a href="d54-kubeadm-cluster.html">Day 54</a>) is the realistic way to do that.</p></div>
+
+<h2>What a KIND node really is</h2>
+<figure data-anim="kind-nesting"></figure>
+<div class="callout linux" data-ref="l02,l07"><div class="ct">Under the hood · Linux</div>
+<p>Each node is a privileged Docker container whose PID 1 is <strong>systemd</strong>. Inside it, systemd starts <code>kubelet.service</code> and <code>containerd.service</code>, exactly as on a real VM — so the Pods you create become containers <em>inside</em> the node container (nested container runtimes, made possible by nested namespaces and cgroups). On the control-plane node, <code>/etc/kubernetes/manifests</code> holds the static-Pod manifests for etcd, the API server, scheduler and controller-manager, just like a kubeadm cluster — because KIND <em>uses</em> kubeadm to bootstrap. That makes it a faithful model of Module 12.</p>
+<pre><code class="lang-bash">$ docker exec -it cka-control-plane bash
+root@cka-control-plane:/# systemctl status kubelet
+root@cka-control-plane:/# crictl ps                          # containers of every Pod on this node
+root@cka-control-plane:/# ls /etc/kubernetes/manifests/
+root@cka-control-plane:/# journalctl -u kubelet --no-pager | tail</code></pre></div>
+
+<h2>kubeconfig and contexts</h2>
+<p>kubectl needs three things to talk to a cluster: <em>where</em> it is (server URL + CA), <em>who</em> you are (a client certificate or token), and which <em>namespace</em> to default to. A kubeconfig file stores these as reusable pieces and a <strong>context</strong> ties one cluster, one user and a namespace together.</p>
+<pre data-title="~/.kube/config (trimmed)"><code class="lang-yaml">apiVersion: v1
+kind: Config
+clusters:
+- name: kind-cka
+  cluster:
+    server: https://127.0.0.1:43521
+    certificate-authority-data: LS0tLS1CRUdJTi…   # CA that signed the API server's cert
+users:
+- name: kind-cka
+  user:
+    client-certificate-data: LS0tLS1CRUdJTi…   # who you are (CN=kubernetes-admin, O=system:masters)
+    client-key-data: LS0tLS1CRUdJTi…
+contexts:
+- name: kind-cka
+  context:
+    cluster: kind-cka
+    user: kind-cka
+    namespace: default
+current-context: kind-cka</code></pre>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Purpose</th></tr>
+<tr><td>kubectl config view</td><td>Show the merged config (secrets redacted; add <code>--raw</code> to see them).</td></tr>
+<tr><td>kubectl config get-contexts</td><td>List contexts; <code>*</code> marks the current one.</td></tr>
+<tr><td>kubectl config current-context</td><td>Print the active context name.</td></tr>
+<tr><td>kubectl config use-context kind-cka</td><td>Switch clusters.</td></tr>
+<tr><td>kubectl config set-context --current --namespace=dev</td><td>Change the default namespace for the current context (huge time-saver in the exam).</td></tr>
+<tr><td>kubectl --context=prod get pods</td><td>One-off override without switching.</td></tr>
+<tr><td>KUBECONFIG=a.yaml:b.yaml kubectl config view --flatten</td><td>Merge several files into one.</td></tr>
+</table></div>
+<p>KIND writes its context into <code>~/.kube/config</code> automatically (<code>kind get kubeconfig --name cka</code> prints it). The <em>why</em> of every field — the CA, the client cert, what "system:masters" means — is <a href="d32-tls-part2-kubeconfig.html">Day 32</a>.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Every exam question starts with a line like <code>kubectl config use-context k8s-c2</code>. Run it <em>every time</em>, even if you think you are already there. Then, if the task lives in one namespace, <code>kubectl config set-context --current --namespace=&lt;ns&gt;</code> so you cannot forget <code>-n</code>. Also set <code>alias k=kubectl</code> and <code>export do="--dry-run=client -o yaml"</code> at the start.</p></div>
+
+<h2>Useful KIND commands</h2>
+<pre><code class="lang-bash">$ kind get clusters
+$ kind get nodes --name cka
+$ kind load docker-image myapp:1.0 --name cka     # push a local image into the nodes (no registry needed)
+$ kind export logs ./kind-logs --name cka          # kubelet/containerd/journal logs from every node
+$ docker stop cka-worker2 && docker start cka-worker2   # simulate a node outage (Day 58)
+$ kind delete cluster --name cka</code></pre>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kind create cluster --config kind-config.yaml
+$ kubectl get nodes,pods -A
+$ kubectl config get-contexts
+$ kubectl create namespace dev
+$ kubectl config set-context --current --namespace=dev
+$ kubectl run nginx --image=nginx && kubectl get pods       # lands in dev without -n
+$ kubectl config set-context --current --namespace=default
+$ docker exec cka-worker crictl ps                          # is the nginx container on this node?
+$ docker exec cka-worker2 crictl ps                         # or this one?</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>KIND = real Kubernetes, bootstrapped by kubeadm, with Docker containers as nodes. Perfect for every lesson except real upgrades and cloud integrations.</li>
+<li>Use a config file for multi-node clusters and <code>extraPortMappings</code> to reach NodePorts/Ingress from the host.</li>
+<li>kubeconfig = clusters + users + contexts; a context is (cluster, user, namespace). <code>use-context</code> and <code>set-context --current --namespace</code> are daily commands.</li>
+<li>Each node container runs systemd → kubelet + containerd; Pods are nested containers.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.zone('host', 10, 10, 700, 300, 'Your laptop · Docker Engine')
+    + S.node('cp', 30, 40, 300, 250, 'container: cka-control-plane', { sub: 'PID 1 = systemd' })
+    + S.node('w', 390, 40, 300, 250, 'container: cka-worker', { sub: 'PID 1 = systemd' })
+    + S.box('cp-kl', 50, 85, 120, 34, 'kubelet.service', { fs: 10, hidden: true }) + S.box('cp-cd', 190, 85, 120, 34, 'containerd.service', { fs: 10, hidden: true })
+    + S.box('w-kl', 410, 85, 120, 34, 'kubelet.service', { fs: 10, hidden: true }) + S.box('w-cd', 550, 85, 120, 34, 'containerd.service', { fs: 10, hidden: true })
+    + S.zone('cp-sp', 50, 135, 260, 140, 'static pods from /etc/kubernetes/manifests', { cls: 'hid' })
+    + S.pod('sp1', 95, 190, 'apiserver', { cls: 'pur', w: 66, hidden: true }) + S.pod('sp2', 175, 190, 'etcd', { cls: 'pur', w: 56, hidden: true }) + S.pod('sp3', 250, 190, 'sched', { cls: 'pur', w: 56, hidden: true })
+    + S.pod('sp4', 135, 240, 'ctrl-mgr', { cls: 'pur', w: 66, hidden: true }) + S.pod('sp5', 220, 240, 'kube-proxy', { cls: 'cy', w: 72, hidden: true })
+    + S.zone('w-sp', 410, 135, 260, 140, 'your workloads', { cls: 'hid' })
+    + S.pod('wp1', 460, 190, 'nginx', { cls: 'ok', hidden: true }) + S.pod('wp2', 540, 190, 'api', { cls: 'ok', hidden: true }) + S.pod('wp3', 620, 190, 'kube-proxy', { cls: 'cy', w: 72, hidden: true })
+    + S.pod('wp4', 500, 240, 'coredns', { cls: 'cy', w: 66, hidden: true }) + S.pod('wp5', 590, 240, 'kindnet', { cls: 'cy', w: 66, hidden: true });
+  Anim.define('kind-nesting', { w: 720, h: 320, title: 'What kind create cluster builds', svg, steps: [
+    { c: '<code>kind create cluster</code> starts one Docker container per node from the <code>kindest/node</code> image. Each container\'s PID 1 is <b>systemd</b>, like a real Linux VM.', on(q){} },
+    { c: 'systemd starts <b>kubelet</b> and <b>containerd</b> inside each container — the same two services a kubeadm node runs.', on(q){ q('#cp-kl,#cp-cd,#w-kl,#w-cd').show(); } },
+    { c: 'On the control-plane node, kubeadm has written static-Pod manifests. The kubelet reads them and asks containerd to start <b>nested containers</b> for etcd, the API server, scheduler and controller-manager.', on(q){ q('#cp-sp').show(); q('#sp1,#sp2,#sp3,#sp4').show(); } },
+    { c: 'The workers join through the API server. Add-ons arrive as DaemonSets and Deployments: kube-proxy on every node, CoreDNS, and <b>kindnet</b> (KIND\'s simple CNI).', on(q){ q('#sp5,#wp3,#wp4,#wp5').show(); q('#w-sp').show(); } },
+    { c: 'Your Pods are containers inside the worker containers. <code>docker exec cka-worker crictl ps</code> shows them; <code>docker ps</code> on the host shows only the nodes.', on(q){ q('#wp1,#wp2').show(); } },
+  ]});
+})();
+</script>
+</body>
+</html>

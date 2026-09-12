@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 2 · Your First Dockerfile · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d02" data-root="../" data-linux="l04">
+<article class="lesson">
+<p class="lead">A Dockerfile is a recipe: a short list of instructions that turns a base image plus your source code into a new image. Each instruction produces one filesystem layer, and understanding that one fact explains build caching, image size, and half of the "why is my build slow?" questions you will ever get.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The instructions every Dockerfile uses: <code>FROM</code>, <code>WORKDIR</code>, <code>COPY</code>, <code>RUN</code>, <code>ENV</code>, <code>EXPOSE</code>, <code>CMD</code></li>
+<li>How <code>docker build</code> turns instructions into cached layers</li>
+<li>Tagging and pushing to Docker Hub so a cluster can pull your image</li>
+</ul></div>
+
+<h2>A minimal application</h2>
+<p>We will containerise a tiny Python web app. The language does not matter — the pattern is identical for Node, Go or Java.</p>
+<div class="grid-2">
+<div><pre data-title="app.py"><code>from flask import Flask
+import os, socket
+
+app = Flask(__name__)
+
+@app.route("/")
+def hello():
+    return f"Hello from {socket.gethostname()} (v{os.getenv('APP_VERSION','1')})\n"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)</code></pre></div>
+<div><pre data-title="requirements.txt"><code>flask==3.0.3</code></pre>
+<p class="mini">Binding to <code>0.0.0.0</code> matters: a container has its own network namespace, so a server listening on <code>127.0.0.1</code> is unreachable from outside it.</p></div>
+</div>
+
+<h2>The Dockerfile</h2>
+<pre data-title="Dockerfile"><code class="lang-dockerfile"># 1. Start from an image that already has Python
+FROM python:3.12-slim
+
+# 2. Every following relative path is inside /app (created if missing)
+WORKDIR /app
+
+# 3. Copy dependency list first — this layer changes rarely
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 4. Now copy the source code — this layer changes often
+COPY app.py .
+
+# 5. Metadata: environment variable and the port the app listens on
+ENV APP_VERSION=1
+EXPOSE 5000
+
+# 6. What to run when a container starts from this image
+CMD ["python", "app.py"]</code></pre>
+
+<div class="tbl-wrap"><table>
+<tr><th>Instruction</th><th>Meaning</th><th>Creates a layer?</th></tr>
+<tr><td><code>FROM</code></td><td>Base image. Must be first (apart from <code>ARG</code>). <code>FROM scratch</code> is an empty image.</td><td>Reuses the base's layers</td></tr>
+<tr><td><code>WORKDIR</code></td><td>Set the working directory for subsequent instructions and for the running container.</td><td>Metadata (tiny)</td></tr>
+<tr><td><code>COPY</code></td><td>Copy files from the build context into the image. Prefer over <code>ADD</code> (which also unpacks tarballs and fetches URLs).</td><td>Yes</td></tr>
+<tr><td><code>RUN</code></td><td>Execute a command <em>at build time</em> and snapshot the resulting filesystem.</td><td>Yes</td></tr>
+<tr><td><code>ENV</code></td><td>Environment variable available at build time and in every container.</td><td>Metadata</td></tr>
+<tr><td><code>EXPOSE</code></td><td>Documents which port the app listens on. It does <strong>not</strong> publish anything (see <a href="d03-docker-flags-ports.html">Day 3</a>).</td><td>Metadata</td></tr>
+<tr><td><code>CMD</code></td><td>Default command <em>at run time</em>. Only the last <code>CMD</code> counts.</td><td>Metadata</td></tr>
+</table></div>
+
+<h2>Building: instructions become layers</h2>
+<pre><code class="lang-bash">$ docker build -t hello-web:1.0 .
+[+] Building 12.4s (10/10) FINISHED
+ => [1/5] FROM docker.io/library/python:3.12-slim
+ => [2/5] WORKDIR /app
+ => [3/5] COPY requirements.txt .
+ => [4/5] RUN pip install --no-cache-dir -r requirements.txt
+ => [5/5] COPY app.py .
+ => exporting to image
+ => => naming to docker.io/library/hello-web:1.0</code></pre>
+<p>The trailing <code>.</code> is the <strong>build context</strong>: the directory sent to the Docker daemon. <code>COPY</code> can only reference files inside it. Anything large you do not need (<code>.git</code>, <code>node_modules</code>, local data) should be excluded with a <code>.dockerignore</code> file, exactly like <code>.gitignore</code>.</p>
+
+<figure data-anim="build-cache"></figure>
+
+<div class="callout tip"><div class="ct">The layer-ordering rule</div><p>Docker rebuilds from the <em>first instruction whose inputs changed</em> and every instruction after it. So put the things that change least (base image, OS packages, dependency install) at the top, and the things that change most (your source code) at the bottom. That is why <code>requirements.txt</code> is copied and installed <em>before</em> <code>app.py</code>: editing your code no longer re-runs <code>pip install</code>.</p></div>
+
+<div class="callout linux" data-ref="l04"><div class="ct">Under the hood · Linux</div><p>Each layer is a directory on disk (<code>/var/lib/docker/overlay2/&lt;id&gt;/diff</code>). A <code>RUN</code> step mounts all previous layers as an OverlayFS "lower" stack with a fresh "upper" directory, executes the command in a temporary container, then keeps the upper directory as the new layer. Files deleted in a later layer are not removed from the earlier one — they are hidden by a <em>whiteout</em> file. That is why <code>RUN rm -rf big-file</code> in a separate step does not make an image smaller.</p></div>
+
+<h2>Run it</h2>
+<pre><code class="lang-bash">$ docker run -d --name hello -p 8080:5000 hello-web:1.0
+$ curl localhost:8080
+Hello from 3f9c1a2b7d1e (v1)
+$ docker run --rm -e APP_VERSION=2 -p 8081:5000 hello-web:1.0   # override ENV at run time</code></pre>
+
+<h2>Push to Docker Hub</h2>
+<p>A registry is how your image gets to a cluster. Kubernetes nodes never see your laptop; they pull from a registry by name.</p>
+<ol class="steps">
+<li><strong>Log in</strong><pre><code class="lang-bash">$ docker login          # username + password or access token</code></pre></li>
+<li><strong>Tag with your namespace</strong> — Docker Hub repositories are <code>&lt;username&gt;/&lt;repo&gt;</code>.<pre><code class="lang-bash">$ docker tag hello-web:1.0 yourname/hello-web:1.0
+$ docker tag hello-web:1.0 yourname/hello-web:latest   # a second tag on the same image ID</code></pre></li>
+<li><strong>Push</strong> — only layers the registry does not already have are uploaded.<pre><code class="lang-bash">$ docker push yourname/hello-web:1.0
+$ docker push yourname/hello-web:latest</code></pre></li>
+<li><strong>Pull from anywhere</strong><pre><code class="lang-bash">$ docker pull yourname/hello-web:1.0
+$ kubectl run hello --image=yourname/hello-web:1.0 --port=5000   # preview of Day 13</code></pre></li>
+</ol>
+<div class="callout warn"><div class="ct">Tags are not versions</div><p><code>latest</code> is overwritten every time you push it, and a Kubernetes node that already has <code>yourname/hello-web:latest</code> cached may never pull the new one (the default <code>imagePullPolicy</code> for tagged images is <code>IfNotPresent</code>). Always ship immutable tags like <code>1.0.3</code> or a git SHA. Details on <a href="d22-pod-lifecycle.html">Day 22</a>.</p></div>
+
+<h2>Inspecting what you built</h2>
+<pre><code class="lang-bash">$ docker images hello-web
+$ docker history hello-web:1.0        # one line per layer with its size
+$ docker inspect hello-web:1.0 | jq '.[0].Config'   # Env, Cmd, ExposedPorts, WorkingDir</code></pre>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3><p>Build, break the cache on purpose, push.</p>
+<pre><code class="lang-bash">$ mkdir hello-web && cd hello-web
+# create app.py, requirements.txt and Dockerfile from above
+$ docker build -t hello-web:1.0 .
+$ docker build -t hello-web:1.0 .            # second build: every step says CACHED
+$ sed -i 's/Hello/Hi/' app.py
+$ docker build -t hello-web:1.1 .            # only steps 5+ rebuild
+$ echo "requests" >> requirements.txt
+$ docker build -t hello-web:1.2 .            # steps 3+ rebuild, pip runs again
+$ docker history hello-web:1.2
+$ docker tag hello-web:1.2 &lt;you&gt;/hello-web:1.2 && docker push &lt;you&gt;/hello-web:1.2</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A Dockerfile is executed top to bottom; <code>RUN</code>, <code>COPY</code> and <code>ADD</code> create filesystem layers, everything else is metadata.</li>
+<li>The cache is invalidated from the first changed instruction downward — order rarely-changing steps first.</li>
+<li><code>EXPOSE</code> documents; <code>-p</code> publishes. <code>ENV</code> sets defaults that <code>-e</code> can override.</li>
+<li>Push with an immutable tag to a registry; clusters pull by name, never from your machine.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const steps = ['FROM python:3.12-slim', 'WORKDIR /app', 'COPY requirements.txt .', 'RUN pip install …', 'COPY app.py .', 'CMD ["python","app.py"]'];
+  let svg = S.text('t', 200, 28, 'Dockerfile', { cls: 'b' }) + S.text('t2', 540, 28, 'Layers on disk', { cls: 'b' });
+  steps.forEach((s, i) => {
+    svg += S.box(`i${i}`, 40, 46 + i * 42, 320, 34, s, { cls: 'soft', fs: 11, lcls: 'mono' });
+    svg += S.box(`l${i}`, 430, 256 - i * 42, 220, 34, `layer ${i + 1}`, { fs: 11, hidden: true });
+    svg += S.text(`s${i}`, 660, 277 - i * 42, '', { cls: 'xs muted left' });
+  });
+  svg += S.arrow('a', 365, 170, 425, 170, { cls: 'dashed' });
+  const sizes = ['130 MB', '0 B', '12 B', '11 MB', '412 B', '0 B'];
+  const st = [];
+  steps.forEach((s, i) => st.push({ c: `<b>Step ${i + 1}</b>: <code>${s}</code> ${['pulls the base image — its layers are reused as-is.', 'only records metadata; no filesystem change.', 'adds one small file → one small layer.', 'installs packages → a big layer, the slow step.', 'adds your code → a tiny layer.', 'is metadata: the default command, stored in the image config.'][i]}`, ms: 1600, on(q){ q(`#i${i} rect`).set('hl'); if (i) q(`#i${i-1} rect`).set(); q(`#l${i}`).show(); q(`#s${i}`).text(sizes[i]); } }));
+  st.push({ c: 'Second build, nothing changed: every step is a <b>cache hit</b> — the build finishes in under a second.', ms: 2200, on(q){ q('#i5 rect').set(); steps.forEach((_, i) => q(`#l${i} rect`).set('ok')); } });
+  st.push({ c: 'You edit <code>app.py</code>. Steps 1–4 still hit the cache, but step 5\'s input changed, so it and everything below it are rebuilt. <code>pip install</code> is skipped.', ms: 2600, on(q){ q('#l4 rect,#l5 rect').set('warn'); q('#i4 rect,#i5 rect').set('warn'); } });
+  st.push({ c: 'You edit <code>requirements.txt</code>. Now the cache breaks at step 3 and the expensive step 4 runs again. Ordering the Dockerfile by change frequency is what keeps builds fast.', ms: 3000, on(q){ q('#l2 rect,#l3 rect,#i2 rect,#i3 rect').set('bad'); } });
+  Anim.define('build-cache', { w: 720, h: 300, title: 'Layers and the build cache', svg, steps: st });
+})();
+</script>
+</body>
+</html>

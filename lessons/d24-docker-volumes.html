@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 24 · Docker Volumes · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d24" data-root="../" data-linux="l04" data-related="d01,d26,d27">
+<article class="lesson">
+<p class="lead">Everything a container writes goes into its thin writable layer, and that layer is deleted with the container. For a stateless web server that is a feature. For a database it is a disaster. Docker's answer — mount a directory from <em>outside</em> the layer stack into the container — is the exact idea Kubernetes generalises into volumes, PersistentVolumes and CSI. Learn it here where there is only one machine and no controllers in the way.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Why the writable layer is ephemeral and slow</li>
+<li>Bind mounts vs named volumes vs tmpfs, and the <code>-v</code> / <code>--mount</code> syntax</li>
+<li>Sharing data between containers; volume lifecycle and backup</li>
+<li>The mount-namespace mechanics underneath, which are identical in Kubernetes</li>
+</ul></div>
+
+<h2>The writable layer problem</h2>
+<figure data-anim="writable-layer"></figure>
+<p>Two problems with writing into the container layer: it is <strong>lost on <code>docker rm</code></strong>, and it is <strong>slow</strong> — every write to a file that exists in a lower layer first triggers a copy-up of the whole file through OverlayFS. Databases, uploads, caches and logs all belong outside the layer stack.</p>
+
+<h2>Three kinds of mounts</h2>
+<div class="grid-3">
+<div class="card"><h4>Bind mount</h4><p>A host directory (or file) mounted at a container path. You choose the host path; Docker does not manage it.</p><pre><code class="lang-bash">docker run -v /srv/data:/var/lib/postgresql/data postgres
+docker run --mount type=bind,src=$(pwd),dst=/app,readonly node</code></pre><p>Dev loops (live code), host config files, host sockets (<code>/var/run/docker.sock</code>).</p></div>
+<div class="card"><h4>Named volume</h4><p>A directory Docker creates and manages under <code>/var/lib/docker/volumes/&lt;name&gt;/_data</code>. Portable across hosts (with drivers), listed and deleted by name.</p><pre><code class="lang-bash">docker volume create pgdata
+docker run -v pgdata:/var/lib/postgresql/data postgres
+docker run --mount type=volume,src=pgdata,dst=/var/lib/postgresql/data postgres</code></pre><p>Databases, anything that must outlive the container.</p></div>
+<div class="card"><h4>tmpfs</h4><p>RAM-backed, never written to disk, gone when the container stops.</p><pre><code class="lang-bash">docker run --tmpfs /run:rw,size=64m nginx
+docker run --mount type=tmpfs,dst=/scratch,tmpfs-size=100m app</code></pre><p>Secrets in flight, scratch space, anything sensitive.</p></div>
+</div>
+<div class="tbl-wrap"><table>
+<tr><th></th><th>Bind mount</th><th>Named volume</th><th>tmpfs</th><th>Kubernetes equivalent</th></tr>
+<tr><td>Location</td><td>Anywhere on host</td><td>Docker-managed dir</td><td>RAM</td><td><code>hostPath</code> · PV/PVC · <code>emptyDir medium: Memory</code></td></tr>
+<tr><td>Survives <code>rm</code></td><td>Yes</td><td>Yes (until <code>volume rm</code>)</td><td>No</td><td></td></tr>
+<tr><td>Pre-populated from image</td><td>No (host dir hides image content)</td><td>Yes, if empty on first use</td><td>No</td><td></td></tr>
+<tr><td>Shareable</td><td>Yes</td><td>Yes</td><td>No</td><td></td></tr>
+</table></div>
+
+<h2>Working with volumes</h2>
+<pre><code class="lang-bash">$ docker volume ls
+$ docker volume inspect pgdata                 # Mountpoint: /var/lib/docker/volumes/pgdata/_data
+$ docker run -d --name db -v pgdata:/var/lib/postgresql/data -e POSTGRES_PASSWORD=pw postgres:16
+$ docker rm -f db                              # container gone…
+$ docker run -d --name db2 -v pgdata:/var/lib/postgresql/data -e POSTGRES_PASSWORD=pw postgres:16   # …data still there
+$ docker run --rm --volumes-from db2 alpine ls /var/lib/postgresql/data     # share another container's mounts
+$ docker run --rm -v pgdata:/from -v $(pwd):/to alpine tar czf /to/pgdata.tgz -C /from .   # backup
+$ docker volume prune                          # delete volumes not used by any container
+$ docker volume rm pgdata</code></pre>
+<p>Anonymous volumes appear when an image declares <code>VOLUME /data</code> and you run it without <code>-v</code>: Docker creates a random-named volume so writes there do not hit the layer. They are removed with <code>docker rm -v</code>; otherwise they accumulate — <code>docker volume prune</code> cleans up.</p>
+
+<div class="callout linux" data-ref="l04"><div class="ct">Under the hood · Linux</div>
+<p>Every one of these is a plain <code>mount</code> executed inside the container's <em>mount namespace</em> before the process starts. A bind mount is <code>mount --bind /srv/data /merged/var/lib/postgresql/data</code>; a named volume is the same thing with a Docker-chosen source; tmpfs is <code>mount -t tmpfs</code>. The container's root filesystem is itself an OverlayFS mount; the volume mounts sit on top of specific paths within it, which is why the image's contents at that path become invisible (shadowed) for bind mounts. From inside the container: <code>cat /proc/self/mountinfo</code> lists every mount with its source; from the host: <code>findmnt -N &lt;pid&gt;</code> shows the same for any process. Kubernetes' kubelet performs exactly these mounts under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/</code> and the runtime bind-mounts them into containers.</p>
+<pre><code class="lang-bash">$ docker run -d --name v -v pgdata:/data -v $(pwd):/host:ro --tmpfs /tmp alpine sleep 3600
+$ docker exec v cat /proc/self/mountinfo | grep -E ' /data | /host | /tmp | / '
+$ docker exec v df -h /data /host /tmp /
+$ sudo findmnt -N $(docker inspect -f '{{.State.Pid}}' v) | head</code></pre></div>
+
+<h2>Compose preview: volumes as first-class objects</h2>
+<pre data-title="compose.yaml"><code class="lang-yaml">services:
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data        # named volume
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # bind mount
+volumes:
+  pgdata: {}</code></pre>
+<p>Notice the shape: volumes are declared once at the top level and <em>referenced</em> by services with a mount path. A Kubernetes Pod does the same — <code>volumes:</code> at Pod level, <code>volumeMounts:</code> per container — and a PersistentVolumeClaim is the cluster-wide version of that top-level declaration.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Nothing Docker-specific is examined, but the mapping is: bind mount ⇢ <code>hostPath</code> (Day 27), named volume ⇢ PV + PVC, tmpfs ⇢ <code>emptyDir</code> with <code>medium: Memory</code> (Day 26), <code>--volumes-from</code> ⇢ two containers in one Pod mounting the same volume (Day 21).</p></div>
+
+<div class="lab"><h3>Hands-on lab (10 min)</h3>
+<pre><code class="lang-bash">$ docker run --name a alpine sh -c 'echo hello &gt; /data.txt'; docker rm a
+$ docker run --rm alpine cat /data.txt          # No such file — writable layer was deleted
+$ docker volume create keep
+$ docker run --rm -v keep:/data alpine sh -c 'echo hello &gt; /data/data.txt'
+$ docker run --rm -v keep:/data alpine cat /data/data.txt      # hello — survives across containers
+$ docker run --rm -v $(pwd):/host:ro alpine ls /host             # bind mount of your cwd, read-only
+$ docker run --rm -v $(pwd):/host:ro alpine touch /host/x        # Read-only file system
+$ docker volume inspect keep; docker volume rm keep</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>The writable layer dies with the container and is slow for heavy writes; put data in a volume.</li>
+<li>Bind mounts use a host path you choose; named volumes are Docker-managed; tmpfs is RAM.</li>
+<li>Volumes are mounts inside the container's mount namespace — the same mechanism Kubernetes uses for every volume type.</li>
+<li>Declare once, mount per container — the shape of Pod <code>volumes</code>/<code>volumeMounts</code> and PVCs.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.text('tl', 180, 24, 'container "db" (no volume)', { cls: 'b' }) + S.text('tr', 540, 24, 'container "db2" (volume pgdata)', { cls: 'b' });
+  const stack = (px, id, top) => { let s = ''; ['image layer 1', 'image layer 2', 'image layer 3'].forEach((l, i) => s += S.box(`${id}l${i}`, px, 190 - i * 36, 240, 30, l, { fs: 10, cls: 'soft' })); s += S.box(`${id}w`, px, 190 - 3 * 36, 240, 30, top, { fs: 10, cls: 'ok' }); return s; };
+  svg += stack(60, 'a', 'writable layer  ← /var/lib/postgresql/data') + stack(420, 'b', 'writable layer (empty)');
+  svg += S.box('vol', 420, 240, 240, 34, ['/var/lib/docker/volumes/pgdata/_data'], { fs: 9, lcls: 'mono', cls: 'warn' });
+  svg += S.arrow('m', 540, 240, 540, 118, { d: 'M 540 238 L 540 116', cls: 'hid', label: 'mounted at /var/lib/postgresql/data', lx: 540, ly: 205 });
+  svg += S.text('ma', 180, 260, '', { cls: 'sm b badc' }) + S.text('mb', 540, 300, '', { cls: 'sm b okc' });
+  Anim.define('writable-layer', { w: 720, h: 310, title: 'Writable layer vs volume', ms: 2600, svg, steps: [
+    { c: 'Left: postgres writes its data files into the container\'s <b>writable layer</b>. Right: the same path is a <b>mount point</b> for a named volume that lives outside the layer stack.', on(q){ q('#m').show().set('hl'); } },
+    { c: 'Both containers work identically while running. Writes on the left are copy-on-write through OverlayFS (slower); writes on the right go straight to a normal directory.', on(q){ q('#aw rect').set('warn'); } },
+    { c: '<code>docker rm -f db db2</code>. Both containers are removed — and with them their writable layers.', on(q){ q('#aw').add('hid'); q('#bw').add('hid'); q('#ma').text('data deleted with the layer'); } },
+    { c: 'The volume directory is untouched. Start a new container with <code>-v pgdata:/var/lib/postgresql/data</code> and postgres finds its database exactly where it left it.', on(q){ q('#bw').show().text('new container\'s writable layer'); q('#vol rect').set('ok'); q('#mb').text('data survives: it was never in a layer'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

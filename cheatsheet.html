@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>kubectl Cheatsheet · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<script src="js/theme.js"></script>
+<style>
+.cs-filter{width:100%;font:inherit;font-size:1rem;padding:.7rem 1rem;border:1px solid var(--border2);border-radius:10px;background:var(--surface);color:var(--text);margin:1rem 0 .5rem}
+.cs-filter:focus{outline:none;border-color:var(--accent)}
+.cs-jump{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0 1.5rem}
+.cs-jump a{font-size:.78rem;padding:.2rem .6rem;border:1px solid var(--border);border-radius:99px;color:var(--text2);background:var(--surface)}
+.cs-jump a:hover{border-color:var(--accent);text-decoration:none;color:var(--accent)}
+.cs section{margin-bottom:2.2rem}
+.cs h2{margin-top:2rem;display:flex;align-items:baseline;gap:.6rem}
+.cs h2 small{font-size:.75rem;font-weight:500;color:var(--muted)}
+.cs .row{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:.3rem 1rem;padding:.45rem 0;border-bottom:1px solid var(--border);align-items:start}
+.cs .row code{font-size:.8rem;background:var(--code-bg);color:var(--code-text);border-color:transparent;padding:.2rem .5rem;display:block;white-space:pre-wrap}
+.cs .row span{font-size:.86rem;color:var(--text2)}
+.cs .row.hide{display:none}
+.cs section.hide{display:none}
+@media (max-width:700px){.cs .row{grid-template-columns:1fr}}
+.cs-count{font-size:.8rem;color:var(--muted);margin-bottom:1rem}
+</style>
+</head>
+<body data-page="cheatsheet" data-root="">
+<article class="cs">
+<h1>kubectl cheatsheet</h1>
+<p class="lead">Every command from the course, grouped by task, in the form you would type it under time pressure. Type to filter. Aliases assumed: <code>k</code>=kubectl, <code>$do</code>=<code>--dry-run=client -o yaml</code>, <code>$now</code>=<code>--force --grace-period=0</code>.</p>
+<input class="cs-filter" id="f" type="search" placeholder="Filter: e.g. taint, rollout, jsonpath, etcd, drain…" autocomplete="off">
+<div class="cs-count" id="cnt"></div>
+<div class="cs-jump" id="jump"></div>
+
+<section id="setup"><h2>Session setup <small><a href="lessons/d13-imperative-commands.html">Day 13</a></small></h2>
+<div class="row"><code>alias k=kubectl; export do="--dry-run=client -o yaml"; export now="--force --grace-period=0"</code><span>Once per terminal. Saves minutes per task.</span></div>
+<div class="row"><code>source &lt;(kubectl completion bash); complete -o default -F __start_kubectl k</code><span>Tab completion for the alias.</span></div>
+<div class="row"><code>kubectl config use-context NAME</code><span>Every exam question starts here.</span></div>
+<div class="row"><code>kubectl config set-context --current --namespace=NS</code><span>Default namespace for the session.</span></div>
+<div class="row"><code>kubectl config view --minify; kubectl config get-contexts; kubectl auth whoami</code><span>Where am I, who am I.</span></div>
+<div class="row"><code>printf 'set ts=2 sw=2 et\nset paste\n' &gt; ~/.vimrc</code><span>Vim: spaces, and paste without auto-indent.</span></div>
+</section>
+
+<section id="create"><h2>Create things fast <small><a href="lessons/d13-imperative-commands.html">Day 13</a></small></h2>
+<div class="row"><code>k run web --image=nginx --port=80 --labels=app=web</code><span>Pod.</span></div>
+<div class="row"><code>k run t --rm -it --image=busybox:1.36 -- sh</code><span>Throwaway shell Pod (wget, nslookup, nc).</span></div>
+<div class="row"><code>k run sleeper --image=busybox --command -- sleep 3600</code><span><code>--command</code> sets command; without it, args only.</span></div>
+<div class="row"><code>k run web --image=nginx $do &gt; pod.yaml</code><span>Generate, edit, apply. The core workflow.</span></div>
+<div class="row"><code>k create deploy web --image=nginx --replicas=3 --port=80</code><span>Deployment.</span></div>
+<div class="row"><code>k create deploy web --image=nginx $do | sed 's/Deployment/DaemonSet/;/replicas/d;/strategy/d' | k apply -f -</code><span>DaemonSet (no imperative command exists).</span></div>
+<div class="row"><code>k expose deploy web --port=80 --target-port=8080 --type=NodePort --name=web</code><span>Service from a Deployment/Pod (copies selector).</span></div>
+<div class="row"><code>k create svc clusterip web --tcp=80:8080; k create svc nodeport web --tcp=80:8080 --node-port=30080</code><span>Service without a workload (selector app=web).</span></div>
+<div class="row"><code>k create cm app --from-literal=K=V --from-file=cfg.ini --from-env-file=.env</code><span>ConfigMap.</span></div>
+<div class="row"><code>k create secret generic db --from-literal=pw=s3cret; k create secret tls web-tls --cert=c.crt --key=c.key; k create secret docker-registry regcred --docker-server=… --docker-username=… --docker-password=…</code><span>Secrets.</span></div>
+<div class="row"><code>k create job j --image=busybox -- echo hi; k create cronjob c --image=busybox --schedule="*/5 * * * *" -- date; k create job now --from=cronjob/c</code><span>Job, CronJob, run a CronJob now.</span></div>
+<div class="row"><code>k create ns dev; k create sa builder; k create quota q --hard=pods=10,cpu=4 -n dev</code><span>Namespace, ServiceAccount, ResourceQuota.</span></div>
+<div class="row"><code>k create ingress web --class=nginx --rule="host/path*=svc:80,tls=secret"</code><span>Ingress; <code>*</code> = Prefix.</span></div>
+<div class="row"><code>k create priorityclass high --value=100000; k create pdb web --selector=app=web --min-available=2</code><span>PriorityClass, PodDisruptionBudget.</span></div>
+<div class="row"><code>k autoscale deploy web --cpu-percent=70 --min=2 --max=10</code><span>HPA.</span></div>
+<div class="row"><code>k create role r --verb=get,list --resource=pods,pods/log; k create rolebinding rb --role=r --user=jane --group=devs --serviceaccount=ns:sa</code><span>RBAC (add <code>cluster</code> prefix for cluster-scoped).</span></div>
+<div class="row"><code>k create token SA --duration=1h</code><span>Bound SA token.</span></div>
+</section>
+
+<section id="change"><h2>Change things <small><a href="lessons/d10-replicasets-deployments.html">Day 10</a></small></h2>
+<div class="row"><code>k scale deploy web --replicas=5</code><span>Also rs, sts.</span></div>
+<div class="row"><code>k set image deploy/web nginx=nginx:1.27</code><span>Container NAME=image. Triggers a rollout.</span></div>
+<div class="row"><code>k set env deploy/web LOG=debug; k set env deploy/web --from=configmap/app; k set resources deploy/web --limits=cpu=500m,memory=256Mi --requests=cpu=100m,memory=128Mi; k set serviceaccount deploy/web builder</code><span>Env, resources, SA without editing YAML.</span></div>
+<div class="row"><code>k edit deploy web</code><span>Live edit; reopens on validation error.</span></div>
+<div class="row"><code>k patch deploy web -p '{"spec":{"replicas":2}}'; k patch svc web -p '{"spec":{"type":"NodePort"}}'</code><span>Strategic merge patch.</span></div>
+<div class="row"><code>k patch deploy web --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"k","operator":"Exists"}]}]'</code><span>JSON patch for lists/precise edits.</span></div>
+<div class="row"><code>k label pod web tier=fe; k label pod web tier-; k label node n1 disk=ssd --overwrite; k annotate deploy web note=x</code><span>Labels/annotations.</span></div>
+<div class="row"><code>k taint node n1 key=val:NoSchedule; k taint node n1 key-</code><span>Taints; trailing <code>-</code> removes.</span></div>
+<div class="row"><code>k rollout status|history|undo|restart|pause|resume deploy/web; k rollout undo deploy/web --to-revision=2</code><span>Rollouts.</span></div>
+<div class="row"><code>k replace --force -f pod.yaml</code><span>Delete + recreate (immutable Pod fields).</span></div>
+<div class="row"><code>k delete pod web $now; k delete -f dir/; k delete pods -l app=web; k delete deploy web --cascade=orphan</code><span>Delete variants.</span></div>
+<div class="row"><code>k apply -f f.yaml; k apply -f dir/; k apply -k overlay/; k diff -f f.yaml; k apply -f f.yaml --dry-run=server</code><span>Declarative; Kustomize; preview; server-side validation.</span></div>
+</section>
+
+<section id="inspect"><h2>Inspect & troubleshoot <small><a href="lessons/d13-imperative-commands.html">Day 13</a> · <a href="lessons/d22-pod-lifecycle.html">22</a></small></h2>
+<div class="row"><code>k get pods -o wide -A --show-labels --sort-by=.metadata.creationTimestamp</code><span>The overview.</span></div>
+<div class="row"><code>k get pods -l app=web --field-selector status.phase!=Running -w</code><span>Selectors and watch.</span></div>
+<div class="row"><code>k describe pod web | tail -20</code><span>Events + Last State. First stop for anything broken.</span></div>
+<div class="row"><code>k logs web -c app --previous --tail=100 --since=10m -f; k logs -l app=web --all-containers --prefix</code><span>Logs (<code>--previous</code> for crashes).</span></div>
+<div class="row"><code>k exec -it web -c app -- sh; k exec web -- env</code><span>Run inside.</span></div>
+<div class="row"><code>k debug -it web --image=busybox --target=app; k debug node/n1 -it --image=ubuntu</code><span>Ephemeral debug container; node shell (host at /host).</span></div>
+<div class="row"><code>k port-forward svc/web 8080:80; k cp web:/var/log/app.log ./app.log</code><span>Tunnel; copy files.</span></div>
+<div class="row"><code>k top nodes; k top pods -A --sort-by=memory --containers</code><span>Needs metrics-server.</span></div>
+<div class="row"><code>k get events -A --sort-by=.lastTimestamp | tail -30; k get events --field-selector type=Warning,involvedObject.name=web</code><span>What just happened.</span></div>
+<div class="row"><code>k get endpointslices -l kubernetes.io/service-name=web; k describe svc web</code><span>Service has endpoints? Right port?</span></div>
+<div class="row"><code>k api-resources | grep -i name; k explain pod.spec.containers.livenessProbe --recursive</code><span>Discovery and docs, offline.</span></div>
+<div class="row"><code>k auth can-i create deploy -n dev --as=jane; k auth can-i --list --as=system:serviceaccount:ns:sa</code><span>RBAC checks.</span></div>
+<div class="row"><code>k get --raw /healthz?verbose; k get --raw /readyz; k get pods -n kube-system</code><span>Control plane health.</span></div>
+<div class="row"><code>k get pod x -v=8</code><span>See the HTTP calls kubectl makes.</span></div>
+</section>
+
+<section id="output"><h2>Output formats <small><a href="lessons/d59-jsonpath.html">Day 59</a></small></h2>
+<div class="row"><code>k get pods -o yaml|json|name|wide</code><span>Formats.</span></div>
+<div class="row"><code>k get pods -o jsonpath='{.items[*].metadata.name}'</code><span>All names, space-separated.</span></div>
+<div class="row"><code>k get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'</code><span>One per line with a template.</span></div>
+<div class="row"><code>k get pods -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}'</code><span>Filter.</span></div>
+<div class="row"><code>k get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'</code><span>Node IPs.</span></div>
+<div class="row"><code>k get pods -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,IMG:.spec.containers[0].image' --sort-by=.spec.nodeName</code><span>Table.</span></div>
+<div class="row"><code>k get secret s -o jsonpath='{.data.password}' | base64 -d</code><span>Decode a Secret value.</span></div>
+<div class="row"><code>k get pods -o json | jq -r '.items[] | select(.status.containerStatuses[]?.restartCount &gt; 3) | .metadata.name'</code><span>When JSONPath is not enough.</span></div>
+</section>
+
+<section id="sched"><h2>Scheduling <small><a href="lessons/d15-manual-scheduling-static-pods.html">Days 15–18</a></small></h2>
+<div class="row"><code>spec.nodeName: worker-1</code><span>Bypass the scheduler.</span></div>
+<div class="row"><code>spec.nodeSelector: {disk: ssd}</code><span>Simple label match.</span></div>
+<div class="row"><code>spec.tolerations: [{key: k, operator: Equal, value: v, effect: NoSchedule}]</code><span>Accept a taint (<code>operator: Exists</code> for any value).</span></div>
+<div class="row"><code>spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[]: {key, operator: In|NotIn|Exists|DoesNotExist|Gt|Lt, values}</code><span>Hard node affinity; <code>preferred…</code> with <code>weight</code> for soft.</span></div>
+<div class="row"><code>spec.affinity.podAntiAffinity.required…[]: {labelSelector: {matchLabels: {app: web}}, topologyKey: kubernetes.io/hostname}</code><span>One per node.</span></div>
+<div class="row"><code>spec.topologySpreadConstraints: [{maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: DoNotSchedule, labelSelector: …}]</code><span>Even spread.</span></div>
+<div class="row"><code>spec.priorityClassName: high</code><span>Priority/preemption.</span></div>
+<div class="row"><code>grep staticPodPath /var/lib/kubelet/config.yaml; ls /etc/kubernetes/manifests</code><span>Static Pods (on the node).</span></div>
+<div class="row"><code>k cordon n1; k drain n1 --ignore-daemonsets --delete-emptydir-data; k uncordon n1</code><span>Node maintenance.</span></div>
+</section>
+
+<section id="res"><h2>Resources, probes, config <small><a href="lessons/d19-requests-limits.html">Day 19</a> · <a href="lessons/d23-health-probes.html">23</a> · <a href="lessons/d28-configmaps-secrets.html">28</a></small></h2>
+<div class="row"><code>resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}</code><span>Per container. Exit 137 = OOMKilled.</span></div>
+<div class="row"><code>livenessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 10, failureThreshold: 3}</code><span>Also readinessProbe, startupProbe; tcpSocket, exec {command: […]}, grpc.</span></div>
+<div class="row"><code>envFrom: [{configMapRef: {name: app}}, {secretRef: {name: db}}]</code><span>All keys as env.</span></div>
+<div class="row"><code>env: [{name: PW, valueFrom: {secretKeyRef: {name: db, key: pw}}}, {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}]</code><span>Single keys; downward API.</span></div>
+<div class="row"><code>volumes: [{name: c, configMap: {name: app}}, {name: s, secret: {secretName: db}}, {name: e, emptyDir: {}}, {name: h, hostPath: {path: /data}}, {name: p, persistentVolumeClaim: {claimName: data}}]</code><span>Volume types.</span></div>
+<div class="row"><code>volumeMounts: [{name: c, mountPath: /etc/app, readOnly: true}]</code><span>Per container.</span></div>
+<div class="row"><code>securityContext: {runAsUser: 1000, runAsNonRoot: true, fsGroup: 2000}</code> / container: <code>{allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}}</code><span>Pod vs container level.</span></div>
+<div class="row"><code>k label ns prod pod-security.kubernetes.io/enforce=restricted</code><span>Pod Security Admission.</span></div>
+</section>
+
+<section id="storage"><h2>Storage <small><a href="lessons/d27-persistent-volumes.html">Day 27</a></small></h2>
+<div class="row"><code>k get pv,pvc,sc; k describe pvc data</code><span>Bound? Pending reason?</span></div>
+<div class="row"><code>PV: {capacity: {storage: 1Gi}, accessModes: [ReadWriteOnce], persistentVolumeReclaimPolicy: Retain, storageClassName: manual, hostPath: {path: /data}}</code><span>Static PV shape.</span></div>
+<div class="row"><code>PVC: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 500Mi}}, storageClassName: manual}</code><span>Must match class/modes; size ≤ PV.</span></div>
+<div class="row"><code>k patch pv pv1 -p '{"spec":{"claimRef":null}}'</code><span>Reuse a Released PV.</span></div>
+<div class="row"><code>k patch sc standard -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'</code><span>Default StorageClass.</span></div>
+</section>
+
+<section id="net"><h2>Networking <small><a href="lessons/d12-services.html">Day 12</a> · <a href="lessons/d47-network-policies.html">47</a> · <a href="lessons/d48-dns-coredns.html">48</a> · <a href="lessons/d49-ingress-part1.html">49</a> · <a href="lessons/d52-gateway-api-part1.html">52</a></small></h2>
+<div class="row"><code>svc.ns.svc.cluster.local · pod-0.svc.ns.svc.cluster.local</code><span>DNS names (Service; StatefulSet Pod).</span></div>
+<div class="row"><code>k run t --rm -it --image=busybox:1.36 -- sh -c 'nslookup web; wget -qO- --timeout=2 http://web'</code><span>Test a Service/DNS from inside.</span></div>
+<div class="row"><code>NetworkPolicy: {podSelector: {}, policyTypes: [Ingress, Egress]}</code><span>Default deny.</span></div>
+<div class="row"><code>ingress: [{from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ns}}, podSelector: {matchLabels: {app: x}}}], ports: [{port: 80}]}]</code><span>Allow; no dash between the selectors = AND.</span></div>
+<div class="row"><code>egress: [{to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}], ports: [{protocol: UDP, port: 53}]}]</code><span>Allow DNS.</span></div>
+<div class="row"><code>k get ingress; k describe ingress web; k get ingressclass</code><span>Ingress; class name.</span></div>
+<div class="row"><code>curl -H 'Host: shop.local' http://ADDRESS/; curl --resolve host:443:IP -k https://host/</code><span>Test without DNS.</span></div>
+<div class="row"><code>k get gateway,httproute; k describe httproute x | grep -A4 Conditions</code><span>Gateway API status.</span></div>
+<div class="row"><code>k -n kube-system get pods -l k8s-app=kube-dns; k -n kube-system get cm coredns -o yaml</code><span>CoreDNS.</span></div>
+</section>
+
+<section id="security"><h2>Security & access <small><a href="lessons/d34-tls-part4-csr.html">Day 34</a> · <a href="lessons/d36-rbac.html">36</a> · <a href="lessons/d37-service-accounts.html">37</a></small></h2>
+<div class="row"><code>openssl genrsa -out u.key 2048; openssl req -new -key u.key -subj "/CN=user/O=group" -out u.csr</code><span>Key + CSR.</span></div>
+<div class="row"><code>CSR: {request: $(base64 -w0 u.csr), signerName: kubernetes.io/kube-apiserver-client, usages: [client auth]}</code><span>CertificateSigningRequest spec.</span></div>
+<div class="row"><code>k certificate approve u; k get csr u -o jsonpath='{.status.certificate}' | base64 -d &gt; u.crt</code><span>Approve, fetch.</span></div>
+<div class="row"><code>k config set-credentials u --client-certificate=u.crt --client-key=u.key --embed-certs; k config set-context u --cluster=C --user=u</code><span>kubeconfig entry.</span></div>
+<div class="row"><code>k create rolebinding x --clusterrole=view --user=u -n ns; k create clusterrolebinding y --clusterrole=cluster-admin --group=g</code><span>Grant.</span></div>
+<div class="row"><code>k get rolebindings,clusterrolebindings -A -o wide | grep u</code><span>Where is a subject bound?</span></div>
+<div class="row"><code>kubeadm certs check-expiration; kubeadm certs renew all</code><span>Cluster certs.</span></div>
+<div class="row"><code>openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -subject -dates -ext subjectAltName</code><span>Read a cert.</span></div>
+<div class="row"><code>grep -E 'authorization-mode|enable-admission-plugins' /etc/kubernetes/manifests/kube-apiserver.yaml</code><span>API server security flags.</span></div>
+</section>
+
+<section id="cluster"><h2>Cluster ops <small><a href="lessons/d54-kubeadm-cluster.html">Day 54</a> · <a href="lessons/d55-kubeadm-upgrade.html">55</a> · <a href="lessons/d57-troubleshoot-control-plane.html">57</a> · <a href="lessons/d58-troubleshoot-data-plane.html">58</a></small></h2>
+<div class="row"><code>kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=IP; kubeadm token create --print-join-command; kubeadm join …</code><span>Build.</span></div>
+<div class="row"><code>apt-mark unhold kubeadm &amp;&amp; apt-get install -y kubeadm=1.32.1-1.1 &amp;&amp; apt-mark hold kubeadm; kubeadm upgrade plan; kubeadm upgrade apply v1.32.1</code><span>Control plane upgrade.</span></div>
+<div class="row"><code>k drain N --ignore-daemonsets --delete-emptydir-data; (node) kubeadm upgrade node; apt-get install kubelet=… kubectl=…; systemctl daemon-reload &amp;&amp; systemctl restart kubelet; k uncordon N</code><span>Worker upgrade.</span></div>
+<div class="row"><code>ETCDCTL_API=3 etcdctl snapshot save /tmp/s.db --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key</code><span>etcd backup.</span></div>
+<div class="row"><code>etcdctl snapshot restore /tmp/s.db --data-dir /var/lib/etcd-new; sed -i 's#/var/lib/etcd#/var/lib/etcd-new#' /etc/kubernetes/manifests/etcd.yaml</code><span>etcd restore (new dir + repoint static Pod).</span></div>
+<div class="row"><code>systemctl status kubelet; journalctl -u kubelet -n 50 --no-pager; systemctl daemon-reload &amp;&amp; systemctl restart kubelet</code><span>Kubelet on a node.</span></div>
+<div class="row"><code>crictl ps -a; crictl logs ID; crictl pods; crictl images; crictl inspect ID</code><span>Containers without kubectl.</span></div>
+<div class="row"><code>ls /etc/kubernetes/manifests /etc/kubernetes/pki /etc/cni/net.d /opt/cni/bin; cat /var/lib/kubelet/config.yaml</code><span>The files that define a node.</span></div>
+<div class="row"><code>k describe node N | grep -A6 Conditions; k get node N -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'</code><span>Why NotReady.</span></div>
+<div class="row"><code>swapoff -a; sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables; lsmod | grep -E 'overlay|br_netfilter'; grep SystemdCgroup /etc/containerd/config.toml</code><span>Node prerequisites.</span></div>
+</section>
+
+<section id="pkg"><h2>Helm & Kustomize <small><a href="lessons/d42-kustomize.html">Day 42</a> · <a href="lessons/d43-helm.html">43</a></small></h2>
+<div class="row"><code>helm repo add NAME URL; helm repo update; helm search repo X --versions; helm show values NAME/CHART</code><span>Find and read charts.</span></div>
+<div class="row"><code>helm install R NAME/CHART -n ns --create-namespace -f values.yaml --set k=v --version X</code><span>Install.</span></div>
+<div class="row"><code>helm upgrade --install R … ; helm list -A; helm history R; helm rollback R 1; helm uninstall R</code><span>Lifecycle.</span></div>
+<div class="row"><code>helm template R ./chart -f v.yaml; helm install R ./chart --dry-run --debug; helm get manifest R</code><span>Render/inspect.</span></div>
+<div class="row"><code>kubectl kustomize overlays/prod; kubectl apply -k overlays/prod; kubectl diff -k overlays/prod</code><span>Kustomize (a directory, not a file).</span></div>
+</section>
+
+<section id="quickyaml"><h2>YAML skeletons to remember <small><a href="lessons/d09-yaml-imperative-declarative.html">Day 9</a></small></h2>
+<div class="row"><code>apiVersion: v1 → Pod Service ConfigMap Secret Namespace PV PVC ServiceAccount
+apps/v1 → Deployment ReplicaSet StatefulSet DaemonSet
+batch/v1 → Job CronJob
+networking.k8s.io/v1 → Ingress NetworkPolicy IngressClass
+rbac.authorization.k8s.io/v1 → Role RoleBinding ClusterRole ClusterRoleBinding
+storage.k8s.io/v1 → StorageClass · autoscaling/v2 → HPA · policy/v1 → PDB · scheduling.k8s.io/v1 → PriorityClass
+certificates.k8s.io/v1 → CSR · gateway.networking.k8s.io/v1 → Gateway HTTPRoute</code><span>apiVersion by kind.</span></div>
+<div class="row"><code>k explain KIND.spec --recursive | less</code><span>When in doubt.</span></div>
+</section>
+</article>
+
+<script src="js/curriculum.js"></script>
+<script src="js/anim.js"></script>
+<script src="js/app.js"></script>
+<script>
+(function(){
+  const f = document.getElementById('f'), cnt = document.getElementById('cnt'), jump = document.getElementById('jump');
+  const secs = [...document.querySelectorAll('.cs section')];
+  secs.forEach(s => { const a = document.createElement('a'); a.href = '#' + s.id; a.textContent = s.querySelector('h2').firstChild.textContent.trim(); jump.appendChild(a); });
+  const rows = [...document.querySelectorAll('.cs .row')];
+  function apply() {
+    const q = f.value.trim().toLowerCase(); let n = 0;
+    rows.forEach(r => { const hit = !q || r.textContent.toLowerCase().includes(q); r.classList.toggle('hide', !hit); if (hit) n++; });
+    secs.forEach(s => s.classList.toggle('hide', !s.querySelector('.row:not(.hide)')));
+    cnt.textContent = `${n} of ${rows.length} commands`;
+  }
+  f.addEventListener('input', apply); apply();
+})();
+</script>
+</body>
+</html>

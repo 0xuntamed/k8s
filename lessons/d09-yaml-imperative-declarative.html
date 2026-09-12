@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 9 · YAML, Imperative vs Declarative · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d09" data-root="../">
+<article class="lesson">
+<p class="lead">Every Kubernetes object is a JSON document stored in etcd; YAML is just the friendlier way to write it. Learn the handful of YAML rules that matter, the four top-level keys every manifest has, and the three ways to get a manifest into the cluster — because <code>create</code>, <code>replace</code> and <code>apply</code> behave differently in ways that bite later.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>YAML in ten minutes: maps, lists, scalars, multi-line strings, and the indentation traps</li>
+<li>The universal manifest shape: <code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code> (and the read-only <code>status</code>)</li>
+<li><code>kubectl explain</code> and <code>api-resources</code> — never guess a field again</li>
+<li>Imperative commands vs imperative object config vs declarative <code>apply</code>, and the three-way merge</li>
+<li>The <code>--dry-run=client -o yaml</code> workflow that the exam is built around</li>
+</ul></div>
+
+<h2>YAML in ten minutes</h2>
+<div class="grid-2">
+<div><pre><code class="lang-yaml"># a map (key: value)
+name: web
+replicas: 3            # integer
+enabled: true          # boolean
+version: "1.21"        # string — quote things that look like numbers!
+port: 8080
+
+# nested map: indent with SPACES (2 is the convention), never tabs
+metadata:
+  name: web
+  labels:
+    app: web
+    tier: frontend</code></pre></div>
+<div><pre><code class="lang-yaml"># a list: each item starts with "- "
+ports:
+- 80
+- 443
+
+# a list of maps (the most common shape in Kubernetes)
+containers:
+- name: nginx
+  image: nginx:1.27
+- name: sidecar
+  image: busybox
+
+# inline forms (same meaning)
+args: ["--verbose", "--port=8080"]
+labels: {app: web, tier: frontend}</code></pre></div>
+</div>
+<pre><code class="lang-yaml"># multi-line strings
+script: |            # "|" keeps newlines — for scripts and config files
+  #!/bin/sh
+  echo hello
+  exec nginx
+description: >       # ">" folds newlines into spaces — for long prose
+  This is one
+  long paragraph.
+---                  # three dashes separate documents in one file
+apiVersion: v1
+kind: Service</code></pre>
+<div class="callout warn"><div class="ct">The traps</div><ul>
+<li><strong>Tabs are illegal.</strong> A tab in indentation gives "found character that cannot start any token". Configure your editor for spaces.</li>
+<li><strong>Unquoted values get typed.</strong> <code>version: 1.10</code> becomes the float <code>1.1</code>; <code>enabled: yes</code> may become <code>true</code>; a value like <code>0755</code> becomes octal. Quote anything that must stay a string — ports in annotations, versions, tokens.</li>
+<li><strong>List item indentation is flexible</strong> — <code>- name:</code> may sit at the same level as its parent key or two spaces in; both are valid. Just be consistent, and keep the keys <em>inside</em> an item aligned with each other.</li>
+<li><strong>Keys are case-sensitive.</strong> <code>ImagePullPolicy</code> is silently ignored (or rejected with strict validation). It is <code>imagePullPolicy</code>.</li>
+</ul></div>
+
+<h2>The shape of every manifest</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: default
+  labels:
+    app: web
+  annotations:
+    owner: "team-a"
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.27
+    ports:
+    - containerPort: 80
+status:            # you never write this
+  phase: Running
+  podIP: 10.244.1.7</code></pre>
+<ul class="notes">
+<li><b>apiVersion</b> — which API group and version the kind belongs to. Core objects (Pod, Service, ConfigMap, Namespace, PV/PVC) are <code>v1</code>; Deployment/ReplicaSet/StatefulSet/DaemonSet are <code>apps/v1</code>; Job/CronJob are <code>batch/v1</code>; Ingress/NetworkPolicy are <code>networking.k8s.io/v1</code>; RBAC is <code>rbac.authorization.k8s.io/v1</code>.</li>
+<li><b>kind</b> — the object type. Case matters: <code>Pod</code>, not <code>pod</code>.</li>
+<li><b>metadata</b> — identity: <code>name</code> (unique per namespace per kind), <code>namespace</code>, <code>labels</code> (for selection, must be short key=value), <code>annotations</code> (free-form metadata for tools).</li>
+<li><b>spec</b> — the desired state; its fields differ per kind. This is what you write and controllers read.</li>
+<li><b>status</b> — the observed state written by controllers and kubelets. Present when you <code>get -o yaml</code>, ignored when you apply.</li>
+</ul>
+</div>
+
+<h3>Never guess a field</h3>
+<pre><code class="lang-bash">$ kubectl api-resources                        # every kind, its short name, API group, namespaced?
+$ kubectl api-resources --namespaced=false     # cluster-scoped kinds (Node, PV, Namespace, ClusterRole…)
+$ kubectl explain pod.spec.containers          # documentation for any path, with types
+$ kubectl explain deployment.spec.strategy --recursive   # the whole subtree
+$ kubectl explain cronjob.spec.jobTemplate.spec.template.spec.restartPolicy</code></pre>
+<div class="callout exam"><div class="ct">CKA exam tip</div><p><code>kubectl explain</code> is faster than the docs site and works offline. Memorise the apiVersion of the eight or so kinds above; for anything else, <code>kubectl api-resources | grep -i &lt;name&gt;</code> gives the group in the APIVERSION column.</p></div>
+
+<h2>Three ways to create things</h2>
+<div class="grid-3">
+<div class="card"><h4>1 · Imperative commands</h4><p>No file. Tell kubectl what to do right now.</p><pre><code class="lang-bash">kubectl run web --image=nginx
+kubectl create deploy web --image=nginx
+kubectl expose deploy web --port=80
+kubectl scale deploy web --replicas=3
+kubectl set image deploy/web nginx=nginx:1.27
+kubectl edit deploy web</code></pre><p>Fastest for the exam and for experiments. No record of what you did.</p></div>
+<div class="card"><h4>2 · Imperative object config</h4><p>A file, but you tell kubectl the operation.</p><pre><code class="lang-bash">kubectl create -f web.yaml    # fails if it exists
+kubectl replace -f web.yaml   # fails if it does not; overwrites entirely
+kubectl delete -f web.yaml</code></pre><p>Predictable, but <code>replace</code> throws away fields other tools added.</p></div>
+<div class="card"><h4>3 · Declarative</h4><p>A file (or directory); kubectl works out the operation.</p><pre><code class="lang-bash">kubectl apply -f web.yaml
+kubectl apply -f ./manifests/
+kubectl apply -k ./overlay/    # kustomize
+kubectl diff -f web.yaml       # preview
+</code></pre><p>Create if missing, patch if present. The basis of GitOps. Use this for anything you keep.</p></div>
+</div>
+
+<h3>How <code>apply</code> decides what to change</h3>
+<p><code>apply</code> does a <strong>three-way merge</strong>: it compares (a) the last configuration you applied — stored on the object in the annotation <code>kubectl.kubernetes.io/last-applied-configuration</code>, (b) your new file, and (c) the live object. That is what lets it <em>remove</em> a field you deleted from the file, while <em>leaving alone</em> fields set by other actors (the HPA changing <code>replicas</code>, a defaulter adding <code>imagePullPolicy</code>).</p>
+<figure data-anim="three-way"></figure>
+<div class="callout warn"><div class="ct">Do not mix them on one object</div><p>Objects created with <code>create</code> or <code>run</code> have no last-applied annotation, so the first <code>apply</code> cannot know what you "own" and prints a warning. Objects managed by <code>apply</code> and then edited with <code>kubectl edit</code> or <code>scale</code> will drift back the next time you apply the file — which is correct, and confusing. Pick one style per object; for real systems, pick declarative.</p></div>
+
+<h2>The workflow you will use 100 times</h2>
+<pre><code class="lang-bash">$ export do="--dry-run=client -o yaml"                     # once per session
+$ kubectl run web --image=nginx --port=80 $do > pod.yaml   # generate, don't type
+$ vim pod.yaml                                             # tweak: add a label, resources, a volume
+$ kubectl apply -f pod.yaml
+$ kubectl get pod web -o yaml                              # see what the server added (status, defaults)
+$ kubectl apply -f pod.yaml --dry-run=server               # validate against the real API, incl. admission</code></pre>
+<p><code>--dry-run=client</code> only renders locally (fast, no cluster needed, no validation of unknown fields). <code>--dry-run=server</code> sends the request and lets the API server validate and run admission, but does not persist. <code>-o yaml</code> prints; <code>-o json</code>, <code>-o wide</code>, <code>-o name</code>, <code>-o jsonpath</code> (<a href="d59-jsonpath.html">Day 59</a>) are the other formats you will use.</p>
+
+<h2>Labels, selectors and annotations</h2>
+<p>Labels are the glue of Kubernetes: Services find Pods by label, ReplicaSets own Pods by label, <code>kubectl get -l</code> filters by label. Annotations are for tools and humans, never for selection.</p>
+<pre><code class="lang-bash">$ kubectl get pods -l app=web,tier!=cache
+$ kubectl get pods -l 'env in (dev,staging)'
+$ kubectl label pod web tier=frontend          # add
+$ kubectl label pod web tier-                  # remove
+$ kubectl annotate pod web note="scaled by hand"
+$ kubectl get pods --show-labels
+$ kubectl get pods -L app,tier                 # labels as columns</code></pre>
+
+<div class="lab"><h3>Hands-on lab (10 min)</h3>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx --replicas=2 $do > deploy.yaml
+$ kubectl apply -f deploy.yaml
+$ kubectl scale deploy web --replicas=4                  # imperative change
+$ kubectl get deploy web -o yaml | grep -A1 last-applied   # note: replicas still 2 in the annotation
+$ kubectl apply -f deploy.yaml && kubectl get deploy web   # back to 2 — apply enforces the file
+$ sed -i 's/replicas: 2/replicas: 3/' deploy.yaml && kubectl diff -f deploy.yaml
+$ kubectl explain deploy.spec.template.spec.containers.resources</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>YAML: spaces not tabs, quote ambiguous scalars, <code>-</code> for list items, <code>|</code> for literal blocks, <code>---</code> between documents.</li>
+<li>Every manifest: <code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code>; <code>status</code> is written by the system.</li>
+<li><code>kubectl explain</code> and <code>api-resources</code> replace memorisation.</li>
+<li>Imperative for speed and experiments; <code>apply</code> (three-way merge) for anything you keep. Don't mix on one object.</li>
+<li>Generate with <code>--dry-run=client -o yaml</code>, edit, apply, inspect with <code>get -o yaml</code>.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const T = (id, x, title, ls) => S.term(id, x, 60, 215, 130, [title, ...ls], { fs: 10 });
+  let svg = S.text('h', 360, 30, 'kubectl apply -f deploy.yaml — the three inputs', { cls: 'b' })
+    + T('last', 20, 'last-applied (annotation)', ['replicas: 2', 'image: nginx:1.26', 'env: FOO=1', ''])
+    + T('file', 252, 'your file (new)', ['replicas: 2', 'image: nginx:1.27', '', ''])
+    + T('live', 484, 'live object (server)', ['replicas: 4   # HPA', 'image: nginx:1.26', 'env: FOO=1', 'imagePullPolicy: Always'])
+    + S.box('res', 180, 230, 360, 60, ['PATCH sent to the API server', ''], { fs: 12, subfs: 10, subcls: 'mono acc', cls: 'soft' })
+    + S.arrow('a1', 127, 190, 300, 228, { cls: 'hid' }) + S.arrow('a2', 360, 190, 360, 228, { cls: 'hid' }) + S.arrow('a3', 592, 190, 420, 228, { cls: 'hid' });
+  Anim.define('three-way', { w: 720, h: 305, title: 'Three-way merge', ms: 3200, svg, steps: [
+    { c: 'Three documents: what you applied <b>last time</b> (saved on the object as an annotation), what your file says <b>now</b>, and what is <b>live</b> in the cluster — including changes made by others.', on(q){} },
+    { c: '<b>image</b> changed between last-applied and the file → apply <b>sets</b> it. This is the normal case.', on(q){ q('#file-l2').style('fill', 'var(--green)'); q('#last-l2').style('fill', 'var(--amber)'); q('#a1,#a2').show().set('hl'); q('#res text:nth-of-type(2)').text('image: nginx:1.27'); } },
+    { c: '<b>env: FOO</b> was in last-applied but is <b>gone from the file</b> → apply <b>removes</b> it. A plain PATCH could never know to do this; that is what the annotation is for.', on(q){ q('#last-l3').style('fill', 'var(--red)'); q('#live-l3').style('fill', 'var(--red)'); q('#res text:nth-of-type(2)').text('image: nginx:1.27   env: null'); } },
+    { c: '<b>replicas</b> is 2 in both last-applied and the file — <b>you did not change it</b> — so apply leaves the live value (4, set by an autoscaler) alone. Fields you never mentioned, like <code>imagePullPolicy</code>, are also untouched.', on(q){ q('#live-l1').style('fill', 'var(--green)'); q('#live-l4').style('fill', 'var(--green)'); q('#a3').show().set('ok'); } },
+    { c: 'Result: apply only changes what <i>you</i> changed, and can delete what you removed. <code>kubectl diff -f</code> shows this patch before you send it.', on(q){ q('#res rect').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

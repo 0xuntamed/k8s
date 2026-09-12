@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 10 · ReplicaSets & Deployments · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d10" data-root="../" data-related="d06,d07">
+<article class="lesson">
+<p class="lead">You almost never create a Pod directly. Pods are mortal: they are not rescheduled when their node dies, and nothing restarts a deleted one. Instead you create a <strong>Deployment</strong>, which manages <strong>ReplicaSets</strong>, which manage Pods. This layering is what gives you self-healing, scaling, rolling updates and one-command rollbacks — and it is the first place the "controller watches labels" pattern really matters.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Why bare Pods are not enough, and why ReplicationController was replaced by ReplicaSet</li>
+<li>ReplicaSet: <code>replicas</code>, <code>selector</code>, <code>template</code> — and how label matching decides ownership</li>
+<li>Deployment: a controller for ReplicaSets that implements RollingUpdate and Recreate strategies</li>
+<li><code>maxSurge</code> / <code>maxUnavailable</code>, rollout status, history, undo, pause/resume</li>
+<li>The imperative commands that generate and modify all of this</li>
+</ul></div>
+
+<h2>Three layers, one purpose</h2>
+<div class="flow"><span>Deployment</span><i>manages →</i><span>ReplicaSet (one per revision)</span><i>manages →</i><span>Pods (identical, label-selected)</span></div>
+<dl class="kv">
+<dt>Pod</dt><dd>One or more containers sharing a network namespace and volumes. Disposable. Has no controller of its own.</dd>
+<dt>ReplicaSet</dt><dd>"Keep N Pods matching this selector alive, using this template to make new ones." Handles crashes and node loss. Knows nothing about versions.</dd>
+<dt>Deployment</dt><dd>"Run this Pod template with N replicas, and when the template changes, move from the old ReplicaSet to a new one gradually." Keeps old ReplicaSets around (scaled to 0) so you can roll back.</dd>
+<dt>ReplicationController</dt><dd>The original ReplicaSet (2014). Same idea, but its selector only supported equality. Legacy; you will only see it in old manifests and exam trivia.</dd>
+</dl>
+
+<h2>ReplicaSet</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+    matchExpressions:
+    - key: tier
+      operator: In
+      values: [frontend]
+  template:
+    metadata:
+      labels:
+        app: web
+        tier: frontend
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.26</code></pre>
+<ul class="notes">
+<li><b>replicas</b> — desired count. Default 1.</li>
+<li><b>selector</b> — which Pods this ReplicaSet <em>owns</em>. <code>matchLabels</code> is AND-ed equality; <code>matchExpressions</code> adds <code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code>. Immutable after creation.</li>
+<li><b>template</b> — a full Pod spec (minus apiVersion/kind) used to create new Pods. Its labels <strong>must</strong> satisfy the selector, or the API server rejects the object.</li>
+<li>Pods created by the ReplicaSet get an <code>ownerReferences</code> entry pointing at it; deleting the ReplicaSet garbage-collects them (unless <code>--cascade=orphan</code>).</li>
+</ul>
+</div>
+<figure data-anim="rs-reconcile"></figure>
+<div class="callout warn"><div class="ct">Selectors are about labels, not lineage</div><p>A ReplicaSet counts <em>every</em> Pod in the namespace that matches its selector and has no other owner — including ones you created by hand. Create a bare Pod with <code>app: web</code> and a ReplicaSet with <code>replicas: 3</code> already satisfied will <strong>delete</strong> one to get back to three. Conversely, remove the label from a managed Pod and the ReplicaSet "loses" it and makes a replacement, leaving your orphan running. This is a useful trick for pulling a misbehaving Pod out of service to debug it.</p></div>
+
+<h2>Deployment</h2>
+<pre><code class="lang-bash">$ kubectl create deployment web --image=nginx:1.26 --replicas=3 --dry-run=client -o yaml > web.yaml</code></pre>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.26
+        ports:
+        - containerPort: 80</code></pre>
+<ul class="notes">
+<li><b>strategy.type</b> — <code>RollingUpdate</code> (default) replaces Pods gradually; <code>Recreate</code> kills all old Pods, then creates new ones (downtime, but no two versions overlap — needed for some databases).</li>
+<li><b>maxSurge</b> — how many Pods <em>above</em> <code>replicas</code> may exist during the rollout (number or %). Default 25%.</li>
+<li><b>maxUnavailable</b> — how many Pods <em>below</em> <code>replicas</code> may be unavailable. Default 25%. Setting it to 0 guarantees capacity; setting <code>maxSurge: 0</code> guarantees no extra resource usage. They cannot both be 0.</li>
+<li><b>minReadySeconds</b> — a new Pod must be Ready this long before it counts as available and the rollout proceeds. Cheap insurance against fast crash loops.</li>
+<li><b>revisionHistoryLimit</b> — how many old ReplicaSets to keep for rollback.</li>
+<li>Everything under <b>template</b> is what a change to triggers a new revision; changing <code>replicas</code> alone does not.</li>
+</ul>
+</div>
+
+<h3>A rolling update, frame by frame</h3>
+<figure data-anim="rolling-update"></figure>
+<p>With <code>replicas: 4</code>, <code>maxSurge: 1</code>, <code>maxUnavailable: 1</code> the controller may run up to 5 Pods and must keep at least 3 available. It scales the new ReplicaSet up and the old one down in steps that never break those bounds, waiting for each new Pod to become Ready (readiness probes, <a href="d23-health-probes.html">Day 23</a>) before continuing. Traffic shifts automatically because the Service selects <code>app: web</code>, which both revisions carry.</p>
+
+<h2>Working with rollouts</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td>kubectl set image deploy/web nginx=nginx:1.27</td><td>Change the container image → new ReplicaSet → rolling update. (<code>nginx=</code> is the <em>container name</em>.)</td></tr>
+<tr><td>kubectl edit deploy web</td><td>Open the live object in <code>$EDITOR</code>; any template change triggers a rollout.</td></tr>
+<tr><td>kubectl rollout status deploy/web</td><td>Block until the rollout finishes (or fails). Use in scripts and in the exam to confirm.</td></tr>
+<tr><td>kubectl rollout history deploy/web</td><td>List revisions. <code>--revision=2</code> shows that revision's template.</td></tr>
+<tr><td>kubectl rollout undo deploy/web</td><td>Roll back to the previous revision (<code>--to-revision=N</code> for a specific one). Rollback is itself a new revision.</td></tr>
+<tr><td>kubectl rollout pause / resume deploy/web</td><td>Pause: make several changes without triggering several rollouts; resume to roll them out together.</td></tr>
+<tr><td>kubectl rollout restart deploy/web</td><td>Re-create all Pods with the same template (adds a timestamp annotation). For picking up new ConfigMap/Secret contents.</td></tr>
+<tr><td>kubectl scale deploy web --replicas=5</td><td>Change replicas without a new revision.</td></tr>
+<tr><td>kubectl get rs -l app=web</td><td>See the ReplicaSets: the active one has DESIRED=replicas, old ones 0.</td></tr>
+</table></div>
+<p>The <code>CHANGE-CAUSE</code> column in <code>rollout history</code> comes from the annotation <code>kubernetes.io/change-cause</code>. Set it with <code>kubectl annotate deploy/web kubernetes.io/change-cause="bump to 1.27"</code> (the old <code>--record</code> flag is deprecated).</p>
+
+<h3>When a rollout goes wrong</h3>
+<pre><code class="lang-bash">$ kubectl set image deploy/web nginx=nginx:1.27-typo
+$ kubectl rollout status deploy/web            # "Waiting for deployment "web" rollout to finish: 1 out of 3 new replicas have been updated..."
+$ kubectl get pods                             # one Pod in ImagePullBackOff; the old ones still serve traffic
+$ kubectl describe deploy web | grep -A5 Conditions   # Progressing=False, reason ProgressDeadlineExceeded (after progressDeadlineSeconds, default 600)
+$ kubectl rollout undo deploy/web              # back to 1.26 in seconds</code></pre>
+<p>Because the old ReplicaSet is still there and <code>maxUnavailable</code> bounds the damage, a bad image never takes down more than one slice of your capacity. That is the whole reason to prefer Deployments over anything hand-rolled.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Fastest way to fix a "Pod template has wrong image" question: <code>kubectl set image</code>, then <code>kubectl rollout status</code> to prove it.</li>
+<li>If a ReplicaSet won't create Pods, check <code>kubectl describe rs</code> events — a template label that does not match the selector, or a resource quota, are the usual causes.</li>
+<li>Remember that <code>selector</code> is immutable: to change it you must delete and re-create the Deployment (<code>--cascade=orphan</code> keeps the Pods running while you do).</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx:1.26 --replicas=4
+$ kubectl get deploy,rs,pods -l app=web
+$ kubectl delete pod -l app=web --wait=false && kubectl get pods -l app=web -w   # watch replacements appear
+# orphan a pod
+$ P=$(kubectl get pod -l app=web -o name | head -1); kubectl label $P app-
+$ kubectl get pods --show-labels                # 5 pods: 4 owned + 1 orphan
+$ kubectl delete pod -l 'app notin (web)'       # clean up
+# rolling update
+$ kubectl set image deploy/web nginx=nginx:1.27 && kubectl rollout status deploy/web
+$ kubectl get rs -l app=web                     # two ReplicaSets, old one at 0
+$ kubectl rollout history deploy/web
+$ kubectl rollout undo deploy/web && kubectl get rs -l app=web</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Pod → ReplicaSet (keep N alive by label) → Deployment (manage ReplicaSets across revisions). Create Deployments, not Pods.</li>
+<li>Ownership is by <strong>selector</strong>, not by who created the Pod; template labels must match the selector.</li>
+<li>Any change to <code>spec.template</code> creates a new ReplicaSet and a rolling update bounded by <code>maxSurge</code>/<code>maxUnavailable</code>.</li>
+<li><code>rollout status / history / undo / pause / restart</code> are the operational verbs; <code>set image</code> is the fastest change.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ReplicaSet reconcile */
+  let s1 = S.box('rs', 20, 20, 220, 60, ['ReplicaSet web-rs', 'replicas: 3 · selector app=web'], { subfs: 10, subcls: 'mono muted' })
+    + S.zone('ns', 20, 110, 680, 190, 'namespace default — pods with label app=web are counted')
+    + S.pod('p1', 110, 200, 'web-abc', { cls: 'ok', w: 74, sub: 'app=web' }) + S.pod('p2', 230, 200, 'web-def', { cls: 'ok', w: 74, sub: 'app=web' }) + S.pod('p3', 350, 200, 'web-ghi', { cls: 'ok', w: 74, sub: 'app=web' })
+    + S.pod('p4', 470, 200, 'web-jkl', { cls: 'ok', w: 74, sub: 'app=web', hidden: true })
+    + S.pod('px', 590, 200, 'manual', { cls: 'warn', w: 74, sub: 'app=web', hidden: true })
+    + S.text('obs', 470, 55, 'observed: 3 / desired: 3', { cls: 'sm mono muted' });
+  Anim.define('rs-reconcile', { w: 720, h: 310, title: 'ReplicaSet reconciliation', svg: s1, steps: [
+    { c: 'The ReplicaSet controller lists Pods matching <code>app=web</code>: three, as desired. Nothing to do.', on(q){} },
+    { c: 'A Pod dies (or you delete it). The watch fires; observed = 2.', on(q){ q('#p2').add('hid'); q('#obs').text('observed: 2 / desired: 3'); q('#rs rect').set('warn'); } },
+    { c: 'Controller creates a new Pod from the <b>template</b>. Random suffix, same labels. Back to 3.', on(q){ q('#p4').show(); q('#obs').text('observed: 3 / desired: 3'); q('#rs rect').set(); } },
+    { c: 'Now someone creates a Pod by hand with the label <code>app=web</code>. The selector matches it, so the ReplicaSet <b>counts it</b>: observed = 4.', on(q){ q('#px').show(); q('#obs').text('observed: 4 / desired: 3'); q('#rs rect').set('warn'); } },
+    { c: 'Too many → the controller deletes one (it prefers newer / not-ready Pods, but may pick any). Labels, not lineage, decide ownership.', on(q){ q('#px').add('hid'); q('#obs').text('observed: 3 / desired: 3'); q('#rs rect').set(); } },
+    { c: 'Remove the label from a managed Pod and the opposite happens: the ReplicaSet no longer sees it, creates a replacement, and your orphan keeps running — handy for debugging a single instance.', on(q){ q('#p3 text:nth-of-type(2)').text('app=debug'); q('#p3 rect').set('gray'); q('#p2').rm('hid'); } },
+  ]});
+
+  /* Rolling update */
+  const OLD = [], NEW = [];
+  let s2 = S.box('rsold', 20, 20, 300, 56, ['ReplicaSet web-5c4 (nginx:1.26)', 'desired 4'], { subfs: 10, subcls: 'mono muted' })
+    + S.box('rsnew', 400, 20, 300, 56, ['ReplicaSet web-7d9 (nginx:1.27)', 'desired 0'], { subfs: 10, subcls: 'mono muted', hidden: true })
+    + S.zone('z', 20, 100, 680, 160, 'running pods  ·  replicas=4  maxSurge=1  maxUnavailable=1')
+    + S.text('lim', 360, 285, 'allowed range: 3 … 5 pods · at least 3 available', { cls: 'sm muted' });
+  for (let i = 0; i < 4; i++) s2 += S.pod(`o${i}`, 80 + i * 70, 160, '1.26', { cls: 'ok', w: 56 });
+  for (let i = 0; i < 4; i++) s2 += S.pod(`n${i}`, 400 + i * 70, 160, '1.27', { cls: 'pur', w: 56, hidden: true });
+  s2 += S.text('svc', 360, 235, 'Service app=web → sends traffic to every Ready pod, old or new', { cls: 'xs muted' });
+  const cnt = (q, o, n) => { q('#rsold text:nth-of-type(2)').text('desired ' + o); q('#rsnew text:nth-of-type(2)').text('desired ' + n); };
+  Anim.define('rolling-update', { w: 720, h: 300, title: 'RollingUpdate strategy', ms: 2400, svg: s2, steps: [
+    { c: 'Four Pods of nginx:1.26 owned by ReplicaSet <code>web-5c4</code>. You run <code>kubectl set image deploy/web nginx=nginx:1.27</code>.', on(q){} },
+    { c: 'The Deployment controller creates a <b>new ReplicaSet</b> for the new template, initially with 0 replicas.', on(q){ q('#rsnew').show(); q('#rsnew rect').set('pur'); } },
+    { c: 'maxSurge=1 allows one extra Pod: new RS → 1. The Pod is created, pulls the image, becomes Ready (probes + minReadySeconds).', on(q){ q('#n0').show(); cnt(q, 4, 1); } },
+    { c: 'maxUnavailable=1 allows one fewer: old RS → 3. One old Pod gets SIGTERM and drains.', on(q){ q('#o3').add('hid'); cnt(q, 3, 1); } },
+    { c: 'Surge again: new RS → 2. Wait for Ready.', on(q){ q('#n1').show(); cnt(q, 3, 2); } },
+    { c: 'Scale down: old RS → 2. The controller keeps alternating, never exceeding 5 or dropping below 3 available.', on(q){ q('#o2').add('hid'); cnt(q, 2, 2); } },
+    { c: 'New RS → 3, old → 1…', on(q){ q('#n2').show(); q('#o1').add('hid'); cnt(q, 1, 3); } },
+    { c: 'New RS → 4, old → 0. Rollout complete. The old ReplicaSet is <b>kept at 0</b> so <code>rollout undo</code> can scale it back up instantly.', on(q){ q('#n3').show(); q('#o0').add('hid'); cnt(q, 0, 4); q('#rsold rect').set('dim'); q('#rsnew rect').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

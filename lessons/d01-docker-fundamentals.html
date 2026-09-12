@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 1 · Docker Fundamentals · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d01" data-root="../" data-linux="l02,l03,l04">
+<article class="lesson">
+<p class="lead">Kubernetes orchestrates containers, so the first question is the one most tutorials skip: <strong>what is a container?</strong> Not "a lightweight VM" — a container is an ordinary Linux process that has been given a restricted view of the machine. Once you see that, images, volumes, networking and Pods all become concrete.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The problem containers solve and how they differ from virtual machines</li>
+<li>What actually happens when you type <code>docker run</code></li>
+<li>Images vs containers, registries, and the essential Docker commands</li>
+<li>The three Linux features (namespaces, cgroups, union filesystems) that <em>are</em> the container</li>
+</ul></div>
+
+<h2>The problem: "it works on my machine"</h2>
+<p>An application is never just its code. It is code <em>plus</em> a runtime (Python 3.12, Node 22, the JVM), plus system libraries (glibc, OpenSSL), plus config files, plus environment variables, plus assumptions about paths and users. Move the code to another machine where any one of those differs and it breaks.</p>
+<p>Before containers there were two answers, both bad:</p>
+<div class="compare bad-good">
+<div><h4>Install everything on the server</h4><p>Fast and cheap, but two apps that need different versions of the same library cannot coexist, servers drift over time, and "the server" becomes a snowflake nobody dares rebuild.</p></div>
+<div><h4>One virtual machine per app</h4><p>Perfect isolation, but every VM boots a full operating system: gigabytes of disk, minutes to start, and a whole kernel's worth of RAM overhead per app.</p></div>
+</div>
+<p>Containers are the third answer: package the app <em>with</em> everything it depends on (the whole userland, down to the C library), but share the host's kernel instead of booting a new one.</p>
+
+<figure data-anim="vm-vs-container"></figure>
+
+<div class="callout mental"><div class="ct">Mental model</div><p>A VM virtualises <strong>hardware</strong> — it pretends to be a computer, so you install an OS on it. A container virtualises the <strong>operating system</strong> — it pretends to be a fresh Linux install, so you just start a process in it. The kernel is shared; everything above the kernel is private.</p></div>
+
+<h2>A container is a process</h2>
+<p>Run <code>docker run -d nginx</code> and then look at the host with <code>ps</code>. You will find an <code>nginx</code> process, owned by the host kernel, scheduled by the host scheduler, using host memory. It is not "inside" anything in the way a VM is. What makes it a container is that the kernel has been told to <strong>lie to it</strong> about three things:</p>
+<ol>
+<li><strong>What it can see</strong> — its own process tree, network stack, hostname, mount table, users. These lies are <strong>namespaces</strong>.</li>
+<li><strong>How much it can use</strong> — CPU time, memory, I/O. These caps are <strong>cgroups</strong> (control groups).</li>
+<li><strong>What its filesystem looks like</strong> — a root filesystem assembled from read-only image layers plus a thin writable layer, using a <strong>union filesystem</strong> (OverlayFS).</li>
+</ol>
+
+<figure data-anim="container-is-process"></figure>
+
+<div class="callout linux" data-ref="l02,l03,l04"><div class="ct">Under the hood · Linux</div>
+<p>You can build a container by hand without Docker. <code>unshare --pid --net --mount --uts --fork bash</code> gives you a shell in new PID, network, mount and hostname namespaces; <code>cgcreate</code>/<code>systemd-run</code> puts it in a cgroup with a memory cap; <code>mount -t overlay</code> assembles a root filesystem from layers; <code>chroot</code> or <code>pivot_root</code> switches into it. Docker, containerd and Kubernetes automate exactly these system calls — nothing more exotic. The three Linux-track pages linked below walk through each one with commands you can run.</p></div>
+
+<h2>Images vs containers</h2>
+<p>An <strong>image</strong> is a read-only, layered filesystem snapshot plus some metadata (which command to run, which ports it listens on, environment variables). A <strong>container</strong> is a running (or stopped) instance of an image: the image's layers, plus one writable layer on top, plus a process.</p>
+<div class="figure diagram"><svg viewBox="0 0 720 210" xmlns="http://www.w3.org/2000/svg">
+  <g>
+    <rect class="nb soft" x="40" y="150" width="280" height="34" rx="6"/><text class="lb sm" x="180" y="171">Layer 1 · ubuntu:24.04 base (read-only)</text>
+    <rect class="nb soft" x="40" y="112" width="280" height="34" rx="6"/><text class="lb sm" x="180" y="133">Layer 2 · apt install nginx (read-only)</text>
+    <rect class="nb soft" x="40" y="74" width="280" height="34" rx="6"/><text class="lb sm" x="180" y="95">Layer 3 · COPY index.html (read-only)</text>
+    <text class="lb b" x="180" y="50">Image: my-nginx:1.0</text>
+  </g>
+  <g>
+    <rect class="nb soft" x="400" y="150" width="280" height="34" rx="6"/><text class="lb sm muted" x="540" y="171">Layer 1 (shared, read-only)</text>
+    <rect class="nb soft" x="400" y="112" width="280" height="34" rx="6"/><text class="lb sm muted" x="540" y="133">Layer 2 (shared, read-only)</text>
+    <rect class="nb soft" x="400" y="74" width="280" height="34" rx="6"/><text class="lb sm muted" x="540" y="95">Layer 3 (shared, read-only)</text>
+    <rect class="nb ok" x="400" y="36" width="280" height="34" rx="6"/><text class="lb sm b" x="540" y="57">Writable layer · this container's changes</text>
+    <text class="lb b" x="540" y="20">Container (image + writable layer + process)</text>
+  </g>
+  <path class="ar" d="M 325 130 L 395 130"/>
+  <text class="lb xs muted" x="360" y="120">docker run</text>
+</svg><figcaption>Ten containers from one image share the read-only layers on disk; each gets its own tiny writable layer. Delete the container and only the writable layer is lost.</figcaption></div>
+<p>This is why containers start in milliseconds (nothing is copied) and why anything written inside a container disappears when the container is removed (the writable layer is deleted). Persisting data is what <a href="d24-docker-volumes.html">volumes</a> are for.</p>
+
+<h2>What happens on <code>docker run</code></h2>
+<p>Docker is not one program. The <code>docker</code> CLI talks to the <code>dockerd</code> daemon over a Unix socket; <code>dockerd</code> delegates container lifecycle to <strong>containerd</strong>; containerd uses <strong>runc</strong> (the reference OCI runtime) to actually create the namespaces and cgroups and exec the process. Kubernetes talks to containerd <em>directly</em>, which is why "Kubernetes dropped Docker" (in v1.24) changed nothing for your images.</p>
+<figure data-anim="docker-run-flow"></figure>
+<div class="callout info"><div class="ct">OCI: the standards that make this interchangeable</div><p>The <strong>Open Container Initiative</strong> defines two specs: the <em>image spec</em> (how layers and metadata are packaged — what Docker Hub stores) and the <em>runtime spec</em> (how a bundle is turned into a running container — what runc implements). Any OCI image runs on any OCI runtime: Docker, containerd, CRI-O, Podman, and every Kubernetes cluster.</p></div>
+
+<h2>Registries and image names</h2>
+<p>A <strong>registry</strong> stores images; Docker Hub is the default public one. A full image reference has four parts:</p>
+<pre data-title="image reference"><code>docker.io/library/nginx:1.27
+└──┬───┘ └──┬──┘ └─┬─┘ └─┬─┘
+registry  namespace  repo   tag (default: latest)</code></pre>
+<ul>
+<li><code>nginx</code> alone expands to <code>docker.io/library/nginx:latest</code>. Official images live in the <code>library</code> namespace.</li>
+<li>Tags are mutable pointers. <code>latest</code> is just a tag someone chose to push — it is not automatically the newest. For anything reproducible, pin a version tag or better, a digest (<code>nginx@sha256:…</code>).</li>
+<li>Private registries (ECR, GCR, ACR, Harbor, GitLab) use the same protocol; you just log in first. Kubernetes handles credentials with <a href="d45-image-pull-secrets.html">imagePullSecrets</a>.</li>
+</ul>
+
+<h2>Essential commands</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td>docker pull nginx:1.27</td><td>Download image layers you do not already have.</td></tr>
+<tr><td>docker images</td><td>List local images (with size and ID).</td></tr>
+<tr><td>docker run -d --name web -p 8080:80 nginx</td><td>Create + start a container in the background, publish host port 8080 → container 80.</td></tr>
+<tr><td>docker ps / docker ps -a</td><td>Running containers / all containers including stopped.</td></tr>
+<tr><td>docker logs -f web</td><td>Stream the container's stdout/stderr.</td></tr>
+<tr><td>docker exec -it web sh</td><td>Start an extra process (a shell) inside the container's namespaces.</td></tr>
+<tr><td>docker stop web</td><td>Send SIGTERM, wait 10 s, then SIGKILL.</td></tr>
+<tr><td>docker rm web / docker rmi nginx</td><td>Delete a container / an image.</td></tr>
+<tr><td>docker inspect web</td><td>Full JSON: IPs, mounts, env, cgroup path, PID.</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>The CKA does not test Docker itself, but exam nodes run <strong>containerd</strong>, and troubleshooting questions expect you to use <code>crictl ps</code>, <code>crictl logs</code>, <code>crictl images</code> and <code>systemctl status containerd</code> on a node. The concepts on this page transfer one-to-one; only the CLI name changes. See <a href="d58-troubleshoot-data-plane.html">Day 58</a>.</p></div>
+
+<div class="lab"><h3>Hands-on lab (10 min)</h3><p>Prove to yourself that a container is a process.</p>
+<pre><code class="lang-bash">$ docker run -d --name web nginx
+$ docker exec web ps -ef          # inside: nginx is PID 1
+$ ps -ef | grep "nginx: master"   # on the host: same process, a big PID
+$ PID=$(docker inspect -f '{{.State.Pid}}' web)
+$ sudo ls -l /proc/$PID/ns        # its namespaces (pid, net, mnt, uts, ipc…)
+$ sudo cat /proc/$PID/cgroup      # the cgroup it lives in
+$ docker exec web hostname        # = the container ID (UTS namespace)
+$ docker exec web ip addr         # its own eth0 (network namespace)
+$ docker rm -f web</code></pre>
+<p>Compare the two <code>ps</code> outputs: identical process, different PID. That difference is the PID namespace, and it is the whole trick.</p></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A container is a normal process with a restricted view (namespaces), a resource budget (cgroups) and a layered root filesystem (OverlayFS). The kernel is shared with the host.</li>
+<li>Images are immutable stacks of read-only layers; a container adds one writable layer that dies with it.</li>
+<li><code>docker</code> → <code>dockerd</code> → <code>containerd</code> → <code>runc</code>. Kubernetes skips the first two and talks to containerd via CRI.</li>
+<li>Image references are <code>registry/namespace/repo:tag</code>; <code>latest</code> is just a tag.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---- VM vs container stacks ---- */
+  const L = (id, x, y, w, label, cls) => S.box(id, x, y, w, 32, label, { cls, fs: 11, hidden: true });
+  let svg = S.text('tl', 180, 30, 'Virtual machines', { cls: 'b' }) + S.text('tr', 540, 30, 'Containers', { cls: 'b' });
+  // left
+  svg += L('l-hw', 30, 290, 300, 'Hardware') + L('l-os', 30, 254, 300, 'Host OS + kernel') + L('l-hv', 30, 218, 300, 'Hypervisor', 'pur');
+  [0,1,2].forEach(i => { const x = 30 + i * 102; svg += L(`l-g${i}`, x, 182, 96, 'Guest OS + kernel', 'warn') + L(`l-b${i}`, x, 146, 96, 'Bins / libs') + L(`l-a${i}`, x, 110, 96, `App ${i+1}`, 'ok'); });
+  // right
+  svg += L('r-hw', 390, 290, 300, 'Hardware') + L('r-os', 390, 254, 300, 'Host OS + kernel (shared)') + L('r-rt', 390, 218, 300, 'Container runtime (containerd)', 'pur');
+  [0,1,2].forEach(i => { const x = 390 + i * 102; svg += L(`r-b${i}`, x, 182, 96, 'Bins / libs') + L(`r-a${i}`, x, 146, 96, `App ${i+1}`, 'ok'); });
+  svg += S.text('note', 540, 96, ['no guest kernel:', 'MBs, milliseconds'], { cls: 'sm okc b', gcls: 'hid' });
+  svg += S.text('note2', 180, 70, ['each VM boots a full OS:', 'GBs, minutes'], { cls: 'sm warnc b', gcls: 'hid' });
+  Anim.define('vm-vs-container', { w: 720, h: 335, title: 'VMs vs containers', svg, steps: [
+    { c: 'Both start from the same place: physical hardware running a host operating system with a kernel.', on(q){ q('#l-hw,#l-os,#r-hw,#r-os').show(); } },
+    { c: 'A VM platform adds a <b>hypervisor</b> that emulates hardware. A container platform adds a <b>runtime</b> that only creates processes.', on(q){ q('#l-hv,#r-rt').show(); } },
+    { c: 'Every VM must boot its own <b>guest kernel and OS</b> before the app can start — gigabytes on disk, minutes to boot, RAM reserved up front.', on(q){ q('#l-g0,#l-g1,#l-g2').show(); q('#note2').show(); } },
+    { c: 'Containers skip that layer. Each one carries only the userland it needs (its bins and libs) and runs directly on the shared host kernel.', on(q){ q('#l-b0,#l-b1,#l-b2,#r-b0,#r-b1,#r-b2').show(); q('#note').show(); } },
+    { c: 'Apps run in both. Isolation is stronger with VMs (separate kernels); density and start-up speed are far better with containers. Kubernetes nodes are usually VMs running many containers — you get both.', on(q){ q('#l-a0,#l-a1,#l-a2,#r-a0,#r-a1,#r-a2').show(); } },
+  ]});
+
+  /* ---- container is a process ---- */
+  const hostLines = ['$ ps -ef', 'PID   CMD', '1     /sbin/init', '812   sshd', '1450  containerd', '1512  dockerd', '      '];
+  const inLines = ['$ docker exec web ps -ef', 'PID   CMD', '1     nginx: master', '29    nginx: worker'];
+  let s2 = S.zone('host', 10, 10, 700, 300, 'Host machine (one kernel)');
+  s2 += S.term('hterm', 30, 40, 300, 150, hostLines);
+  s2 += S.text('hlbl', 180, 210, 'View from the host', { cls: 'sm muted' });
+  s2 += `<g id="cont" style="opacity:0">${S.zone('cz', 370, 40, 320, 250, 'Container "web"', { cls: 'hl' })}${S.term('cterm', 385, 65, 290, 80, inLines)}</g>`;
+  s2 += S.text('ns-pid', 530, 170, 'PID namespace: it thinks it is PID 1', { cls: 'sm acc', gcls: 'hid' });
+  s2 += S.text('ns-net', 530, 192, 'NET namespace: own eth0, own iptables', { cls: 'sm acc', gcls: 'hid' });
+  s2 += S.text('ns-mnt', 530, 214, 'MNT namespace: rootfs = image layers', { cls: 'sm acc', gcls: 'hid' });
+  s2 += S.text('cg', 530, 240, 'cgroup: memory.max = 128Mi, cpu.max = 50%', { cls: 'sm warnc', gcls: 'hid' });
+  s2 += S.text('concl', 360, 300, '', { cls: 'sm b' });
+  Anim.define('container-is-process', { w: 720, h: 320, title: 'A container is a process', svg: s2, steps: [
+    { c: 'A normal Linux host: init, sshd, containerd and dockerd are just processes in one process table.', on(q){} },
+    { c: 'You run <code>docker run -d --name web nginx</code>. A new process appears in the host table — PID 2231 — as an ordinary child of containerd-shim.', on(q){ q('#hterm-l6').text('2231  nginx: master').style('fill','var(--green)'); } },
+    { c: 'Ask the <b>same process</b> what it sees, and it reports itself as PID 1. That is a <b>PID namespace</b>: a private numbering of processes.', on(q){ q('#cont').show(); q('#ns-pid').show(); } },
+    { c: 'It also has a private network stack and a private mount table whose root is the image\'s layers. Same kernel, different view.', on(q){ q('#ns-net,#ns-mnt').show(); } },
+    { c: 'Finally the kernel enforces a budget through a <b>cgroup</b>: exceed memory.max and the OOM killer ends the process — that is what Kubernetes reports as <code>OOMKilled</code>.', on(q){ q('#cg').show(); } },
+    { c: '<b>Container = process + namespaces + cgroups + layered rootfs.</b> Every Kubernetes Pod is a small group of these sharing some namespaces.', on(q){ q('#concl').text('container = process + namespaces + cgroups + rootfs'); q('#cz rect').set('ok'); } },
+  ]});
+
+  /* ---- docker run flow ---- */
+  let s3 = S.box('cli', 20, 120, 100, 50, ['docker CLI', 'docker run'], { subfs: 10, subcls: 'mono muted' })
+    + S.box('dd', 160, 120, 100, 50, ['dockerd', 'REST API'], { subfs: 10, subcls: 'muted' })
+    + S.box('cd', 300, 120, 110, 50, ['containerd', 'gRPC'], { subfs: 10, subcls: 'muted' })
+    + S.box('shim', 450, 120, 100, 50, ['shim', 'per container'], { subfs: 10, subcls: 'muted' })
+    + S.box('runc', 590, 120, 100, 50, ['runc', 'OCI runtime'], { subfs: 10, subcls: 'muted' })
+    + S.box('reg', 300, 20, 110, 44, ['Registry', 'docker.io'], { subfs: 10, subcls: 'muted' })
+    + S.box('proc', 590, 230, 100, 50, ['nginx', 'namespaces+cgroups'], { subfs: 9, subcls: 'muted', cls: 'ok', hidden: true })
+    + S.box('kubelet', 160, 230, 100, 50, ['kubelet', 'Kubernetes'], { subfs: 10, subcls: 'muted', cls: 'pur', hidden: true })
+    + S.arrow('a1', 120, 145, 158, 145) + S.arrow('a2', 260, 145, 298, 145) + S.arrow('a3', 410, 145, 448, 145) + S.arrow('a4', 550, 145, 588, 145)
+    + S.arrow('a5', 355, 118, 355, 66, { cls: 'hid' }) + S.arrow('a6', 640, 172, 640, 228, { cls: 'hid' })
+    + S.curve('a7', 260, 245, 300, 200, 330, 172, { cls: 'hid', label: 'CRI', lx: 300, ly: 215 })
+    + S.text('cap', 360, 305, '', { cls: 'sm muted' });
+  Anim.define('docker-run-flow', { w: 720, h: 320, title: 'docker run, step by step', svg: s3, steps: [
+    { c: 'The <b>docker CLI</b> is only a client. It POSTs "create container" to <b>dockerd</b> over <code>/var/run/docker.sock</code>.', on(q){ q('#cli rect,#dd rect').set('hl'); q('#a1').set('hl'); } },
+    { c: 'dockerd asks <b>containerd</b> (over gRPC) to prepare the image and start a task.', on(q){ q('#cli rect').set(); q('#cd rect').set('hl'); q('#a2').set('hl'); } },
+    { c: 'If a layer is missing locally, containerd pulls it from the <b>registry</b> and unpacks it into a snapshot (an OverlayFS lower dir).', on(q){ q('#a5').rm('hid').set('hl'); q('#reg rect').set('hl'); } },
+    { c: 'containerd starts a tiny <b>shim</b> for this container and invokes <b>runc</b> with an OCI bundle (config.json + rootfs).', on(q){ q('#a5,#reg rect,#dd rect,#a1,#a2').set(); q('#a5').add('hid'); q('#shim rect,#runc rect').set('hl'); q('#a3,#a4').set('hl'); } },
+    { c: 'runc creates the namespaces and cgroups, pivots into the rootfs, <code>exec</code>s nginx… and then <b>exits</b>. The shim becomes the parent so containerd can restart without killing containers.', on(q){ q('#proc').show(); q('#a6').rm('hid').set('ok'); q('#runc rect').set(); } },
+    { c: 'Kubernetes does not need dockerd at all: the <b>kubelet</b> speaks the Container Runtime Interface (CRI) straight to containerd. Same images, same runc, one layer fewer.', on(q){ q('#kubelet').show(); q('#a7').rm('hid').set('hl'); q('#cli rect,#dd rect').add('dim'); q('#a1,#a2').add('dim'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 6 · Why Kubernetes? · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d06" data-root="../" data-linux="l07">
+<article class="lesson">
+<p class="lead">Docker solved "how do I package and run one container on one machine". Production is a different question: hundreds of containers, dozens of machines, machines that die at 3 a.m., traffic that triples on Monday morning, and releases that must not cause downtime. Kubernetes is the answer to that second question, and its core idea — <em>declare the desired state and let controllers converge on it</em> — is worth understanding before you learn a single command.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The operational problems that appear the moment you run containers on more than one machine</li>
+<li>What an orchestrator does: scheduling, self-healing, scaling, rollouts, service discovery, config</li>
+<li>The desired-state / reconciliation model that every Kubernetes feature is built on</li>
+<li>Where Kubernetes came from and what it deliberately does not do</li>
+</ul></div>
+
+<h2>Life with containers but without an orchestrator</h2>
+<p>Imagine five services, each in a container, across three servers. Now answer these questions by hand:</p>
+<div class="grid-2">
+<div class="card"><h4>Placement</h4><p>Which server has enough free memory for the new API container? You check <code>free -m</code> on each box and pick one. Tomorrow the answer is different.</p></div>
+<div class="card"><h4>Failure</h4><p>Server 2 loses its disk at night. Everything on it is gone. Someone has to notice, then re-create those containers elsewhere, then update whatever pointed at them.</p></div>
+<div class="card"><h4>Scaling</h4><p>Traffic spikes. You SSH in and start three more copies of the frontend… and register them in the load balancer… and remember to remove them later.</p></div>
+<div class="card"><h4>Releases</h4><p>Version 2 of the API must replace version 1 without dropping requests. That means starting new, waiting until healthy, shifting traffic, stopping old — per replica, in order, with a rollback plan.</p></div>
+<div class="card"><h4>Discovery</h4><p>The frontend needs the API's address. Containers get new IPs every restart. You maintain a config file, or a DNS zone, by hand.</p></div>
+<div class="card"><h4>Configuration &amp; secrets</h4><p>Database passwords, feature flags, TLS certificates — distributed to the right containers on the right servers, rotated occasionally, never baked into images.</p></div>
+</div>
+<p>Each of these is solvable with scripts. Together, at scale, they are a full-time job for a team, and the scripts become the most fragile software you own. An <strong>orchestrator</strong> is a system that does all six continuously, automatically, from a description of what you want.</p>
+
+<h2>The idea: desired state and reconciliation</h2>
+<p>Kubernetes does not take commands like "start a container on server 2". It takes <strong>declarations</strong>: "there should be three replicas of this container, each with 512 MiB of memory, reachable under the name <code>api</code>". You store that declaration in the cluster. Then a set of <strong>controllers</strong> run a loop forever:</p>
+<div class="flow"><span>Observe actual state</span><i>→</i><span>Compare with desired state</span><i>→</i><span>Act to close the gap</span><i>→</i><span>repeat</span></div>
+<p>The consequence is that <em>failure handling is not a special case</em>. A node dying, a Pod crashing, you editing the replica count from 3 to 5, a rolling update — they all look the same to the controller: the actual state no longer matches the desired state, so act.</p>
+<figure data-anim="self-heal"></figure>
+
+<div class="callout mental"><div class="ct">Mental model</div><p>Think of a thermostat. You do not tell it "turn the heater on for 12 minutes"; you set 21 °C. It measures, compares, acts, and keeps doing so when someone opens a window. Kubernetes is a building full of thermostats, one per kind of object, all reading and writing the same shared record of desired state — the API server backed by etcd.</p></div>
+
+<h2>What Kubernetes gives you</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Capability</th><th>What it means</th><th>Where you learn it</th></tr>
+<tr><td>Scheduling</td><td>Picks a node for each Pod based on resource requests, constraints and affinities.</td><td><a href="d15-manual-scheduling-static-pods.html">Days 15–19</a></td></tr>
+<tr><td>Self-healing</td><td>Restarts crashed containers, replaces Pods from dead nodes, removes unhealthy endpoints from Services.</td><td><a href="d10-replicasets-deployments.html">Day 10</a>, <a href="d23-health-probes.html">Day 23</a></td></tr>
+<tr><td>Horizontal scaling</td><td>Change one number (or let the HPA change it) and replicas appear or disappear.</td><td><a href="d20-autoscaling.html">Day 20</a></td></tr>
+<tr><td>Rollouts &amp; rollbacks</td><td>Replace versions gradually; undo with one command.</td><td><a href="d10-replicasets-deployments.html">Day 10</a></td></tr>
+<tr><td>Service discovery &amp; load balancing</td><td>A stable name and virtual IP in front of a changing set of Pods; internal DNS.</td><td><a href="d12-services.html">Day 12</a>, <a href="d48-dns-coredns.html">Day 48</a></td></tr>
+<tr><td>Config &amp; secret management</td><td>Inject configuration and credentials without rebuilding images.</td><td><a href="d28-configmaps-secrets.html">Day 28</a></td></tr>
+<tr><td>Storage orchestration</td><td>Attach cloud disks, NFS, or local storage to Pods on demand.</td><td><a href="d27-persistent-volumes.html">Day 27</a></td></tr>
+<tr><td>Extensibility</td><td>Define your own resource types and controllers.</td><td><a href="d39-crds.html">Days 39–40</a></td></tr>
+</table></div>
+
+<h2>What Kubernetes is not</h2>
+<ul>
+<li><strong>Not a PaaS.</strong> It does not build your code, has no opinion about languages or frameworks, and does not ship with CI/CD, logging or monitoring — it provides the hooks for those (Argo CD, Jenkins, Prometheus and friends plug in).</li>
+<li><strong>Not a container runtime.</strong> It drives containerd/CRI-O through the CRI; it does not run containers itself.</li>
+<li><strong>Not magic.</strong> Every feature is a controller writing to the API, a kubelet calling a runtime, or a Linux primitive on a node. This site's "under the hood" boxes exist to keep that visible.</li>
+</ul>
+
+<h2>Where it came from</h2>
+<p>Google ran containers at planetary scale for a decade with an internal system called <strong>Borg</strong>. In 2014 engineers from that team open-sourced a redesign in Go, named Kubernetes (Greek for "helmsman"; "k8s" counts the eight letters between k and s). In 2015 Google donated it to the newly formed <strong>Cloud Native Computing Foundation</strong> (CNCF), which also certifies conformant distributions (EKS, GKE, AKS, OpenShift, Rancher, k3s…) and runs the CKA/CKAD/CKS exams. Releases ship roughly three times a year; each minor version is supported for about 14 months, which is why cluster upgrades (<a href="d55-kubeadm-upgrade.html">Day 55</a>) are a routine skill, not a project.</p>
+
+<div class="callout linux" data-ref="l07"><div class="ct">Under the hood · Linux</div><p>The reconciliation loop is also how Linux itself keeps services alive: <code>systemd</code> compares the units you enabled with the processes that exist and restarts what died (<code>Restart=always</code>). On every Kubernetes node the <strong>kubelet</strong> is itself a systemd unit — so the base of the whole self-healing stack is a plain systemd service on each machine, and <code>systemctl status kubelet</code> is the first troubleshooting command you will learn.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Nothing on this page is asked directly, but the <em>reflex</em> it teaches is: when something is wrong, ask "what is the desired state (the spec), what is the actual state (the status/events), and which controller is supposed to close the gap?" <code>kubectl describe</code> shows all three. That is the troubleshooting method for 30% of the exam.</p></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>One machine → Docker. Many machines, failures, scaling, releases → an orchestrator.</li>
+<li>You declare desired state; controllers loop observe → diff → act. Failures, scaling and upgrades are all just "diffs".</li>
+<li>Kubernetes provides scheduling, self-healing, scaling, rollouts, discovery, config and storage — and leaves building, CI/CD and observability to the ecosystem.</li>
+<li>Born from Google's Borg, governed by the CNCF, released three times a year.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('desired', 20, 20, 200, 44, ['Desired: api × 4'], { cls: 'soft', fs: 12 })
+    + S.box('ctl', 260, 20, 200, 44, ['controllers + scheduler'], { cls: 'pur', fs: 11 })
+    + S.box('actual', 500, 20, 200, 44, ['Actual: api × 4'], { cls: 'soft', fs: 12 });
+  [0,1,2].forEach(i => svg += S.node(`n${i}`, 20 + i * 235, 100, 210, 200, `node-${i + 1}`, { sub: '4 CPU · 16 GiB' }));
+  const P = [[70, 160, 0], [170, 160, 0], [305, 160, 1], [540, 160, 2]];
+  P.forEach((p, i) => svg += S.pod(`p${i}`, p[0], p[1], 'api', { cls: 'ok' }));
+  svg += S.pod('p4', 405, 160, 'api', { cls: 'ok', hidden: true }) + S.pod('p5', 640, 160, 'api', { cls: 'ok', hidden: true });
+  svg += S.text('msg', 360, 320, '', { cls: 'sm b' });
+  Anim.define('self-heal', { w: 720, h: 335, title: 'Self-healing', svg, steps: [
+    { c: 'Desired state: four replicas of <code>api</code>. The scheduler has spread them over three nodes; actual matches desired, so the controllers are idle.', on(q){} },
+    { c: 'node-2 dies — kernel panic, hardware failure, a cloud instance retired. Its kubelet stops reporting; after a timeout the node is marked <b>NotReady</b> and its Pods are considered gone.', on(q){ q('#n1 rect').set('bad'); q('#p2').add('hid'); q('#actual').text('Actual: api × 3'); q('#actual rect').set('bad'); q('#msg').text('desired 4 ≠ actual 3'); } },
+    { c: 'The ReplicaSet controller sees 3 ≠ 4 and creates a new Pod object. The scheduler sees a Pod with no node and picks the best remaining one.', on(q){ q('#ctl rect').set('hl'); q('#p4').show(); q('#p4').to(405, 160); q('#msg').text('controller creates a replacement · scheduler places it'); } },
+    { c: 'The kubelet on node-3 pulls the image and starts the container. Actual = desired again. Total human involvement: zero.', on(q){ q('#actual').text('Actual: api × 4'); q('#actual rect').set('ok'); q('#ctl rect').set(); q('#msg').text('converged'); } },
+    { c: 'You now edit the desired state: <code>replicas: 5</code>. From the controller\'s point of view this is the <b>same situation</b> — a gap to close.', on(q){ q('#desired').text('Desired: api × 5'); q('#desired rect').set('hl'); q('#actual rect').set('warn'); q('#msg').text('desired 5 ≠ actual 4'); } },
+    { c: 'One more Pod is created and scheduled. Scaling, healing and (as you will see) upgrades are all the same loop.', on(q){ q('#p5').show(); q('#actual').text('Actual: api × 5'); q('#actual rect').set('ok'); q('#desired rect').set(); q('#msg').text('converged — same loop, different diff'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

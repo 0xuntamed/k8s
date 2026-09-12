@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 35 · Authorization Modes & the Kubernetes API · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d35" data-root="../" data-linux="l10" data-related="d09,d36,d38">
+<article class="lesson">
+<p class="lead">Every request to the API server passes through the same three gates in order: <strong>authentication</strong> (who are you?), <strong>authorization</strong> (may you do this?), and <strong>admission</strong> (should this object be allowed/changed?). Day 32 covered the first gate. This lesson opens the second — the pluggable authorization modes and the order they run in — and, because authorization decisions are made in terms of the API's own vocabulary (groups, resources, verbs), it also teaches you to read the API like the API server does, with nothing but <code>curl</code>.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The request pipeline: authn → authz → admission → validation → etcd</li>
+<li>Authorization modes: Node, RBAC, ABAC, Webhook, AlwaysAllow, AlwaysDeny — and how a chain of them decides</li>
+<li>API structure: core group vs named groups, versions, resources, subresources, verbs</li>
+<li>Exploring the API directly: <code>kubectl proxy</code>, <code>kubectl get --raw</code>, curl with a token, <code>-v=8</code></li>
+<li>Reading a request the way an authorizer sees it</li>
+</ul></div>
+
+<h2>The pipeline</h2>
+<figure data-anim="api-pipeline"></figure>
+<ol class="steps">
+<li><strong>TLS + Authentication.</strong> Client cert, bearer token (ServiceAccount, OIDC, static file, bootstrap), or authenticating proxy. Each authenticator is tried in turn; the first to recognise the credential wins. Result: a <em>user name</em>, a set of <em>groups</em>, and extra attributes. Unrecognised → <code>401 Unauthorized</code>, or treated as <code>system:anonymous</code> in group <code>system:unauthenticated</code> if anonymous auth is on (default).</li>
+<li><strong>Authorization.</strong> The request is reduced to attributes — user, groups, verb, API group, resource, subresource, namespace, name — and each configured authorizer is asked. Denied → <code>403 Forbidden</code>.</li>
+<li><strong>Admission.</strong> Only for writes. Mutating plugins/webhooks may change the object; validating ones may reject it. <a href="d38-admission-controllers.html">Day 38</a>.</li>
+<li><strong>Schema validation and persistence.</strong> The object is checked against its type's OpenAPI schema and written to etcd; watchers are notified.</li>
+</ol>
+
+<h2>Authorization modes</h2>
+<pre><code class="lang-bash">$ grep authorization-mode /etc/kubernetes/manifests/kube-apiserver.yaml
+    - --authorization-mode=Node,RBAC          # kubeadm default; order matters</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Mode</th><th>How it decides</th><th>Use</th></tr>
+<tr><td><strong>Node</strong></td><td>Special-purpose: lets a kubelet (user <code>system:node:&lt;name&gt;</code>, group <code>system:nodes</code>) read only the Secrets, ConfigMaps, PVCs… referenced by Pods <em>on its own node</em>, and write only its own Node/Pod status. Paired with the <code>NodeRestriction</code> admission plugin.</td><td>Always on; keeps a compromised node from reading the whole cluster.</td></tr>
+<tr><td><strong>RBAC</strong></td><td>Roles (rules) bound to subjects via RoleBindings — objects in the API, changed with kubectl, no restart.</td><td>The standard. <a href="d36-rbac.html">Day 36</a>.</td></tr>
+<tr><td><strong>ABAC</strong></td><td>A JSON-lines policy file on the API server (<code>--authorization-policy-file</code>): one line per rule matching user/group/resource/namespace. Needs an API server restart to change.</td><td>Legacy; you will only meet it in old clusters and exam trivia.</td></tr>
+<tr><td><strong>Webhook</strong></td><td>POSTs a <code>SubjectAccessReview</code> to an external HTTPS service that answers allowed/denied.</td><td>Integrating an enterprise policy engine (OPA, cloud IAM).</td></tr>
+<tr><td><strong>AlwaysAllow</strong> / <strong>AlwaysDeny</strong></td><td>What they say.</td><td>Testing only. AlwaysAllow is what "no authorization" means — never in production.</td></tr>
+</table></div>
+<p><strong>The chain:</strong> authorizers run in the order listed. Each returns <em>allow</em>, <em>deny</em>, or <em>no opinion</em>. The first allow or deny wins; no-opinion passes to the next; if every authorizer has no opinion, the request is <strong>denied</strong>. With <code>Node,RBAC</code>: a kubelet request is decided by Node; anything else falls through to RBAC. (Since 1.30 the same chain can be expressed in a structured <code>AuthorizationConfiguration</code> file that also allows multiple webhooks and CEL pre-filters.)</p>
+
+<h2>The API, the way an authorizer sees it</h2>
+<p>An RBAC rule says "verb X on resource Y in API group Z". Those words are the URL structure:</p>
+<pre><code>/api/v1/namespaces/{ns}/pods/{name}            ← core group ("" in RBAC), version v1, resource pods
+/api/v1/namespaces/{ns}/pods/{name}/log        ← subresource: pods/log
+/api/v1/namespaces/{ns}/pods/{name}/exec       ← subresource: pods/exec  (a websocket)
+/api/v1/nodes                                  ← cluster-scoped: no "namespaces" segment
+/apis/apps/v1/namespaces/{ns}/deployments      ← named group apps, resource deployments
+/apis/apps/v1/namespaces/{ns}/deployments/web/scale   ← subresource deployments/scale (what HPA uses)
+/apis/batch/v1/…/jobs   /apis/networking.k8s.io/v1/…/ingresses   /apis/rbac.authorization.k8s.io/v1/…/roles
+/apis/metrics.k8s.io/v1beta1/…                 ← an aggregated API (served by metrics-server)
+/apis/example.com/v1/…/widgets                 ← a CRD's group</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>HTTP</th><th>URL shape</th><th>RBAC verb</th></tr>
+<tr><td>GET</td><td>…/pods/{name}</td><td><code>get</code></td></tr>
+<tr><td>GET</td><td>…/pods</td><td><code>list</code> (and <code>watch</code> with <code>?watch=true</code>)</td></tr>
+<tr><td>POST</td><td>…/pods</td><td><code>create</code></td></tr>
+<tr><td>PUT</td><td>…/pods/{name}</td><td><code>update</code> (whole object; <code>kubectl replace</code>, <code>edit</code>)</td></tr>
+<tr><td>PATCH</td><td>…/pods/{name}</td><td><code>patch</code> (<code>kubectl apply</code>, <code>patch</code>, <code>set</code>, <code>scale</code>, <code>label</code>)</td></tr>
+<tr><td>DELETE</td><td>…/pods/{name} · …/pods</td><td><code>delete</code> · <code>deletecollection</code></td></tr>
+<tr><td>—</td><td>non-resource: /healthz, /metrics, /api</td><td><code>nonResourceURLs</code> in ClusterRoles</td></tr>
+</table></div>
+<p>Two consequences that trip people up: <code>kubectl get pods</code> needs <code>list</code>, not <code>get</code>; and reading logs needs <code>get</code> on <code>pods/log</code> — a separate subresource — even if you can <code>get pods</code>.</p>
+<pre><code class="lang-bash">$ kubectl api-resources -o wide                 # NAME SHORTNAMES APIVERSION NAMESPACED KIND VERBS
+$ kubectl api-resources --api-group=apps
+$ kubectl api-versions                          # every group/version served
+$ kubectl explain deployment --api-version=apps/v1 | head</code></pre>
+
+<h2>Talking to the API without kubectl</h2>
+<pre><code class="lang-bash"># 1. see what kubectl actually sends
+$ kubectl get pods -n kube-system -v=8 2&gt;&1 | grep -E 'GET|Response Status'
+# 2. kubectl proxy: local plain-HTTP port that adds your kubeconfig credentials for you
+$ kubectl proxy --port=8001 &
+$ curl -s localhost:8001/api/v1/namespaces/default/pods | jq '.items[].metadata.name'
+$ curl -s localhost:8001/apis/apps/v1/namespaces/default/deployments/web/scale
+$ curl -s -X PATCH -H 'Content-Type: application/merge-patch+json' -d '{"spec":{"replicas":3}}' localhost:8001/apis/apps/v1/namespaces/default/deployments/web/scale
+# 3. --raw: same thing without the proxy
+$ kubectl get --raw /healthz?verbose
+$ kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes | jq .
+# 4. from inside a Pod, with the ServiceAccount token (Day 37)
+$ TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+$ curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer $TOKEN" https://kubernetes.default.svc/api/v1/namespaces/default/pods</code></pre>
+
+<h2>Asking the authorizer directly</h2>
+<pre><code class="lang-bash">$ kubectl auth can-i create deployments -n dev                  # yes / no, for you
+$ kubectl auth can-i list secrets --as=jane --as-group=developers -n dev     # impersonate (needs impersonate permission)
+$ kubectl auth can-i --list -n dev                              # everything you can do there
+$ kubectl auth can-i get pods --subresource=log
+$ kubectl create -f - &lt;&lt;EOF                                   # what can-i sends under the hood
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: jane
+  groups: [developers]
+  resourceAttributes: {namespace: dev, verb: delete, resource: pods}
+EOF</code></pre>
+
+<div class="callout linux" data-ref="l10"><div class="ct">Under the hood · Linux</div><p>The API server is an ordinary HTTPS server; everything above is visible with the usual tools. <code>curl -v</code> shows the TLS handshake and the exact verb/path; <code>jq</code> slices the JSON (the <a href="../linux/l10-shell-toolkit.html">shell toolkit</a> page). Audit logging (<code>--audit-policy-file</code>, <code>--audit-log-path</code>) writes one JSON line per request with the user, verb, URI, and the authorization decision and reason — <code>jq 'select(.verb=="delete")' /var/log/kubernetes/audit.log</code> answers "who deleted that?". On a busy control plane, <code>ss -tnp | grep 6443</code> shows every component holding a connection to the API server — kubelets, controllers, kube-proxy — each of which authenticated with the certificates from Day 33.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li><code>kubectl auth can-i</code> (with <code>--as</code>) is the fastest way to verify any RBAC task. Use it before you say you are done.</li>
+<li>"Which authorization modes are enabled?" → read the API server manifest. Changing them = edit the static Pod manifest; the API server restarts itself.</li>
+<li>Know the group of the common kinds: core (<code>""</code>) for pods/services/configmaps/secrets/nodes/pv/pvc/namespaces; <code>apps</code>; <code>batch</code>; <code>networking.k8s.io</code>; <code>rbac.authorization.k8s.io</code>; <code>storage.k8s.io</code>. You will write them in Role rules on Day 36.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ docker exec cka-control-plane grep authorization-mode /etc/kubernetes/manifests/kube-apiserver.yaml
+$ kubectl get pods -v=8 2&gt;&1 | grep -E '^I.*(GET|Response Status)' | head -3
+$ kubectl proxy --port=8001 &amp; sleep 1
+$ curl -s localhost:8001/api | jq .versions; curl -s localhost:8001/apis | jq '.groups[].name' | head
+$ curl -s localhost:8001/api/v1/namespaces/kube-system/pods | jq '.items | length'
+$ curl -s localhost:8001/api/v1/namespaces/kube-system/pods/$(kubectl get pod -n kube-system -o name | head -1 | cut -d/ -f2)/log | tail -2
+$ kill %1
+$ kubectl auth can-i --list | head -15
+$ kubectl auth can-i get pods --as=system:anonymous            # no
+$ kubectl auth can-i get nodes --as=system:kube-scheduler      # yes (bound by default ClusterRoles)
+$ kubectl get --raw /healthz?verbose | tail -3</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Pipeline: authenticate (who) → authorize (may) → admit (should/mutate) → validate → etcd.</li>
+<li>Modes run as a chain: first allow/deny wins, no opinion falls through, all-no-opinion = deny. kubeadm uses <code>Node,RBAC</code>.</li>
+<li>Authorization vocabulary = the API's URL structure: group (core is <code>""</code>), resource, subresource (<code>pods/log</code>, <code>deployments/scale</code>), verb (<code>get list watch create update patch delete</code>).</li>
+<li><code>kubectl proxy</code>, <code>--raw</code>, <code>-v=8</code>, curl + token: see the API without kubectl. <code>auth can-i --as</code>: ask the authorizer.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('cl', 50, 60, 'laptop', { label: 'kubectl delete pod web -n dev', ly: 28, lcls: 'mono' })
+    + S.box('g1', 170, 30, 120, 60, ['1 · Authentication', 'cert / token'], { subfs: 9, subcls: 'muted' })
+    + S.box('g2', 320, 30, 120, 60, ['2 · Authorization', 'Node → RBAC'], { subfs: 9, subcls: 'muted' })
+    + S.box('g3', 470, 30, 120, 60, ['3 · Admission', 'mutate · validate'], { subfs: 9, subcls: 'muted' })
+    + S.box('db', 620, 35, 80, 50, ['etcd'], { fs: 12 })
+    + S.arrow('a0', 100, 60, 168, 60) + S.arrow('a1', 290, 60, 318, 60) + S.arrow('a2', 440, 60, 468, 60) + S.arrow('a3', 590, 60, 618, 60)
+    + S.term('req', 20, 120, 680, 120, ['request attributes:', '  user: —      groups: —', '  verb: delete  group: ""  resource: pods  name: web  namespace: dev', '', 'decision: —'], { fs: 10 })
+    + S.text('m', 360, 275, '', { cls: 'sm b' });
+  Anim.define('api-pipeline', { w: 720, h: 290, title: 'Request pipeline', ms: 2800, svg, steps: [
+    { c: 'A request arrives over TLS: <code>DELETE /api/v1/namespaces/dev/pods/web</code>. Before anything else it is reduced to a set of <b>attributes</b>.', on(q){ q('#req-l2').style('fill', 'var(--accent)'); } },
+    { c: '<b>Authentication</b>: the client certificate\'s Subject (or a token) yields user <code>jane</code>, groups <code>developers, system:authenticated</code>. Unknown credential → 401 and the pipeline stops.', on(q){ q('#g1 rect').set('hl'); q('#req-l1').text('  user: jane   groups: [developers, system:authenticated]').style('fill', 'var(--green)'); } },
+    { c: '<b>Authorization</b>: the <b>Node</b> authorizer sees a non-kubelet user → no opinion. <b>RBAC</b> looks for a binding granting <code>delete pods</code> in <code>dev</code> to jane or her groups.', on(q){ q('#g1 rect').set(); q('#g2 rect').set('hl'); q('#req-l4').text('decision: Node = no opinion → RBAC evaluating…').style('fill', 'var(--amber)'); } },
+    { c: 'RoleBinding <code>dev-edit</code> binds ClusterRole <code>edit</code> to group <code>developers</code> in <code>dev</code>; edit includes delete on pods → <b>allow</b>. (No matching rule anywhere → 403 Forbidden.)', on(q){ q('#req-l4').text('decision: RBAC = allow (RoleBinding dev-edit → ClusterRole edit)').style('fill', 'var(--green)'); q('#m').text('first allow or deny wins; all "no opinion" = deny'); } },
+    { c: '<b>Admission</b>: for a delete there is little to mutate; validating plugins/webhooks (e.g. "no deletes in dev on Fridays") may still reject with 4xx. For creates, this is where defaults and quotas apply.', on(q){ q('#g2 rect').set(); q('#g3 rect').set('hl'); q('#m').text('admission: policy on the object, not on the caller'); } },
+    { c: 'Persisted: the Pod gets a deletionTimestamp in etcd, watchers (the kubelet) are notified, and the response goes back. Every gate ran in the same order it always does.', on(q){ q('#g3 rect').set(); q('#db rect').set('ok'); q('#m').text('authn → authz → admission → etcd, every request'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

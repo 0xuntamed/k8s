@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 11 · Microservices & 3-Tier Architecture · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d11" data-root="../" data-related="d12,d44">
+<article class="lesson">
+<p class="lead">Kubernetes assumes your software is split into independently deployable pieces that talk over the network. If you have only ever run a monolith, the objects in the next lessons — Services, ConfigMaps, StatefulSets — will feel arbitrary. Spend twenty minutes on <em>why</em> applications are decomposed and how a classic three-tier app maps onto Kubernetes objects, and the rest of the course reads as the obvious consequence.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Monolith vs microservices: what you gain, what you pay</li>
+<li>The three-tier pattern (presentation, application, data) and how each tier becomes Kubernetes objects</li>
+<li>Stateless vs stateful components and why they get different controllers</li>
+<li>The twelve-factor habits that make an app "cloud-native" enough to run well on Kubernetes</li>
+</ul></div>
+
+<h2>Monolith vs microservices</h2>
+<div class="compare">
+<div><h4>Monolith</h4><p>One codebase, one deployable, one process (or a few identical copies). Simple to develop and debug locally; every function call is in-process.</p><p><strong>Pain at scale:</strong> the whole thing scales together (the image-resizer and the login page get the same replica count), one team's bug takes everything down, releases are big-bang events, and the tech stack is frozen.</p></div>
+<div><h4>Microservices</h4><p>Many small services, each owning one capability and its data, communicating over HTTP/gRPC/queues. Each is built, deployed, scaled and fixed independently, by a team that can move at its own pace.</p><p><strong>New pain:</strong> network calls fail and are slow, you need service discovery, distributed tracing, per-service config and secrets, and consistent deployment tooling — precisely the problems Kubernetes exists to solve.</p></div>
+</div>
+<div class="callout mental"><div class="ct">Mental model</div><p>Microservices move complexity from <em>inside the code</em> to <em>between the services</em>. Kubernetes is the platform that makes the "between" manageable: Services for discovery and load balancing, Deployments for independent rollouts, Namespaces for team boundaries, NetworkPolicies for who-may-talk-to-whom. You do not need dozens of services to benefit — three is enough to need all of it.</p></div>
+
+<h2>The three-tier pattern</h2>
+<figure data-anim="three-tier"></figure>
+<div class="tbl-wrap"><table>
+<tr><th>Tier</th><th>Role</th><th>State?</th><th>Kubernetes objects</th></tr>
+<tr><td>Presentation (frontend)</td><td>Serves the UI: static files, SSR, or a reverse proxy. Talks to the API tier.</td><td>Stateless</td><td>Deployment + Service (ClusterIP) + Ingress for external access</td></tr>
+<tr><td>Application (backend / API)</td><td>Business logic. Talks to the database and to other services.</td><td>Stateless</td><td>Deployment + Service (ClusterIP) + ConfigMap + Secret + HPA</td></tr>
+<tr><td>Data (database, cache, queue)</td><td>Stores state. Needs stable identity and durable disks.</td><td>Stateful</td><td>StatefulSet + headless Service + PersistentVolumeClaims (or a managed cloud DB outside the cluster, via ExternalName)</td></tr>
+</table></div>
+<p>Two rules fall out of this table and they drive most design decisions in Kubernetes:</p>
+<ol>
+<li><strong>Tiers talk through Services, never Pod IPs.</strong> Pods come and go; the Service name (<code>api</code>, resolvable via cluster DNS as <code>api.shop.svc.cluster.local</code>) is the stable contract. <a href="d12-services.html">Day 12</a>.</li>
+<li><strong>Stateless tiers use Deployments; stateful ones use StatefulSets.</strong> A Deployment's Pods are interchangeable — any of them can die and be replaced anywhere. A database replica is not interchangeable: it has a name (<code>db-0</code>), a disk, and often a role (primary/replica). <a href="d44-statefulsets.html">Day 44</a>.</li>
+</ol>
+
+<h2>A concrete example: an online shop</h2>
+<pre data-title="objects (one namespace: shop)"><code class="lang-yaml"># frontend tier
+Deployment  frontend   image: shop/web:2.3      replicas: 3
+Service     frontend   ClusterIP → port 80
+Ingress     shop       host shop.example.com → frontend:80
+
+# application tier
+Deployment  api        image: shop/api:5.1      replicas: 4   env from ConfigMap api-config + Secret api-secrets
+Service     api        ClusterIP → port 8080
+HorizontalPodAutoscaler api   2..10 replicas at 70% CPU
+
+# data tier
+StatefulSet postgres   image: postgres:16       replicas: 1   volumeClaimTemplate 20Gi
+Service     postgres   headless (clusterIP: None) → port 5432
+Deployment  redis      image: redis:7 (cache, safe to lose)
+Service     redis      ClusterIP → port 6379</code></pre>
+<p>Notice what is <em>not</em> here: no IP addresses, no hostnames of machines, no "which server does postgres run on". The frontend's config says <code>API_URL=http://api:8080</code>; the API's config says <code>DB_HOST=postgres</code>. Everything else is discovered.</p>
+
+<h2>Twelve-factor habits that matter on Kubernetes</h2>
+<div class="grid-2">
+<div class="card"><h4>Config from the environment</h4><p>Read settings and secrets from env vars or mounted files, not from files baked into the image. ⇒ ConfigMaps &amp; Secrets (<a href="d28-configmaps-secrets.html">Day 28</a>).</p></div>
+<div class="card"><h4>Logs to stdout/stderr</h4><p>Never write log files inside the container. The kubelet captures stdout; <code>kubectl logs</code> and the logging stack read it (<a href="d56-monitoring-logging.html">Day 56</a>).</p></div>
+<div class="card"><h4>Stateless processes</h4><p>No local session state, no "upload directory" on the container's disk. Put state in the data tier so any replica can serve any request and Pods can be replaced freely.</p></div>
+<div class="card"><h4>Disposability</h4><p>Start fast, stop gracefully on SIGTERM (<a href="d04-cmd-vs-entrypoint.html">Day 4</a>, <a href="d22-pod-lifecycle.html">Day 22</a>). Rolling updates and autoscaling depend on it.</p></div>
+<div class="card"><h4>Health endpoints</h4><p>Expose <code>/healthz</code> and <code>/ready</code> so probes can tell "alive" from "ready for traffic" (<a href="d23-health-probes.html">Day 23</a>).</p></div>
+<div class="card"><h4>Port binding</h4><p>The app listens on a port it is told (<code>PORT</code> env), on <code>0.0.0.0</code>. Routing is the platform's job.</p></div>
+</div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Exam scenarios are usually a mini three-tier app: "create a Deployment, expose it with a Service, make the frontend reach it by name". Recognising the pattern lets you predict the next step. Also remember which tier owns which failure: a frontend that cannot reach the API is a <em>Service/DNS/NetworkPolicy</em> problem, not a Deployment problem.</p></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Microservices trade in-process simplicity for independent scaling and deployment; Kubernetes manages the resulting network-level complexity.</li>
+<li>Three tiers: stateless frontend and API as Deployments behind ClusterIP Services; the stateful data tier as a StatefulSet with persistent volumes.</li>
+<li>Components find each other by <strong>Service name</strong> via DNS — never by Pod IP.</li>
+<li>Config from env, logs to stdout, stateless processes, fast start / graceful stop, health endpoints.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('user', 40, 150, 'user', { label: 'browser' })
+    + S.box('ing', 100, 125, 90, 50, ['Ingress', 'shop.example.com'], { subfs: 8, subcls: 'muted', cls: 'cy' })
+    + S.zone('t1', 215, 40, 150, 230, 'presentation')
+    + S.box('fsvc', 230, 125, 120, 44, ['Service frontend', 'ClusterIP'], { subfs: 9, subcls: 'mono muted' })
+    + S.pod('f1', 270, 205, 'web', { cls: 'ok', w: 44 }) + S.pod('f2', 325, 205, 'web', { cls: 'ok', w: 44 }) + S.pod('f3', 270, 245, 'web', { cls: 'ok', w: 44 })
+    + S.zone('t2', 385, 40, 150, 230, 'application')
+    + S.box('asvc', 400, 125, 120, 44, ['Service api', 'ClusterIP'], { subfs: 9, subcls: 'mono muted' })
+    + S.pod('a1', 440, 205, 'api', { cls: 'pur', w: 44 }) + S.pod('a2', 495, 205, 'api', { cls: 'pur', w: 44 }) + S.pod('a3', 440, 245, 'api', { cls: 'pur', w: 44 }) + S.pod('a4', 495, 245, 'api', { cls: 'pur', w: 44 })
+    + S.zone('t3', 555, 40, 150, 230, 'data')
+    + S.box('dsvc', 570, 125, 120, 44, ['Service postgres', 'headless'], { subfs: 9, subcls: 'mono muted' })
+    + S.pod('d0', 630, 215, 'postgres-0', { cls: 'warn', w: 84, sub: 'PVC 20Gi' })
+    + S.arrow('r1', 62, 150, 98, 150, { cls: 'hid' }) + S.arrow('r2', 190, 150, 228, 150, { cls: 'hid' })
+    + S.arrow('r3', 290, 169, 290, 188, { cls: 'hid' })
+    + S.arrow('r4', 350, 147, 398, 147, { cls: 'hid', label: 'http://api:8080', ly: 110 })
+    + S.arrow('r5', 460, 169, 460, 188, { cls: 'hid' })
+    + S.arrow('r6', 520, 147, 568, 147, { cls: 'hid', label: 'postgres:5432', ly: 110 })
+    + S.arrow('r7', 630, 169, 630, 196, { cls: 'hid' })
+    + S.dot('pk', 40, 130, { hidden: true, r: 5 });
+  Anim.define('three-tier', { w: 720, h: 290, title: 'Three tiers on Kubernetes', ms: 2300, svg, steps: [
+    { c: 'A user opens <code>shop.example.com</code>. DNS points at the cluster\'s Ingress (a cloud load balancer or an ingress controller).', on(q){ q('#pk').show().to(100, 130); q('#r1').show().set('hl'); q('#ing rect').set('hl'); } },
+    { c: 'The Ingress rule routes the host to the <b>frontend Service</b>. The Service is a stable virtual IP in front of the three web Pods.', on(q){ q('#pk').to(230, 130); q('#r2').show().set('hl'); q('#fsvc rect').set('hl'); } },
+    { c: 'kube-proxy picks one web Pod. The web Pod needs product data, so it calls <code>http://api:8080</code> — a <b>name</b>, resolved by cluster DNS to the api Service IP.', on(q){ q('#pk').to(290, 200); q('#r3').show().set('hl'); q('#f1 rect').set('hl'); } },
+    { c: 'The <b>api Service</b> load-balances across four stateless API Pods. Any of them can answer; they can be scaled or replaced at will.', on(q){ q('#pk').to(460, 130); q('#r4,#r5').show().set('hl'); q('#asvc rect').set('hl'); q('#a1 rect').set('hl'); } },
+    { c: 'The API reads from <code>postgres:5432</code>. The data tier is a <b>StatefulSet</b>: the Pod has a stable name (<code>postgres-0</code>) and its own persistent disk that survives restarts.', on(q){ q('#pk').to(630, 205); q('#r6,#r7').show().set('hl'); q('#dsvc rect').set('hl'); q('#d0 rect').set('hl'); } },
+    { c: 'Every hop is by Service name. No tier knows or cares which node the next tier runs on, how many replicas it has, or what their IPs are today.', on(q){ q('#pk').hide(); q('.ar').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

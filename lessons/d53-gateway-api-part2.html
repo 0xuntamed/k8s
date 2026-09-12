@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 53 · Gateway API 2: NGINX Gateway Fabric Demo · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d53" data-root="../" data-related="d52,d10,d49">
+<article class="lesson">
+<p class="lead">Time to run it. <strong>NGINX Gateway Fabric</strong> (NGF) is the NGINX project's Gateway API implementation: a controller that watches Gateways and routes and programs an nginx data plane. This lesson installs the Gateway API CRDs and NGF on KIND, creates a Gateway, and works through the HTTPRoute features that Ingress could not do cleanly — path and header matching, traffic splitting, header modification, redirects — verifying each with curl.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Installing the Gateway API CRDs (standard channel) and NGF, and exposing its Service</li>
+<li>Creating a Gateway and reading its status</li>
+<li>HTTPRoute matching: PathPrefix vs Exact, header and query matches, precedence</li>
+<li>Traffic splitting with weights (canary) and RequestMirror</li>
+<li>Filters: RequestHeaderModifier, RequestRedirect, URLRewrite</li>
+<li>Debugging with route status conditions and NGF logs</li>
+</ul></div>
+
+<h2>Install</h2>
+<pre><code class="lang-bash"># 1. Gateway API CRDs — versioned separately from any implementation
+$ kubectl kustomize "https://github.com/nginx/nginx-gateway-fabric/config/crd/gateway-api/standard?ref=v1.6.0" | kubectl apply -f -
+$ kubectl get crd | grep gateway.networking.k8s.io      # gatewayclasses, gateways, httproutes, grpcroutes, referencegrants
+# 2. NGF itself (controller + nginx data plane in one Deployment)
+$ helm install ngf oci://ghcr.io/nginx/charts/nginx-gateway-fabric --create-namespace -n nginx-gateway \
+    --set service.type=NodePort --set service.nodePorts.http=30080     # KIND: reuse the Day 8 port mapping
+$ kubectl -n nginx-gateway get pods,svc
+$ kubectl get gatewayclass                               # nginx  ACCEPTED True</code></pre>
+
+<h2>A Gateway</h2>
+<pre><code class="lang-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main
+  namespace: default
+spec:
+  gatewayClassName: nginx
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces: {from: All}</code></pre>
+<pre><code class="lang-bash">$ kubectl apply -f gateway.yaml
+$ kubectl get gateway main
+NAME   CLASS   ADDRESS   PROGRAMMED   AGE
+main   nginx             True         10s
+$ kubectl describe gateway main | grep -A12 'Listeners:'   # Attached Routes: 0, conditions Accepted/Programmed/ResolvedRefs</code></pre>
+
+<h2>Backends</h2>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx --port=80 && kubectl expose deploy web --port=80
+$ kubectl create deploy api-v1 --image=hashicorp/http-echo --port=5678 -- -text="api v1" && kubectl expose deploy api-v1 --port=5678
+$ kubectl create deploy api-v2 --image=hashicorp/http-echo --port=5678 -- -text="api v2" && kubectl expose deploy api-v2 --port=5678</code></pre>
+
+<h2>Routes, feature by feature</h2>
+<figure data-anim="httproute"></figure>
+<h3>1 · Path matching</h3>
+<pre><code class="lang-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop
+spec:
+  parentRefs: [{name: main}]
+  hostnames: [shop.local]
+  rules:
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+    backendRefs: [{name: api-v1, port: 5678}]
+  - matches:
+    - path: {type: Exact, value: /health}
+    backendRefs: [{name: api-v1, port: 5678}]
+  - matches:
+    - path: {type: PathPrefix, value: /}
+    backendRefs: [{name: web, port: 80}]</code></pre>
+<pre><code class="lang-bash">$ kubectl apply -f route.yaml && kubectl get httproute shop        # HOSTNAMES shop.local, PARENTS main
+$ curl -s -H 'Host: shop.local' localhost:30080/api               # api v1
+$ curl -s -H 'Host: shop.local' localhost:30080/api/orders        # api v1 (PathPrefix)
+$ curl -s -H 'Host: shop.local' localhost:30080/apix | head -1    # nginx page: /apix is NOT under /api (segment-aware prefix)
+$ curl -s -H 'Host: shop.local' localhost:30080/ | grep -o '&lt;title&gt;.*'</code></pre>
+
+<h3>2 · Header and query matching</h3>
+<pre><code class="lang-yaml">  rules:
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+      headers: [{name: X-Version, value: v2}]      # AND: path AND header
+    backendRefs: [{name: api-v2, port: 5678}]
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+      queryParams: [{name: beta, value: "true"}]
+    backendRefs: [{name: api-v2, port: 5678}]
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+    backendRefs: [{name: api-v1, port: 5678}]</code></pre>
+<pre><code class="lang-bash">$ curl -s -H 'Host: shop.local' -H 'X-Version: v2' localhost:30080/api     # api v2
+$ curl -s -H 'Host: shop.local' 'localhost:30080/api?beta=true'            # api v2
+$ curl -s -H 'Host: shop.local' localhost:30080/api                        # api v1 — the more specific matches win regardless of order</code></pre>
+
+<h3>3 · Traffic splitting (canary)</h3>
+<pre><code class="lang-yaml">  rules:
+  - matches: [{path: {type: PathPrefix, value: /api}}]
+    backendRefs:
+    - {name: api-v1, port: 5678, weight: 90}
+    - {name: api-v2, port: 5678, weight: 10}</code></pre>
+<pre><code class="lang-bash">$ for i in $(seq 1 20); do curl -s -H 'Host: shop.local' localhost:30080/api; done | sort | uniq -c    # ~18 v1, ~2 v2
+# promote: swap weights, then remove v1. No Deployment rollout involved; both versions run side by side.</code></pre>
+
+<h3>4 · Filters: headers, redirect, rewrite, mirror</h3>
+<pre><code class="lang-yaml">  rules:
+  - matches: [{path: {type: PathPrefix, value: /api}}]
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        set: [{name: X-Env, value: dev}]
+        add: [{name: X-Trace, value: gw}]
+        remove: [Cookie]
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        add: [{name: X-Served-By, value: ngf}]
+    - type: RequestMirror                       # copy requests to another service; responses discarded
+      requestMirror:
+        backendRef: {name: api-v2, port: 5678}
+    backendRefs: [{name: api-v1, port: 5678}]
+  - matches: [{path: {type: PathPrefix, value: /legacy}}]
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path: {type: ReplacePrefixMatch, replacePrefixMatch: /api}   # /legacy/x → /api/x
+    backendRefs: [{name: api-v1, port: 5678}]
+  - matches: [{path: {type: PathPrefix, value: /old}}]
+    filters:
+    - type: RequestRedirect
+      requestRedirect: {scheme: https, hostname: shop.example.com, statusCode: 301}</code></pre>
+<pre><code class="lang-bash">$ curl -si -H 'Host: shop.local' localhost:30080/api | grep -i x-served-by
+$ curl -s -H 'Host: shop.local' localhost:30080/legacy/x           # rewritten to /api/x → api v1
+$ curl -sI -H 'Host: shop.local' localhost:30080/old | grep -iE 'HTTP|location'   # 301 Location: https://shop.example.com/old
+$ kubectl logs deploy/api-v2 --tail=5                              # mirrored requests arriving</code></pre>
+
+<h2>Debugging</h2>
+<pre><code class="lang-bash">$ kubectl get httproute shop -o jsonpath='{range .status.parents[*]}{.parentRef.name}{": "}{range .conditions[*]}{.type}={.status}({.reason}) {end}{"\n"}{end}'
+main: Accepted=True(Accepted) ResolvedRefs=True(ResolvedRefs)
+# Accepted=False  NotAllowedByListeners / NoMatchingListenerHostname / NoMatchingParent
+# ResolvedRefs=False  BackendNotFound / RefNotPermitted (needs ReferenceGrant) / InvalidKind
+$ kubectl get gateway main -o jsonpath='{.status.listeners[*].attachedRoutes}{"\n"}'
+$ kubectl -n nginx-gateway logs deploy/ngf-nginx-gateway-fabric -c nginx-gateway --tail=30
+$ kubectl -n nginx-gateway exec deploy/ngf-nginx-gateway-fabric -c nginx -- nginx -T | grep -A5 'server_name shop.local'   # the generated nginx config</code></pre>
+
+<div class="callout mental"><div class="ct">Same machinery, better API</div><p>NGF is doing exactly what ingress-nginx does — watch objects, write an nginx.conf, reload — but the objects it watches describe intent precisely enough that Envoy Gateway or a cloud LB would do the same thing from the same YAML. Compare the canary above with the ingress-nginx way: a second Ingress with <code>nginx.ingress.kubernetes.io/canary: "true"</code> and <code>canary-weight: "10"</code> annotations that mean nothing to any other controller.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Likely tasks: create a Gateway of a given class with an HTTP listener; create an HTTPRoute to a Service with a path match; add a second backend with weights. Verify: <code>get gateway</code> PROGRAMMED, <code>get httproute</code> shows the parent, <code>describe httproute</code> conditions.</li>
+<li>Field names to get right: <code>parentRefs</code>, <code>hostnames</code>, <code>rules[].matches[].path.type/value</code>, <code>backendRefs[].name/port/weight</code>. <code>kubectl explain httproute.spec.rules</code> is available.</li>
+<li>The CRDs must be installed for <code>kubectl explain</code> to know the kind — exam clusters that ask about Gateway API will have them.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (25 min)</h3>
+<pre><code class="lang-bash"># run the install, gateway, backends and route sections above on KIND, then:
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: shop}
+spec:
+  parentRefs: [{name: main}]
+  hostnames: [shop.local]
+  rules:
+  - matches: [{path: {type: PathPrefix, value: /api}, headers: [{name: X-Version, value: v2}]}]
+    backendRefs: [{name: api-v2, port: 5678}]
+  - matches: [{path: {type: PathPrefix, value: /api}}]
+    filters: [{type: ResponseHeaderModifier, responseHeaderModifier: {add: [{name: X-Served-By, value: ngf}]}}]
+    backendRefs: [{name: api-v1, port: 5678, weight: 80}, {name: api-v2, port: 5678, weight: 20}]
+  - matches: [{path: {type: PathPrefix, value: /}}]
+    backendRefs: [{name: web, port: 80}]
+EOF
+$ kubectl get httproute shop; kubectl describe httproute shop | grep -A4 Conditions
+$ for i in $(seq 1 10); do curl -s -H 'Host: shop.local' localhost:30080/api; done | sort | uniq -c
+$ curl -s -H 'Host: shop.local' -H 'X-Version: v2' localhost:30080/api
+$ curl -si -H 'Host: shop.local' localhost:30080/api | grep -i served
+# break it: point at a missing service and read the condition
+$ kubectl patch httproute shop --type=json -p '[{"op":"replace","path":"/spec/rules/2/backendRefs/0/name","value":"nope"}]'
+$ kubectl get httproute shop -o jsonpath='{.status.parents[0].conditions[?(@.type=="ResolvedRefs")]}{"\n"}'   # BackendNotFound
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: shop.local' localhost:30080/                            # 500 from the gateway
+$ kubectl delete httproute shop gateway main; kubectl delete deploy web api-v1 api-v2; kubectl delete svc web api-v1 api-v2</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Install the Gateway API CRDs, then an implementation (NGF); the GatewayClass appears; a Gateway provisions a listener; routes attach.</li>
+<li>HTTPRoute matches: PathPrefix (segment-aware), Exact, headers, query, method — specific beats general by spec, not by order.</li>
+<li>Weighted <code>backendRefs</code> give canaries without annotations; filters modify headers, redirect, rewrite and mirror.</li>
+<li>Route status conditions (Accepted, ResolvedRefs) explain every failure; the generated nginx config is inspectable.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('c', 50, 150, 'laptop', { label: 'curl -H Host: shop.local', ly: 28, lcls: 'mono' })
+    + S.box('gw', 150, 120, 120, 60, ['Gateway main', 'nginx :80'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.term('rt', 300, 40, 260, 130, ['HTTPRoute shop  (shop.local)', ' /api + X-Version:v2 → api-v2', ' /api → api-v1 (90) · api-v2 (10)', '    + ResponseHeader X-Served-By', ' /legacy → rewrite /api → api-v1', ' /old → 301 https://shop.example.com', ' /   → web'], { fs: 8.5 })
+    + S.box('v1', 610, 60, 90, 40, ['api-v1'], { fs: 11, cls: 'ok' }) + S.box('v2', 610, 130, 90, 40, ['api-v2'], { fs: 11, cls: 'cy' }) + S.box('web', 610, 200, 90, 40, ['web'], { fs: 11, cls: 'ok' })
+    + S.arrow('a1', 95, 150, 148, 150, { cls: 'hl' }) + S.arrow('a2', 270, 150, 298, 120, { d: 'M 270 150 L 298 118', cls: 'hl' })
+    + S.arrow('r1', 560, 80, 608, 80, { cls: 'hid' }) + S.arrow('r2', 560, 150, 608, 150, { cls: 'hid' }) + S.arrow('r3', 560, 160, 608, 220, { d: 'M 560 165 L 608 218', cls: 'hid' })
+    + S.text('req', 360, 205, '', { cls: 'sm mono b' }) + S.text('m', 360, 230, '', { cls: 'sm' }) + S.text('m2', 360, 252, '', { cls: 'xs muted' });
+  const hl = (q, line) => { for (let i = 1; i <= 6; i++) q('#rt-l' + i).style('fill', i === line ? 'var(--green)' : 'var(--faint)'); };
+  Anim.define('httproute', { w: 720, h: 265, title: 'HTTPRoute rules in action', ms: 3000, svg, steps: [
+    { c: 'Six rules on one route. NGF has compiled them into an nginx config; each request is matched by the <b>spec\'s precedence</b>, not by the order you wrote them.', on(q){} },
+    { c: '<code>GET /api</code> with <code>X-Version: v2</code>: the rule with path + header is more specific than path alone → api-v2.', on(q){ q('#req').text('GET /api  X-Version: v2'); hl(q, 1); q('#r1,#r3').add('hid'); q('#r2').show().set('ok'); q('#m').text('→ api-v2'); q('#m2').text('more match conditions = higher precedence'); } },
+    { c: '<code>GET /api</code> without the header: the weighted rule. 90% of requests go to api-v1, 10% to api-v2; the response gains <code>X-Served-By: ngf</code>.', on(q){ q('#req').text('GET /api'); hl(q, 2); q('#r1').show().set('ok'); q('#r2').show().set('cy'); q('#m').text('→ api-v1 (90) / api-v2 (10) + response header'); q('#m2').text('canary without annotations'); } },
+    { c: '<code>GET /legacy/orders</code>: URLRewrite replaces the prefix → the backend sees <code>/api/orders</code>.', on(q){ q('#req').text('GET /legacy/orders'); hl(q, 4); q('#r2').add('hid'); q('#r1').set('ok'); q('#m').text('→ api-v1 as /api/orders'); q('#m2').text('URLRewrite ReplacePrefixMatch'); } },
+    { c: '<code>GET /old</code>: RequestRedirect answers 301 to <code>https://shop.example.com/old</code> without touching any backend.', on(q){ q('#req').text('GET /old'); hl(q, 5); q('#r1').add('hid'); q('#m').text('← 301 Location: https://shop.example.com/old'); q('#m2').text('handled at the gateway'); } },
+    { c: 'Everything else (<code>/</code>): the catch-all prefix → web. And a request for another hostname would match nothing on this route — the Gateway returns 404.', on(q){ q('#req').text('GET /'); hl(q, 6); q('#r3').show().set('ok'); q('#m').text('→ web'); q('#m2').text('hostnames gate the whole route'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

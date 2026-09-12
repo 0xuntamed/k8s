@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 58 · Data Plane (Worker Node) Troubleshooting · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d58" data-root="../" data-linux="l07,l05,l03,l10" data-related="d25,d54,d57,d13">
+<article class="lesson">
+<p class="lead">A worker node is simpler than the control plane — a kubelet, a container runtime, a CNI, and kube-proxy — but it fails in more ways, because it also has the disk, the memory, the network and the workloads. This lesson is the runbook for the two questions that cover it: <em>"the node is NotReady"</em> and <em>"the node is Ready but Pods on it are broken"</em>, plus the Service/DNS layer that lives on every node.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Reading <code>kubectl describe node</code>: conditions, taints, allocatable, events</li>
+<li>NotReady: kubelet down, runtime down, CNI missing, certificates, node pressure, network partition</li>
+<li>Pods failing on one node: image pulls, volumes, sandbox creation, cgroups, disk</li>
+<li>Service traffic and DNS failing on a node: kube-proxy, iptables, conntrack, CNI routes</li>
+<li>The node-side commands: systemctl, journalctl, crictl, ip/ss/iptables, df/free</li>
+</ul></div>
+
+<h2>First look: the Node object</h2>
+<pre><code class="lang-bash">$ kubectl get nodes -o wide                                  # STATUS, VERSION, INTERNAL-IP, OS, runtime
+$ kubectl describe node worker-1
+Conditions:
+  Type             Status  Reason                       Message
+  MemoryPressure   False   KubeletHasSufficientMemory
+  DiskPressure     False   KubeletHasNoDiskPressure
+  PIDPressure      False   KubeletHasSufficientPID
+  Ready            True    KubeletReady                 kubelet is posting ready status
+Taints:            &lt;none&gt;
+Allocatable:       cpu: 2  memory: 3.8Gi  pods: 110
+Non-terminated Pods: …  Allocated resources: …
+Events: …  (NodeNotReady, NodeHasDiskPressure, RegisteredNode, Starting, …)
+$ kubectl get node worker-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")]}{"\n"}'
+$ kubectl get lease -n kube-node-lease worker-1 -o jsonpath='{.spec.renewTime}{"\n"}'   # last heartbeat</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Ready condition</th><th>Meaning</th><th>Look at</th></tr>
+<tr><td><code>True</code></td><td>Kubelet healthy and reporting</td><td>Pod-level problems</td></tr>
+<tr><td><code>False</code></td><td>Kubelet reporting, but something it checks failed — the <em>message</em> says what (runtime down, CNI not ready, PLEG unhealthy)</td><td>The message; then the node</td></tr>
+<tr><td><code>Unknown</code></td><td>No heartbeat for <code>node-monitor-grace-period</code> (40 s): kubelet dead, node off, or network partition</td><td>Can you SSH? Is the kubelet running? Can it reach :6443?</td></tr>
+</table></div>
+<p>After a node is <code>Unknown</code>/NotReady, the node controller taints it <code>not-ready</code>/<code>unreachable:NoExecute</code>; Pods are evicted 5 minutes later (<a href="d16-taints-tolerations.html">Day 16</a>) and show <code>Terminating</code> until the node returns or you <code>--force</code> delete them.</p>
+
+<h2>NotReady: the checklist on the node</h2>
+<figure data-anim="node-notready"></figure>
+<pre><code class="lang-bash">$ ssh worker-1
+# 1. kubelet
+$ systemctl status kubelet                       # active (running)? if not: systemctl start kubelet, then:
+$ journalctl -u kubelet -n 50 --no-pager         # the reason it will not start / keeps restarting
+#   "failed to load Kubelet config file"          → /var/lib/kubelet/config.yaml missing/invalid or wrong path in the drop-in
+#   "running with swap on"                        → swapoff -a; comment out in /etc/fstab
+#   "x509: certificate has expired"               → /var/lib/kubelet/pki/kubelet-client-current.pem; rejoin or renew
+#   "Unable to register node … Unauthorized"      → kubelet.conf/bootstrap credentials wrong
+#   "dial tcp 192.168.56.10:6443: connect: no route to host" → network to the API server; wrong server in kubelet.conf
+#   "cgroup driver mismatch"                      → containerd SystemdCgroup
+# 2. runtime
+$ systemctl status containerd; crictl info | head -30; crictl ps        # socket reachable? containers running?
+$ grep -E 'containerRuntimeEndpoint|cgroupDriver' /var/lib/kubelet/config.yaml
+# 3. CNI
+$ ls /etc/cni/net.d/ /opt/cni/bin/                # empty → "cni plugin not initialized"; CNI DaemonSet pod on this node?
+$ kubectl get pods -n calico-system -o wide --field-selector spec.nodeName=worker-1     # from anywhere
+# 4. resources
+$ df -h / /var/lib/containerd /var/lib/kubelet    # DiskPressure at 85–90%: crictl rmi --prune; journalctl --vacuum-size=200M; find big logs
+$ free -m; dmesg | grep -i -E 'oom|killed process' | tail
+$ ps -eo pid,ppid,stat,cmd | grep -c Z            # zombie storm → PIDPressure
+# 5. network to the control plane
+$ curl -sk https://192.168.56.10:6443/healthz     # ok? if not: routing, firewall, or the API server (Day 57)
+$ ip route; ip addr; ss -tlnp | grep -E '10250|10256'
+# 6. time
+$ timedatectl | grep -E 'synchronized|NTP'         # clock skew breaks TLS ("certificate is not yet valid")</code></pre>
+<pre><code class="lang-bash"># common one-line fixes
+$ sudo systemctl daemon-reload && sudo systemctl restart kubelet
+$ sudo systemctl restart containerd
+$ sudo swapoff -a
+$ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml && sudo systemctl restart containerd
+$ sudo crictl rmi --prune                          # reclaim disk from unused images
+$ kubeadm token create --print-join-command        # on cp: then on the node: kubeadm reset -f && kubeadm join …   (last resort: re-register)</code></pre>
+
+<h2>Ready, but Pods on this node fail</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Symptom</th><th>Node-side cause</th><th>Check</th></tr>
+<tr><td><code>ContainerCreating</code> forever, event <code>FailedCreatePodSandBox</code></td><td>CNI cannot allocate an IP (IPAM exhausted, plugin crash), or runtime cannot create the sandbox</td><td><code>describe pod</code> message; CNI pod logs on that node; <code>crictl pods</code></td></tr>
+<tr><td><code>ImagePullBackOff</code> only on one node</td><td>Registry unreachable from this node (DNS, proxy, firewall), disk full, or node-specific credentials</td><td><code>crictl pull image</code> on the node; <code>df -h</code>; <code>cat /etc/containerd/config.toml</code> registry mirrors</td></tr>
+<tr><td><code>FailedMount</code> / <code>FailedAttachVolume</code></td><td>CSI node plugin not running here; disk still attached elsewhere; NFS server unreachable; mount options</td><td><code>kubectl get pods -n kube-system -l app=…-csi-node -o wide</code>; <code>kubectl get volumeattachments</code>; <code>mount | grep kubelet</code>; <code>journalctl -u kubelet | grep -i mount</code></td></tr>
+<tr><td><code>Evicted</code></td><td>Node pressure: the kubelet evicted BestEffort/Burstable Pods</td><td><code>describe pod</code> message names the resource; <code>describe node</code> conditions; free disk/memory</td></tr>
+<tr><td><code>CrashLoopBackOff</code> only here</td><td>Node-local dependency: hostPath content, kernel module, sysctl, different kernel/arch</td><td><code>logs --previous</code>; <code>uname -a</code>; <code>sysctl</code> values</td></tr>
+<tr><td>Pod Running but unreachable</td><td>Pod network on this node broken (routes, veth, iptables)</td><td>see below</td></tr>
+</table></div>
+
+<h2>Networking on the node: Services and DNS</h2>
+<pre><code class="lang-bash"># is kube-proxy running here and healthy?
+$ kubectl get pods -n kube-system -l k8s-app=kube-proxy -o wide --field-selector spec.nodeName=worker-1
+$ kubectl -n kube-system logs -l k8s-app=kube-proxy --field-selector spec.nodeName=worker-1 --tail=20   # "Using iptables Proxier", errors syncing rules?
+$ curl -s localhost:10256/healthz                   # kube-proxy health on the node
+# are the Service rules present?
+$ sudo iptables -t nat -L KUBE-SERVICES -n | head; sudo iptables -t nat -L KUBE-NODEPORTS -n
+$ sudo ipvsadm -Ln                                  # if in IPVS mode
+$ sudo conntrack -L 2&gt;/dev/null | wc -l; sysctl net.netfilter.nf_conntrack_max     # table full → dropped connections
+$ sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables                    # both must be 1
+# pod network
+$ ip route | grep -E '192.168|10.244'               # routes to other nodes' pod CIDRs (Calico/kindnet) or the VXLAN/tunnel device
+$ ip link | grep -E 'cali|veth|vxlan|tunl'
+$ crictl inspectp &lt;sandbox&gt; | jq '.info.runtimeSpec.linux.namespaces' ; nsenter -t &lt;pid&gt; -n ip addr   # inside a pod's netns
+$ kubectl run t --rm -it --image=nicolaka/netshoot --overrides='{"spec":{"nodeName":"worker-1"}}' -- sh   # test FROM this node: curl svc, nslookup, ping a pod on another node
+# DNS specifically: CoreDNS pods healthy? ClusterIP 10.96.0.10 reachable from this node?
+$ kubectl run t --rm -it --image=busybox:1.36 --overrides='{"spec":{"nodeName":"worker-1"}}' -- nslookup kubernetes.default</code></pre>
+<figure data-anim="pod-on-node"></figure>
+
+<div class="callout linux" data-ref="l07,l05,l03,l10"><div class="ct">Under the hood · Linux</div><p>Every row above maps to a Linux subsystem: systemd units for kubelet/containerd; cgroups for pressure and evictions (<code>/sys/fs/cgroup/kubepods.slice</code>, <code>memory.events</code>); the VFS for volumes (<code>findmnt</code>, <code>mount</code>); netfilter for Services (<code>iptables -t nat</code>, <code>conntrack</code>); netlink for the Pod network (<code>ip route</code>, <code>ip link</code>, <code>ip netns</code>/<code>nsenter</code>); the journal for everything the daemons say. The node-level tools — <code>ss</code>, <code>tcpdump -i any port 53</code>, <code>strace -p</code>, <code>dmesg</code>, <code>df</code>, <code>free</code>, <code>top</code> — answer questions kubectl cannot ask. The <a href="../linux/l10-shell-toolkit.html">shell toolkit</a> page is the reference.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Node NotReady, fix it" is nearly always: kubelet stopped (start it), kubelet misconfigured (config path / cert / swap), or containerd stopped. Start with <code>systemctl status kubelet</code> and <code>journalctl -u kubelet</code>. Two minutes.</li>
+<li>After a fix, <code>kubectl get nodes</code> takes up to ~40 s to flip to Ready. Verify before moving on.</li>
+<li>Pods stuck Terminating on a dead node: <code>kubectl delete pod X --force --grace-period=0</code>.</li>
+<li>For "Service unreachable" questions, check kube-proxy on the node and the Service's endpoints before touching iptables.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (30 min) — Day 54 cluster or KIND (docker exec into a worker)</h3>
+<pre><code class="lang-bash"># 1. kubelet down
+$ ssh worker-1 sudo systemctl stop kubelet; sleep 60; kubectl get nodes           # NotReady after ~40 s
+$ kubectl get pods -o wide | grep worker-1                                         # still Running (from the API's view) — 5 min to eviction
+$ ssh worker-1 sudo systemctl start kubelet; sleep 15; kubectl get nodes
+# 2. broken kubelet config
+$ ssh worker-1 "sudo sed -i 's/cgroupDriver: systemd/cgroupDriver: cgroupfs/' /var/lib/kubelet/config.yaml && sudo systemctl restart kubelet"
+$ sleep 30; kubectl get nodes; ssh worker-1 "sudo journalctl -u kubelet -n 5 --no-pager | grep -i cgroup"
+$ ssh worker-1 "sudo sed -i 's/cgroupDriver: cgroupfs/cgroupDriver: systemd/' /var/lib/kubelet/config.yaml && sudo systemctl restart kubelet"
+# 3. runtime down
+$ ssh worker-1 sudo systemctl stop containerd; sleep 60; kubectl describe node worker-1 | grep -A2 'Ready '   # "container runtime is down"
+$ ssh worker-1 sudo systemctl start containerd
+# 4. kube-proxy gone on one node
+$ kubectl -n kube-system patch ds kube-proxy -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-2"}}}}}'
+$ sleep 20; kubectl run t --rm -it --image=busybox:1.36 --overrides='{"spec":{"nodeName":"worker-1"}}' -- wget -qO- --timeout=2 http://kubernetes.default   # existing rules linger; new services would not sync
+$ kubectl -n kube-system patch ds kube-proxy --type=json -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]'
+# 5. disk pressure (careful)
+$ ssh worker-1 "sudo fallocate -l 90%FREE /var/lib/containerd/big 2&gt;/dev/null || sudo dd if=/dev/zero of=/var/lib/containerd/big bs=1M count=3000"
+$ sleep 60; kubectl describe node worker-1 | grep -E 'DiskPressure|Taints'; ssh worker-1 sudo rm /var/lib/containerd/big</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li><code>describe node</code>: the Ready condition's message and the pressure conditions tell you which layer failed.</li>
+<li>NotReady checklist on the node: kubelet → containerd → CNI files/DaemonSet → disk/memory/PIDs → network to :6443 → clock.</li>
+<li>Ready-but-broken Pods: sandbox/CNI (ContainerCreating), pulls (registry from this node), volumes (CSI node plugin, attachments), evictions (pressure).</li>
+<li>Service/DNS problems on a node are kube-proxy, sysctls, conntrack or CNI routes; test from a Pod pinned to that node.</li>
+<li>Evictions from a dead node take 5 minutes; force-delete stuck Terminating Pods.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  const rows = [['kubelet.service running?', 'systemctl status kubelet · journalctl -u kubelet'], ['containerd reachable?', 'systemctl status containerd · crictl ps'], ['CNI configured?', 'ls /etc/cni/net.d · CNI daemonset pod on node'], ['disk / memory / PIDs ok?', 'df -h · free -m · dmesg'], ['can reach apiserver :6443?', 'curl -sk https://cp:6443/healthz'], ['clock in sync?', 'timedatectl']];
+  let s1 = S.box('node', 20, 15, 680, 40, ['worker-1: NotReady — Ready=Unknown (no heartbeat)'], { fs: 11, cls: 'bad' });
+  rows.forEach((r, i) => s1 += S.box(`r${i}`, 40, 70 + i * 36, 260, 30, r[0], { fs: 10, cls: 'soft' }) + S.text(`c${i}`, 320, 90 + i * 36, r[1], { cls: 'xs mono muted left' }));
+  s1 += S.text('m', 360, 305, '', { cls: 'sm b' });
+  Anim.define('node-notready', { w: 720, h: 320, title: 'NotReady checklist', ms: 2400, svg: s1, steps: [
+    { c: 'The node stopped heart-beating. SSH in and walk the list top-down; stop at the first failure.', on(q){} },
+    { c: '<b>kubelet</b>: stopped, crash-looping, or misconfigured? The journal says why. Most exam NotReady cases end here.', on(q){ q('#r0 rect').set('hl'); q('#c0').style('fill', 'var(--accent)'); q('#m').text('start it / fix config path, cert, swap, cgroup driver'); } },
+    { c: '<b>containerd</b>: the kubelet reports "container runtime is down" if the socket does not answer.', on(q){ q('#r0 rect').set('ok'); q('#r1 rect').set('hl'); q('#c1').style('fill', 'var(--accent)'); q('#m').text('systemctl restart containerd'); } },
+    { c: '<b>CNI</b>: "cni plugin not initialized" → no config file. Is the CNI DaemonSet Pod running on this node? Did someone delete /etc/cni/net.d?', on(q){ q('#r1 rect').set('ok'); q('#r2 rect').set('hl'); q('#c2').style('fill', 'var(--accent)'); q('#m').text('CNI pod logs; reinstall config'); } },
+    { c: '<b>Pressure</b>: full disk stops image pulls and log writes; memory exhaustion kills the kubelet itself; zombie storms exhaust PIDs.', on(q){ q('#r2 rect').set('ok'); q('#r3 rect').set('hl'); q('#c3').style('fill', 'var(--accent)'); q('#m').text('crictl rmi --prune · journalctl --vacuum · find the leaker'); } },
+    { c: '<b>Network</b> to the API server and <b>time</b>: a node that cannot reach :6443 is Unknown even if perfectly healthy; a skewed clock fails TLS. Fix, wait ~40 s, watch the node go Ready.', on(q){ q('#r3 rect').set('ok'); q('#r4 rect,#r5 rect').set('hl'); q('#c4,#c5').style('fill', 'var(--accent)'); q('#node').text('worker-1: Ready (after the fix, ~40 s)'); q('#node rect').set('ok'); q('#m').text('verify with kubectl get nodes'); } },
+  ]});
+
+  let s2 = S.node('nd', 20, 20, 680, 300, 'worker-1 (Ready) — a pod\'s dependencies on this node', {})
+    + S.box('kl', 40, 60, 120, 40, 'kubelet', { fs: 11, cls: 'ok' })
+    + S.box('rt', 190, 60, 120, 40, 'containerd', { fs: 11 }) + S.box('cni', 340, 60, 120, 40, 'CNI plugin', { fs: 11 }) + S.box('csi', 490, 60, 120, 40, 'CSI node plugin', { fs: 10 })
+    + S.box('kp', 40, 130, 120, 40, 'kube-proxy', { fs: 11 }) + S.box('reg', 190, 130, 120, 40, 'registry access', { fs: 10 }) + S.box('disk', 340, 130, 120, 40, 'disk space', { fs: 11 }) + S.box('mem', 490, 130, 120, 40, 'memory', { fs: 11 })
+    + S.pod('pod', 300, 240, 'pod api-7f9c', { w: 120, cls: 'ok' })
+    + S.text('st', 300, 285, 'Running', { cls: 'sm mono okc b' })
+    + S.text('m', 360, 310, '', { cls: 'sm b' });
+  const fail = (q, id, status, msg) => { q('.nb').set(); q('#kl rect').set('ok'); q('#' + id + ' rect').set('bad'); q('#st').text(status).style('fill', 'var(--red)'); q('#pod rect').set('bad'); q('#m').text(msg); };
+  Anim.define('pod-on-node', { w: 720, h: 330, title: 'Ready node, broken pod: which dependency?', ms: 2800, svg: s2, steps: [
+    { c: 'The node is Ready — the kubelet is fine. But a Pod scheduled here depends on eight more things.', on(q){} },
+    { c: '<b>CNI</b> fails to allocate an IP (IPAM pool exhausted, plugin crashed) → the sandbox cannot be created: <code>ContainerCreating</code> with <code>FailedCreatePodSandBox</code>.', on(q){ fail(q, 'cni', 'ContainerCreating', 'describe pod → FailedCreatePodSandBox … cni …'); } },
+    { c: 'This node cannot reach the <b>registry</b> (DNS, proxy, firewall) or has no credentials → <code>ImagePullBackOff</code> here only, while the same image runs elsewhere.', on(q){ fail(q, 'reg', 'ImagePullBackOff', 'crictl pull on the node to reproduce'); } },
+    { c: 'The <b>CSI node plugin</b> is missing on this node, or the volume is still attached to another node → <code>FailedMount</code> / <code>FailedAttachVolume</code>, Pod stuck ContainerCreating.', on(q){ fail(q, 'csi', 'ContainerCreating', 'get volumeattachments · CSI DaemonSet pod on this node'); } },
+    { c: '<b>Disk</b> at 90% → DiskPressure → the kubelet evicts Pods (lowest QoS first) and refuses new ones: <code>Evicted</code>.', on(q){ fail(q, 'disk', 'Evicted', 'df -h; crictl rmi --prune; find the log hog'); } },
+    { c: '<b>kube-proxy</b> broken on this node → the Pod runs but cannot reach any Service (or DNS): iptables rules stale. Test from a Pod pinned to the node; check the kube-proxy Pod for this node.', on(q){ fail(q, 'kp', 'Running (no connectivity)', 'iptables -t nat -L KUBE-SERVICES · kube-proxy logs'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 57 · Control Plane Troubleshooting · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="../js/theme.js"></script>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="d57" data-root="../" data-linux="l07,l09,l10" data-related="d07,d15,d33,d58">
+<article class="lesson">
+<p class="lead">Troubleshooting is 30% of the CKA and most of real operations. The control plane is four static Pods and a kubelet on one or three machines, so every failure is one of a short list: a manifest with a typo, a wrong path or flag, an expired certificate, a full disk, a broken kubeconfig, or etcd unhappy. This lesson is a decision tree: from the symptom kubectl shows you, to the node, to the file, to the fix — with each component's characteristic failure and where its evidence lives.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The first five commands, in order, and what each rules in or out</li>
+<li>Working without kubectl: crictl, journalctl, the manifests directory, static Pod logs</li>
+<li>API server failures: flags, certificates, etcd connectivity, ports</li>
+<li>etcd failures: data dir, certs, disk, quorum</li>
+<li>Scheduler and controller-manager failures: Pods Pending / nothing reconciling; kubeconfig and leader election</li>
+<li>kubelet on the control-plane node, and kubeconfig/cert problems on the client side</li>
+</ul></div>
+
+<h2>Where each component lives (recap)</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Component</th><th>Defined in</th><th>Runs as</th><th>Logs</th><th>Talks to</th></tr>
+<tr><td>kube-apiserver</td><td><code>/etc/kubernetes/manifests/kube-apiserver.yaml</code></td><td>static Pod</td><td><code>crictl logs</code> / <code>/var/log/pods/kube-system_kube-apiserver-*</code></td><td>etcd :2379</td></tr>
+<tr><td>etcd</td><td><code>…/etcd.yaml</code></td><td>static Pod</td><td>same</td><td>peers :2380; data in <code>/var/lib/etcd</code></td></tr>
+<tr><td>kube-scheduler</td><td><code>…/kube-scheduler.yaml</code></td><td>static Pod</td><td>same</td><td>API server via <code>/etc/kubernetes/scheduler.conf</code></td></tr>
+<tr><td>kube-controller-manager</td><td><code>…/kube-controller-manager.yaml</code></td><td>static Pod</td><td>same</td><td>API server via <code>controller-manager.conf</code></td></tr>
+<tr><td>kubelet</td><td><code>/var/lib/kubelet/config.yaml</code>, <code>/etc/kubernetes/kubelet.conf</code>, systemd drop-in</td><td>systemd service</td><td><code>journalctl -u kubelet</code></td><td>API server, containerd</td></tr>
+</table></div>
+
+<h2>The decision tree</h2>
+<figure data-anim="cp-tree"></figure>
+<ol class="steps">
+<li><strong>Does kubectl work at all?</strong> <code>kubectl get nodes</code>. Errors: <em>connection refused</em> → API server down (or wrong port/address in kubeconfig); <em>timeout</em> → network/firewall or wrong server IP; <em>x509</em> → certificate problem (client cert, CA, expiry, or server SAN); <em>Unauthorized/Forbidden</em> → authn/authz, not the control plane. Cross-check with <code>kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes</code> on the control-plane node — if <em>that</em> works, your kubeconfig is the problem.</li>
+<li><strong>On the control-plane node: is the kubelet running?</strong> <code>systemctl status kubelet</code>. If not, nothing else can be — see the kubelet section below.</li>
+<li><strong>Are the static Pods running?</strong> <code>crictl ps -a | grep -E 'apiserver|etcd|scheduler|controller'</code>. Missing entirely → the manifest is not being read (wrong directory, invalid YAML, kubelet <code>staticPodPath</code>). Exited/restarting → read its log: <code>crictl logs &lt;id&gt;</code> (use <code>-a</code> to find exited containers; the last few lines say why).</li>
+<li><strong>Read the manifest.</strong> <code>cat /etc/kubernetes/manifests/kube-apiserver.yaml</code>: compare flag values to the files they name (<code>ls -l</code> each path), the ports, and the etcd address. Typos in flags produce <code>unknown flag</code> in the log; wrong paths produce <code>no such file</code>; wrong certs produce <code>x509</code>.</li>
+<li><strong>Check certificates and disk.</strong> <code>kubeadm certs check-expiration</code>; <code>df -h /var/lib/etcd /var/log</code>; <code>free -m</code>.</li>
+<li><strong>Once the API server answers:</strong> <code>kubectl get pods -n kube-system</code>, <code>kubectl get events -A --sort-by=.lastTimestamp</code>, <code>kubectl get componentstatuses</code> (deprecated but still prints), <code>kubectl get --raw /readyz?verbose</code>.</li>
+</ol>
+
+<h2>kube-apiserver</h2>
+<pre><code class="lang-bash">$ crictl ps -a --name kube-apiserver          # state and restart count
+$ crictl logs --tail 30 $(crictl ps -a --name kube-apiserver -q | head -1)
+# typical last lines and what they mean:
+#   "unknown flag: --etcd-server"            → typo in a flag name (it is --etcd-servers)
+#   "open /etc/kubernetes/pki/apiserver.crt: no such file or directory"   → wrong path in --tls-cert-file or hostPath volume
+#   "x509: certificate has expired"          → kubeadm certs renew all
+#   "context deadline exceeded" / "connection refused" to 127.0.0.1:2379   → etcd is down, or --etcd-servers is wrong
+#   "bind: address already in use"           → --secure-port conflicts (another process, or a duplicate apiserver)
+$ grep -E '^\s+- --' /etc/kubernetes/manifests/kube-apiserver.yaml | head -40
+$ ss -tlnp | grep -E '6443|2379'
+$ curl -sk https://127.0.0.1:6443/livez?verbose | tail -5      # once it is listening
+$ kubeadm certs check-expiration</code></pre>
+<p>Editing the manifest is the fix in most cases; the kubelet restarts the Pod within seconds of the file changing (watch <code>crictl ps</code>). If nothing happens after an edit, the YAML is now invalid — <code>journalctl -u kubelet | grep -i manifest</code> will say so.</p>
+
+<h2>etcd</h2>
+<pre><code class="lang-bash">$ crictl logs --tail 30 $(crictl ps -a --name etcd -q | head -1)
+#   "open /var/lib/etcd/member/…: no such file"   → --data-dir or the hostPath volume points somewhere wrong (common after a restore)
+#   "no space left on device"                     → disk full; etcd stops writing (alarm NOSPACE)
+#   "x509" / "tls: bad certificate"               → etcd/server.crt, peer.crt or the CA in --trusted-ca-file
+#   "lost leader" / "request timed out"           → quorum lost in HA (check the other members) or disk latency
+$ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key endpoint health
+$ ETCDCTL_API=3 etcdctl … endpoint status -w table          # leader, db size, raft index
+$ ETCDCTL_API=3 etcdctl … alarm list; etcdctl … defrag; etcdctl … alarm disarm     # after freeing space
+$ df -h /var/lib/etcd; ls -la /var/lib/etcd/member</code></pre>
+
+<h2>kube-scheduler and kube-controller-manager</h2>
+<p>Symptoms are indirect: with the scheduler down, new Pods stay <code>Pending</code> with <em>no events</em>; with the controller-manager down, Deployments do not create ReplicaSets, ReplicaSets do not create Pods, nodes never go NotReady, Jobs never complete, CSRs are never signed, Endpoints do not update. Existing workloads keep running in both cases.</p>
+<pre><code class="lang-bash">$ kubectl get pods -n kube-system | grep -E 'scheduler|controller'      # CrashLoopBackOff? missing?
+$ kubectl -n kube-system logs kube-scheduler-cp-1 --tail=20
+#   "unable to load client CA / kubeconfig"  → --kubeconfig=/etc/kubernetes/scheduler.conf path or the file's cert
+#   "unknown flag"                          → typo
+#   "error retrieving resource lock … leases": leader election failing → RBAC or API connectivity
+$ kubectl -n kube-system get lease kube-scheduler kube-controller-manager   # holderIdentity shows the active instance (HA)
+$ crictl ps -a | grep -E 'scheduler|controller'; crictl logs …            # if they never register as pods</code></pre>
+<p>A trick question loves the image name: <code>image: registry.k8s.io/kube-scheduler:v1.32.1</code> misspelled → <code>ErrImagePull</code> on the mirror Pod. Or the <code>hostPath</code> for <code>/etc/kubernetes/scheduler.conf</code> pointing at a non-existent file → the container starts and exits immediately.</p>
+
+<h2>kubelet on the control-plane node</h2>
+<pre><code class="lang-bash">$ systemctl status kubelet; journalctl -u kubelet -n 50 --no-pager
+#   "failed to load Kubelet config file /var/lib/kubelet/config.yaml"   → path in the systemd drop-in / file missing or invalid YAML
+#   "running with swap on is not supported"                             → swapoff -a
+#   "unable to load client CA file … kubelet.conf"                      → kubelet.conf cert expired/wrong (check /var/lib/kubelet/pki/)
+#   "misconfiguration: kubelet cgroup driver: systemd is different from docker cgroup driver: cgroupfs"   → containerd config
+#   "connection refused" to containerd.sock                             → systemctl restart containerd
+$ cat /var/lib/kubelet/kubeadm-flags.env; cat /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf
+$ grep staticPodPath /var/lib/kubelet/config.yaml                     # must be /etc/kubernetes/manifests
+$ systemctl daemon-reload && systemctl restart kubelet</code></pre>
+
+<h2>Client side: kubeconfig and certificates</h2>
+<pre><code class="lang-bash">$ kubectl config view --minify                                  # which server? which user?
+$ kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server}'   # port 6443? right IP?
+$ kubectl config view --raw -o jsonpath='{.users[0].user.client-certificate-data}' | base64 -d | openssl x509 -noout -dates -subject
+$ openssl s_client -connect &lt;server&gt;:6443 &lt; /dev/null 2&gt;/dev/null | openssl x509 -noout -ext subjectAltName   # is the IP you use in the SANs?
+# "certificate signed by unknown authority" → wrong CA in kubeconfig; compare with /etc/kubernetes/pki/ca.crt
+# "certificate is valid for 10.96.0.1, 192.168.56.10, not 1.2.3.4" → use an address in the SANs, or add one (kubeadm init phase certs apiserver --apiserver-cert-extra-sans)
+$ sudo cp /etc/kubernetes/admin.conf ~/.kube/config            # the known-good admin kubeconfig</code></pre>
+
+<div class="callout linux" data-ref="l07,l09,l10"><div class="ct">Under the hood · Linux</div><p>When kubectl is useless, the node still has everything: <code>systemctl</code>/<code>journalctl</code> for the kubelet and containerd, <code>crictl</code> for containers, <code>ls -l</code>/<code>cat</code>/<code>diff</code> for manifests and certs, <code>openssl x509</code> for expiry and SANs, <code>ss -tlnp</code> for who listens on 6443/2379/10250, <code>df -h</code>/<code>free -m</code> for resources, <code>dmesg</code> for OOM kills of etcd or the API server. The kubelet re-reads a manifest when its mtime changes — <code>touch</code> forces a restart; <code>mv</code> to <code>/tmp</code> and back is a clean "restart this component". The <a href="../linux/l10-shell-toolkit.html">shell toolkit</a> page lists these with examples.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>The exam breaks one thing at a time: a flag typo, a wrong file path, a wrong image tag, a swapped port, an expired cert, a bad kubeconfig path in a manifest. Read the failing component's <code>crictl logs</code> and the manifest side by side; the log names the exact problem.</li>
+<li>After editing a manifest, <strong>wait</strong> (20–60 s) and verify with <code>crictl ps</code> before concluding it did not work. Do not restart the kubelet unless you changed kubelet config.</li>
+<li>Keep a mental map: kubectl error → API server or kubeconfig; Pending without events → scheduler; objects not reconciling → controller-manager; everything read-only + apiserver log mentions etcd → etcd.</li>
+<li>Fix from the node with <code>sudo -i</code>; the exam gives you SSH to the control plane.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (40 min) — break it, then fix it (Day 54 cluster or KIND control-plane container)</h3>
+<pre><code class="lang-bash"># 1. flag typo
+$ sudo sed -i 's/--etcd-servers=/--etcd-server=/' /etc/kubernetes/manifests/kube-apiserver.yaml
+$ sleep 30; kubectl get nodes; sudo crictl ps -a | grep apiserver; sudo crictl logs $(sudo crictl ps -a --name kube-apiserver -q | head -1) 2&gt;&1 | tail -2
+$ sudo sed -i 's/--etcd-server=/--etcd-servers=/' /etc/kubernetes/manifests/kube-apiserver.yaml; sleep 30; kubectl get nodes
+# 2. wrong kubeconfig path for the scheduler
+$ sudo sed -i 's#scheduler.conf#scheduler.yaml#g' /etc/kubernetes/manifests/kube-scheduler.yaml
+$ kubectl run pending --image=nginx; sleep 10; kubectl get pod pending; kubectl describe pod pending | tail -2    # Pending, no events
+$ kubectl -n kube-system get pods | grep scheduler; sudo crictl logs $(sudo crictl ps -a --name kube-scheduler -q | head -1) 2&gt;&1 | tail -2
+$ sudo sed -i 's#scheduler.yaml#scheduler.conf#g' /etc/kubernetes/manifests/kube-scheduler.yaml; sleep 20; kubectl get pod pending -o wide
+# 3. kubelet config path
+$ sudo sed -i 's#/var/lib/kubelet/config.yaml#/var/lib/kubelet/config.yml#' /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf
+$ sudo systemctl daemon-reload && sudo systemctl restart kubelet; sleep 5; systemctl status kubelet | head -5; journalctl -u kubelet -n 3 --no-pager
+$ sudo sed -i 's#config.yml#config.yaml#' /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf && sudo systemctl daemon-reload && sudo systemctl restart kubelet
+# 4. broken client kubeconfig
+$ sed -i 's/6443/6444/' ~/.kube/config; kubectl get nodes; sed -i 's/6444/6443/' ~/.kube/config
+$ kubectl delete pod pending $now</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Order: does kubectl work (and with admin.conf on the node)? → kubelet running? → static Pods running (<code>crictl ps -a</code>)? → read their logs → read their manifests → certs and disk.</li>
+<li>API server: flags, file paths, certs, etcd address — the log line names it. Edit the manifest; the kubelet restarts it.</li>
+<li>etcd: data dir, disk space, certs, quorum; <code>etcdctl endpoint health/status</code> with the three cert flags.</li>
+<li>Scheduler down = Pending with no events; controller-manager down = nothing reconciles. Check their kubeconfig paths and images.</li>
+<li>Client errors (x509, refused, wrong port) are kubeconfig problems until proven otherwise.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const B = (id, x, y, w, t, cls, hidden) => S.box(id, x, y, w, 40, t, { fs: 9.5, cls, hidden, lcls: '' });
+  let svg = B('q0', 260, 15, 200, 'kubectl get nodes ?', 'hl')
+    + B('e1', 20, 80, 150, ['connection refused', 'apiserver down?'], 'bad', true) + B('e2', 190, 80, 150, ['x509 / expired', 'certs?'], 'bad', true) + B('e3', 360, 80, 150, ['timeout', 'network / IP?'], 'bad', true) + B('e4', 530, 80, 170, ['works', '→ pods -n kube-system'], 'ok', true)
+    + B('n1', 20, 150, 220, 'node: systemctl status kubelet', '', true) + B('n2', 260, 150, 200, 'crictl ps -a | grep apiserver', '', true) + B('n3', 480, 150, 220, 'crictl logs <id> | tail', '', true)
+    + B('f1', 20, 220, 210, ['unknown flag / no such file', '→ fix the manifest'], 'warn', true) + B('f2', 250, 220, 210, ['x509 expired', '→ kubeadm certs renew all'], 'warn', true) + B('f3', 480, 220, 220, ['etcd refused', '→ etcd manifest / data dir / disk'], 'warn', true)
+    + S.arrow('a1', 300, 55, 100, 78, { d: 'M 300 55 L 100 78', cls: 'hid' }) + S.arrow('a2', 330, 55, 265, 78, { d: 'M 330 55 L 265 78', cls: 'hid' }) + S.arrow('a3', 390, 55, 435, 78, { d: 'M 390 55 L 435 78', cls: 'hid' }) + S.arrow('a4', 420, 55, 615, 78, { d: 'M 420 55 L 615 78', cls: 'hid' })
+    + S.arrow('b1', 100, 120, 120, 148, { cls: 'hid' }) + S.arrow('b2', 200, 170, 258, 170, { cls: 'hid' }) + S.arrow('b3', 460, 170, 478, 170, { cls: 'hid' })
+    + S.arrow('c1', 590, 190, 130, 218, { d: 'M 560 190 L 130 218', cls: 'hid' }) + S.arrow('c2', 590, 190, 355, 218, { d: 'M 580 190 L 355 218', cls: 'hid' }) + S.arrow('c3', 590, 190, 590, 218, { cls: 'hid' })
+    + S.text('m', 360, 290, '', { cls: 'sm b' });
+  Anim.define('cp-tree', { w: 720, h: 305, title: 'Control-plane decision tree', ms: 2800, svg, steps: [
+    { c: 'Start with one command. Its <b>error text</b> is the first branch.', on(q){} },
+    { c: '<b>refused</b> → the API server is not listening. <b>x509</b> → a certificate (client, CA, server SAN, expiry). <b>timeout</b> → wrong address or firewall. <b>works</b> → the control plane is up; look at kube-system Pods and events instead.', on(q){ q('#e1,#e2,#e3,#e4').show(); q('#a1,#a2,#a3,#a4').show(); } },
+    { c: 'For "refused": go to the node. Is the <b>kubelet</b> running? It is the only process that can start the API server.', on(q){ q('#n1').show(); q('#b1').show().set('hl'); q('#m').text('systemctl status kubelet · journalctl -u kubelet'); } },
+    { c: 'Kubelet fine → is the API server <b>container</b> there? <code>crictl ps -a</code>: absent (manifest not read), exited (crashed on start), or restarting.', on(q){ q('#n2').show(); q('#b2').show().set('hl'); q('#m').text('absent → manifest invalid or wrong staticPodPath'); } },
+    { c: 'Exited/restarting → <b>read its log</b>. The last lines name the cause almost every time.', on(q){ q('#n3').show(); q('#b3').show().set('hl'); q('#m').text('crictl logs $(crictl ps -a --name kube-apiserver -q | head -1)'); } },
+    { c: 'Three families of cause, three fixes: a bad flag or path (edit the manifest), an expired certificate (renew), or etcd unreachable (go troubleshoot etcd the same way). Then wait 30 s and re-run <code>kubectl get nodes</code>.', on(q){ q('#f1,#f2,#f3').show(); q('#c1,#c2,#c3').show().set('ok'); q('#m').text('fix → wait → verify'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

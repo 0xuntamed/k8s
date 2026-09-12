@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 3 · Docker Flags & Exposing Containers · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d03" data-root="../" data-linux="l05,l04">
+<article class="lesson">
+<p class="lead">"I started the container, why can't I reach it?" is the most common Docker question, and the answer is always the same: the container has its own network namespace, and nothing gets in unless you publish a port. This lesson covers the <code>docker run</code> flags you will use daily, the Dockerfile instructions Day 2 skipped, and — because it is the same mechanism Kubernetes Services use — exactly how a published port works.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The essential <code>docker run</code> flags: detach, interactive, name, ports, env, volumes, restart, limits</li>
+<li><code>EXPOSE</code> vs <code>-p</code>, and how port publishing is implemented with a bridge, a veth pair and iptables</li>
+<li>Docker network modes and container-to-container DNS</li>
+<li><code>ARG</code>, <code>USER</code>, <code>HEALTHCHECK</code>, <code>LABEL</code>, <code>COPY --chown</code></li>
+</ul></div>
+
+<h2>The <code>docker run</code> flags that matter</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Flag</th><th>Effect</th><th>Kubernetes equivalent</th></tr>
+<tr><td>-d</td><td>Detach: run in the background and print the container ID.</td><td>(Pods always run detached)</td></tr>
+<tr><td>-it</td><td>Interactive + TTY: attach your terminal's stdin to the process. Use for shells.</td><td><code>kubectl exec -it</code> / <code>stdin: true, tty: true</code></td></tr>
+<tr><td>--name web</td><td>Human name instead of a random one. Names must be unique per host.</td><td><code>metadata.name</code></td></tr>
+<tr><td>-p 8080:80</td><td>Publish host port 8080 → container port 80. <code>-p 80</code> picks a random host port; <code>-P</code> publishes every <code>EXPOSE</code>d port.</td><td>Service <code>NodePort</code> / <code>hostPort</code></td></tr>
+<tr><td>-e KEY=val / --env-file</td><td>Set environment variables.</td><td><code>env</code>, <code>envFrom</code>, ConfigMap, Secret</td></tr>
+<tr><td>-v /host:/ctr / --mount</td><td>Bind-mount a host path or named volume.</td><td><code>volumes</code> + <code>volumeMounts</code></td></tr>
+<tr><td>--rm</td><td>Delete the container when it exits.</td><td>Job <code>ttlSecondsAfterFinished</code></td></tr>
+<tr><td>--restart=always|unless-stopped|on-failure</td><td>Have dockerd restart it after crashes / reboots.</td><td><code>restartPolicy</code></td></tr>
+<tr><td>--memory 256m --cpus 0.5</td><td>cgroup limits.</td><td><code>resources.limits</code></td></tr>
+<tr><td>--network host|none|mynet</td><td>Network mode (see below).</td><td><code>hostNetwork: true</code></td></tr>
+<tr><td>-u 1000:1000 / --read-only / --cap-drop ALL</td><td>Run as a specific user, read-only rootfs, drop capabilities.</td><td><code>securityContext</code></td></tr>
+</table></div>
+
+<h2>EXPOSE is documentation, -p is the wire</h2>
+<p><code>EXPOSE 80</code> in a Dockerfile records "this image listens on 80" in the image metadata. It does <strong>not</strong> open anything. Traffic only reaches the container when you publish a port with <code>-p</code>, and you can publish ports that were never <code>EXPOSE</code>d.</p>
+<figure data-anim="port-publish"></figure>
+
+<div class="callout linux" data-ref="l05"><div class="ct">Under the hood · Linux</div>
+<p>When dockerd starts, it creates a Linux bridge called <code>docker0</code> (<code>172.17.0.1/16</code>). Each container gets a <strong>veth pair</strong> — a virtual cable: one end becomes <code>eth0</code> inside the container's network namespace, the other end is plugged into <code>docker0</code>. <code>-p 8080:80</code> adds an iptables rule in the <code>nat</code> table's <code>DOCKER</code> chain: <em>DNAT</em> any packet arriving on host port 8080 to <code>172.17.0.2:80</code>. Replies are un-NATed by conntrack. Kubernetes' kube-proxy does the same thing for Services, just with more rules.</p>
+<pre><code class="lang-bash">$ ip link show docker0                 # the bridge
+$ ip link | grep veth                  # one veth per running container
+$ sudo iptables -t nat -L DOCKER -n    # DNAT tcp dpt:8080 to:172.17.0.2:80
+$ docker inspect -f '{{.NetworkSettings.IPAddress}}' web</code></pre></div>
+
+<h2>Network modes</h2>
+<div class="grid-3">
+<div class="card"><h4>bridge (default)</h4><p>Private namespace, IP on <code>docker0</code>, outbound via NAT, inbound via <code>-p</code>. Containers on the <em>default</em> bridge can reach each other only by IP.</p></div>
+<div class="card"><h4>user-defined bridge</h4><p><code>docker network create mynet</code>. Same as bridge, but Docker runs an embedded DNS server so containers resolve each other <strong>by name</strong>. Always use this for multi-container setups.</p></div>
+<div class="card"><h4>host</h4><p>No network namespace: the process binds directly on the host's interfaces. Fastest, no isolation, port conflicts are yours to manage.</p></div>
+<div class="card"><h4>none</h4><p>A namespace with only loopback. For batch jobs that must not talk to anything.</p></div>
+<div class="card"><h4>container:&lt;name&gt;</h4><p>Share another container's network namespace — two processes on the same <code>localhost</code>. This is exactly how the containers of a Kubernetes <strong>Pod</strong> are wired together.</p></div>
+</div>
+<pre><code class="lang-bash">$ docker network create appnet
+$ docker run -d --name db  --network appnet -e POSTGRES_PASSWORD=pw postgres:16
+$ docker run -d --name api --network appnet -e DB_HOST=db my-api:1.0   # "db" resolves via Docker DNS
+$ docker exec api getent hosts db          # 172.18.0.2  db</code></pre>
+
+<h2>Dockerfile deep dive</h2>
+<pre data-title="Dockerfile"><code class="lang-dockerfile"># build-time variable; override with --build-arg NODE_VERSION=22
+ARG NODE_VERSION=20
+FROM node:${NODE_VERSION}-alpine
+
+LABEL org.opencontainers.image.source="https://github.com/you/api"
+
+# create an unprivileged user; never run production apps as root
+RUN addgroup -S app && adduser -S app -G app
+WORKDIR /app
+
+# --chown avoids a second layer just to fix ownership
+COPY --chown=app:app package*.json ./
+RUN npm ci --omit=dev
+
+COPY --chown=app:app . .
+USER app
+
+ENV NODE_ENV=production PORT=3000
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/health || exit 1
+CMD ["node", "server.js"]</code></pre>
+<dl class="kv">
+<dt>ARG vs ENV</dt><dd><code>ARG</code> exists only during the build (and only after the line that declares it — put one before <code>FROM</code> to use it in <code>FROM</code>). <code>ENV</code> persists into the running container. Never put secrets in either; they are visible with <code>docker history</code> / <code>inspect</code>.</dd>
+<dt>USER</dt><dd>Everything after it (remaining <code>RUN</code>s and the runtime process) runs as that user. Kubernetes can enforce this with <code>runAsNonRoot: true</code> (<a href="d41-pod-security.html">Day 41</a>).</dd>
+<dt>COPY vs ADD</dt><dd><code>ADD</code> auto-extracts local tar archives and can download URLs. Those surprises are why the convention is <code>COPY</code> unless you specifically want extraction.</dd>
+<dt>HEALTHCHECK</dt><dd>Docker marks the container <em>healthy</em>/<em>unhealthy</em>. Kubernetes ignores this instruction entirely and uses its own <a href="d23-health-probes.html">probes</a>.</dd>
+<dt>LABEL</dt><dd>Arbitrary metadata. The <code>org.opencontainers.image.*</code> keys are a widely adopted convention.</dd>
+</dl>
+
+<h2>Volumes preview</h2>
+<p><code>-v $(pwd)/data:/data</code> bind-mounts a host directory; <code>-v mydata:/data</code> uses a Docker-managed named volume. Both bypass the writable layer, so data survives <code>docker rm</code>. <a href="d24-docker-volumes.html">Day 24</a> covers this properly as the on-ramp to Kubernetes storage.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Two direct mappings show up constantly: <code>-p</code> ⇢ Service <code>NodePort</code> (<a href="d12-services.html">Day 12</a>) and <code>--network container:x</code> ⇢ the shared network namespace of a Pod (<a href="d21-multi-container-pods.html">Day 21</a>). If you understand the iptables DNAT above, you already understand kube-proxy.</p></div>
+
+<div class="lab"><h3>Hands-on lab (10 min)</h3><p>See the port-publishing machinery for yourself (Linux host or a Linux VM; Docker Desktop hides it inside its VM).</p>
+<pre><code class="lang-bash">$ docker run -d --name web -p 8080:80 nginx
+$ curl -s localhost:8080 | head -3
+$ docker inspect -f '{{.NetworkSettings.IPAddress}}' web
+$ sudo iptables -t nat -S DOCKER | grep 8080
+$ ip -br link | grep -E 'docker0|veth'
+$ docker run --rm --network container:web alpine wget -qO- http://localhost   # shares web's netns
+$ docker rm -f web</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A container has a private network namespace; <code>-p host:ctr</code> punches a hole with an iptables DNAT rule on the host.</li>
+<li><code>EXPOSE</code> is metadata only. <code>-P</code> publishes all exposed ports on random host ports.</li>
+<li>Use user-defined networks for name resolution between containers; <code>--network container:x</code> is the Pod model.</li>
+<li>Run as a non-root <code>USER</code>, keep <code>ARG</code> for build-only values, and never bake secrets into images.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.zone('host', 200, 20, 500, 290, 'Host (network namespace of the host)')
+    + S.icon('client', 70, 150, 'laptop', { label: 'browser → host:8080' })
+    + S.box('eth', 220, 60, 120, 40, ['eth0', '10.0.0.5'], { subfs: 10, subcls: 'mono muted' })
+    + S.box('ipt', 220, 150, 120, 44, ['iptables nat', 'DNAT 8080→80'], { subfs: 10, subcls: 'mono muted', cls: 'pur' })
+    + S.box('br', 220, 245, 120, 40, ['docker0 bridge', '172.17.0.1'], { subfs: 10, subcls: 'mono muted' })
+    + S.zone('ctr', 400, 100, 280, 190, 'Container netns', { cls: 'hl' })
+    + S.box('veth', 420, 245, 110, 34, ['eth0 (veth)', '172.17.0.2'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('nginx', 520, 130, 140, 50, ['nginx :80', 'listening 0.0.0.0'], { subfs: 10, subcls: 'mono muted', cls: 'ok' })
+    + S.arrow('a1', 105, 150, 218, 150, { cls: 'hid' })
+    + S.arrow('a2', 280, 100, 280, 148, { cls: 'hid' })
+    + S.arrow('a3', 280, 194, 280, 243, { cls: 'hid' })
+    + S.arrow('a4', 342, 265, 418, 265, { cls: 'hid', label: 'veth pair', ly: 285 })
+    + S.arrow('a5', 500, 245, 570, 182, { cls: 'hid' })
+    + S.dot('pk', 70, 130, { hidden: true, label: 'dst 10.0.0.5:8080' });
+  Anim.define('port-publish', { w: 720, h: 320, title: '-p 8080:80 under the hood', svg, steps: [
+    { c: 'A client sends a TCP packet to the <b>host</b> IP on port 8080. Inside the container nothing is listening on 8080 — and the container is not even on this network.', on(q){ q('#pk').show().to(160, 130); q('#a1').show().set('hl'); } },
+    { c: 'The packet arrives on the host\'s <code>eth0</code> and enters the netfilter <b>PREROUTING</b> hook before any routing decision is made.', on(q){ q('#pk').to(280, 45); q('#eth rect').set('hl'); q('#a2').show().set('hl'); } },
+    { c: 'The <code>DOCKER</code> chain in the <b>nat</b> table matches <code>dport 8080</code> and rewrites the destination: <b>DNAT → 172.17.0.2:80</b>. conntrack remembers the mapping for the reply.', on(q){ q('#pk').to(280, 128).text('dst 172.17.0.2:80'); q('#ipt rect').set('hl'); q('#a3').show().set('hl'); } },
+    { c: 'Routing now sends it to the <code>docker0</code> bridge, which forwards it down the <b>veth pair</b> — a virtual cable whose other end is the container\'s <code>eth0</code>.', on(q){ q('#pk').to(380, 265); q('#br rect').set('hl'); q('#a4').show().set('hl'); } },
+    { c: 'Inside the container\'s network namespace the packet is addressed to port 80, where nginx is listening on <code>0.0.0.0</code>. The reply follows the same path back and conntrack restores the original addresses.', on(q){ q('#pk').to(590, 118); q('#a5').show().set('ok'); q('#veth rect').set('hl'); q('#nginx rect').set('ok'); } },
+    { c: 'This is the whole trick behind <code>-p</code> — and behind Kubernetes NodePort Services: a DNAT rule, a bridge and a veth pair. No proxy process sits in the data path.', on(q){ q('#ipt rect').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

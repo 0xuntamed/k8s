@@ -1,0 +1,20 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "border-left:2px solid var(--border)",
+        "createdAt": "2026-09-12T18:34:56.987Z",
+        "reason": "Claude: .steps>li left border is the vertical connector of a numbered timeline (joins the step circles), not a card accent stripe"
+      },
+      {
+        "rule": "layout-transition",
+        "value": "transition: width, width, height",
+        "createdAt": "2026-09-12T18:34:57.109Z",
+        "reason": "Claude: SVG rect width/height are geometry attributes animated by the anim.js bar helper inside <svg>; no document layout/reflow occurs"
+      }
+    ]
+  }
+}

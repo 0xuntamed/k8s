@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 39 · Custom Resources & CRDs · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d39" data-root="../" data-related="d09,d35,d40">
+<article class="lesson">
+<p class="lead">Every object type you have used — Pod, Deployment, Service — is a <em>resource</em> served by the API server and stored in etcd. A <strong>CustomResourceDefinition</strong> lets you add a new type with a schema, and from then on the API server stores, validates, versions and serves it exactly like the built-ins: <code>kubectl get</code>, <code>apply</code>, <code>describe</code>, RBAC, watches. On its own a custom resource is just structured data; pair it with a controller (Day 40) and you have taught Kubernetes a new noun <em>and</em> a new verb.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>CRD vs CR: the type definition vs the instances</li>
+<li>Anatomy of a CRD: group, names, scope, versions, OpenAPI schema, subresources, printer columns</li>
+<li>Validation, defaulting and CEL rules inside the schema</li>
+<li>Versioning and conversion at a glance</li>
+<li>What the API server does for you — and what it does not (nothing happens until a controller exists)</li>
+</ul></div>
+
+<h2>Definition vs instance</h2>
+<figure data-anim="crd-flow"></figure>
+<div class="compare">
+<div><h4>CRD — the type</h4><p>A cluster-scoped object of kind <code>CustomResourceDefinition</code> (group <code>apiextensions.k8s.io</code>). Creating it makes the API server start serving a new REST path, e.g. <code>/apis/stable.example.com/v1/namespaces/*/databases</code>. Analogy: a table schema.</p></div>
+<div><h4>CR — the instances</h4><p>Objects of the new kind, e.g. <code>kind: Database</code>. Stored in etcd under the group, validated against the CRD's schema. Analogy: rows.</p></div>
+</div>
+
+<h2>A complete CRD</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.stable.example.com      # MUST be <plural>.<group>
+spec:
+  group: stable.example.com
+  scope: Namespaced                        # or Cluster
+  names:
+    plural: databases
+    singular: database
+    kind: Database
+    shortNames: [db]
+    categories: [all]                      # include in "kubectl get all"
+  versions:
+  - name: v1
+    served: true
+    storage: true                          # exactly one version is the storage version
+    schema:
+      openAPIV3Schema:
+        type: object
+        required: [spec]
+        properties:
+          spec:
+            type: object
+            required: [engine, storageGB]
+            properties:
+              engine:
+                type: string
+                enum: [postgres, mysql]
+              version:
+                type: string
+                default: "16"
+              storageGB:
+                type: integer
+                minimum: 1
+                maximum: 1024
+              replicas:
+                type: integer
+                default: 1
+            x-kubernetes-validations:
+            - rule: "self.replicas <= 5 || self.engine == 'postgres'"
+              message: "mysql supports at most 5 replicas"
+          status:
+            type: object
+            properties:
+              phase: {type: string}
+              endpoint: {type: string}
+    subresources:
+      status: {}                           # /status endpoint; spec and status updated separately
+      scale:
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
+    additionalPrinterColumns:
+    - name: Engine
+      type: string
+      jsonPath: .spec.engine
+    - name: Phase
+      type: string
+      jsonPath: .status.phase
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp</code></pre>
+<ul class="notes">
+<li><b>metadata.name</b> — <code>plural.group</code>, no exceptions.</li>
+<li><b>group</b> — a DNS-style name you own; becomes the API path <code>/apis/stable.example.com</code>. Built-in groups (<code>apps</code>, <code>*.k8s.io</code>) are reserved.</li>
+<li><b>scope</b> — Namespaced (like Pods) or Cluster (like Nodes).</li>
+<li><b>names</b> — how kubectl and manifests refer to it. <code>kubectl get db</code>, <code>kind: Database</code>.</li>
+<li><b>versions[]</b> — each has a schema; <code>served</code> = accepts requests; <code>storage</code> = the format written to etcd (one only).</li>
+<li><b>openAPIV3Schema</b> — structural schema: types, required, enum, min/max, patterns, <code>default</code>s (applied on read and write). Fields not in the schema are <em>pruned</em> unless <code>x-kubernetes-preserve-unknown-fields: true</code>.</li>
+<li><b>x-kubernetes-validations</b> — CEL rules with access to <code>self</code> (and <code>oldSelf</code> for updates): cross-field checks the schema cannot express.</li>
+<li><b>subresources.status</b> — separates <code>spec</code> (users) from <code>status</code> (controllers) exactly like built-ins; <b>scale</b> makes <code>kubectl scale</code> and HPA work.</li>
+<li><b>additionalPrinterColumns</b> — what <code>kubectl get</code> shows.</li>
+</ul>
+</div>
+
+<h2>Using it</h2>
+<pre><code class="lang-bash">$ kubectl apply -f database-crd.yaml
+$ kubectl get crd databases.stable.example.com
+$ kubectl api-resources | grep database         # databases  db  stable.example.com/v1  true  Database
+$ kubectl explain database.spec                  # generated from your schema
+$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: stable.example.com/v1
+kind: Database
+metadata:
+  name: orders
+spec:
+  engine: postgres
+  storageGB: 50
+EOF
+$ kubectl get db                                 # NAME  ENGINE  PHASE  AGE  (printer columns; version defaulted to "16")
+$ kubectl get database orders -o yaml
+$ kubectl apply -f - &lt;&lt;EOF                       # validation in action
+apiVersion: stable.example.com/v1
+kind: Database
+metadata: {name: bad}
+spec: {engine: oracle, storageGB: 5000}
+EOF
+# The Database "bad" is invalid: spec.engine: Unsupported value: "oracle"; spec.storageGB: Invalid value: 5000: must be &lt;= 1024
+$ kubectl delete crd databases.stable.example.com   # deletes EVERY Database object too</code></pre>
+
+<h2>What you get for free — and what you do not</h2>
+<div class="compare">
+<div><h4>The API server provides</h4><ul>
+<li>Storage in etcd, optimistic concurrency (<code>resourceVersion</code>), watches</li>
+<li>Schema validation, defaulting, pruning, CEL rules</li>
+<li><code>kubectl get/describe/apply/edit/delete/explain</code>, printer columns, short names</li>
+<li>RBAC on the new resource (<code>apiGroups: [stable.example.com], resources: [databases]</code>)</li>
+<li>Finalizers, owner references, garbage collection, labels/annotations, admission webhooks</li>
+<li>Multi-version serving with conversion webhooks</li>
+</ul></div>
+<div><h4>Nothing happens</h4><p>Creating a <code>Database</code> object creates <em>a record</em>. No Postgres appears. No Pod, no PVC, no Service. The status stays empty forever. Turning intent into reality requires a <strong>controller</strong> that watches Databases and creates StatefulSets, Secrets and Services in response — which is exactly what an <a href="d40-operators.html">Operator</a> is. Until then a CR is a very well-validated ConfigMap.</p></div>
+</div>
+
+<h2>Versions and conversion</h2>
+<p>Add <code>v2</code> to <code>versions[]</code> with its own schema; keep <code>v1</code> served for old clients. Only one is the storage version. If the schemas differ in shape, set <code>spec.conversion.strategy: Webhook</code> and run a conversion webhook that translates between versions; the default <code>None</code> strategy only rewrites <code>apiVersion</code>. This is the same mechanism that let <code>Deployment</code> move from <code>extensions/v1beta1</code> to <code>apps/v1</code> — built-ins just do it in compiled Go.</p>
+
+<h2>CRDs you already have</h2>
+<pre><code class="lang-bash">$ kubectl get crds                        # on a real cluster: dozens
+# calico: ippools.crd.projectcalico.org, networkpolicies.crd.projectcalico.org…
+# cert-manager: certificates.cert-manager.io, issuers.cert-manager.io
+# prometheus-operator: servicemonitors.monitoring.coreos.com, prometheusrules…
+# gateway API: gateways.gateway.networking.k8s.io, httproutes… (Day 52)
+# argo cd: applications.argoproj.io
+$ kubectl get crd certificates.cert-manager.io -o jsonpath='{.spec.versions[*].name}'
+$ kubectl explain servicemonitor.spec.endpoints</code></pre>
+<div class="callout info"><div class="ct">CRDs vs aggregated API servers</div><p>The other way to add types is an <em>aggregated API server</em> — your own binary registered via <code>APIService</code>, which the main API server proxies to (metrics-server is one). It can do anything (custom storage, custom verbs) but you operate a whole API server. CRDs cover 99% of cases with zero code for the type itself.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>You will be asked to <em>read</em> CRDs more than write them: "list the CRDs of group X", "what are the printer columns / versions", "create an instance of kind Y" — <code>kubectl get crd</code>, <code>kubectl explain &lt;kind&gt;</code>, <code>kubectl api-resources --api-group=…</code>.</li>
+<li>To create a CR you need the group/version (<code>kubectl api-resources</code> APIVERSION column) and the required spec fields (<code>kubectl explain kind.spec</code>).</li>
+<li>Deleting a CRD cascades to all its objects. Deleting a CR with a finalizer set by a missing controller hangs — clear the finalizer (Day 14).</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash"># apply the CRD from this page, then:
+$ kubectl api-resources --api-group=stable.example.com
+$ kubectl explain database.spec.engine
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: stable.example.com/v1
+kind: Database
+metadata: {name: orders}
+spec: {engine: postgres, storageGB: 50}
+EOF
+$ kubectl get db -o wide; kubectl get db orders -o jsonpath='{.spec.version}{"\n"}'   # default applied
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: stable.example.com/v1
+kind: Database
+metadata: {name: m}
+spec: {engine: mysql, storageGB: 10, replicas: 9}
+EOF
+# rejected by the CEL rule
+$ kubectl scale db orders --replicas=3 && kubectl get db orders -o jsonpath='{.spec.replicas}{"\n"}'   # scale subresource works
+$ kubectl patch db orders --subresource=status --type=merge -p '{"status":{"phase":"Ready"}}'; kubectl get db
+$ kubectl create role db-viewer --verb=get,list --resource=databases.stable.example.com; kubectl auth can-i list databases --as=x   # RBAC sees the new resource
+$ kubectl delete crd databases.stable.example.com; kubectl delete role db-viewer</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A CRD adds a new resource type to the API server; CRs are its instances. Name = <code>plural.group</code>.</li>
+<li>The OpenAPI schema gives validation, defaults and pruning; CEL rules add cross-field checks; subresources give <code>/status</code> and <code>/scale</code>.</li>
+<li>You get storage, kubectl, RBAC, watches, GC and versioning for free — but no behaviour.</li>
+<li>Behaviour needs a controller. CRD + controller = Operator (next lesson).</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('api', 260, 20, 200, 60, ['kube-apiserver', 'known types:'], { subfs: 9, subcls: 'muted' })
+    + S.term('types', 260, 90, 200, 90, ['/api/v1  pods, services…', '/apis/apps/v1  deployments…', '/apis/batch/v1  jobs…', '', ''], { fs: 9 })
+    + S.icon('adm', 60, 60, 'user', { label: 'admin', ly: 28 }) + S.icon('dev', 60, 200, 'user', { label: 'developer', ly: 28, cls: 'pur' })
+    + S.dot('crd', 90, 40, { hidden: true, label: 'CRD databases.stable.example.com' })
+    + S.dot('cr', 90, 180, { hidden: true, label: 'Database orders', cls: 'pur' })
+    + S.box('etcd', 540, 30, 150, 50, ['etcd'], { fs: 12 })
+    + S.term('store', 540, 100, 160, 80, ['/registry/', '  pods/…', '  deployments/…', ''], { fs: 9 })
+    + S.box('ctl', 260, 210, 200, 50, ['controller?', '(none yet)'], { subfs: 9, subcls: 'muted', cls: 'dashed' })
+    + S.text('m', 360, 295, '', { cls: 'sm b' });
+  Anim.define('crd-flow', { w: 720, h: 310, title: 'CRD → new API path → CR', ms: 2800, svg, steps: [
+    { c: 'The API server serves its built-in types. A request for <code>/apis/stable.example.com/v1/databases</code> gets 404: no such resource.', on(q){} },
+    { c: 'An admin applies a <b>CustomResourceDefinition</b>. It is itself just an object (group apiextensions.k8s.io) — stored in etcd like anything else.', on(q){ q('#crd').show().to(340, 40); q('#api rect').set('hl'); } },
+    { c: 'The API server notices the new CRD and <b>starts serving</b> a new path with the schema attached: validation, defaults, printer columns, <code>kubectl explain</code>, RBAC — all live within seconds, no restart.', on(q){ q('#crd').hide(); q('#types-l3').text('/apis/stable.example.com/v1  databases').style('fill', 'var(--green)'); q('#types-l4').text('  schema: engine enum, storageGB ≤ 1024…').style('fill', 'var(--green)'); q('#m').text('a new noun exists'); } },
+    { c: 'A developer creates a <b>Database</b> object. It is validated against the schema (engine must be postgres|mysql), defaults are filled in (version: "16"), and it is written to etcd under the new group.', on(q){ q('#cr').show().to(340, 180); q('#store-l3').text('  stable.example.com/databases/default/orders').style('fill', 'var(--purple)'); q('#etcd rect').set('ok'); } },
+    { c: 'And then… nothing. No Postgres runs. The object sits in etcd with an empty status. A <b>controller</b> that watches Databases and acts is the missing half — Day 40.', on(q){ q('#cr').hide(); q('#ctl rect').set('warn'); q('#m').text('data without behaviour until a controller watches it'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

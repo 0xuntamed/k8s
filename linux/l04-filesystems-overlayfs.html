@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L4 · Filesystems, Mounts & OverlayFS · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l04" data-root="../" data-related="d01,d02,d24,d26,d27">
+<article class="lesson">
+<p class="lead">Image layers, the container's writable layer, emptyDir, hostPath, a PersistentVolume, a ConfigMap file, the Secret tmpfs — every one of them is a <strong>mount</strong> in a container's mount namespace. This page covers the mount table, bind mounts and tmpfs, and then OverlayFS, the union filesystem that turns a stack of read-only layers into one writable root without copying anything.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The mount table: <code>mount</code>, <code>findmnt</code>, <code>/proc/self/mountinfo</code>, mount namespaces</li>
+<li>Bind mounts (a directory at a second path), tmpfs (RAM), read-only remounts, propagation</li>
+<li>OverlayFS: lowerdir/upperdir/workdir/merged, copy-up, whiteouts</li>
+<li>How containerd stores images and containers on disk (<code>/var/lib/containerd</code>)</li>
+<li>Disk accounting: <code>df</code> vs <code>du</code>, where node disk goes, and DiskPressure</li>
+</ul></div>
+
+<h2>The mount table</h2>
+<p>A Linux filesystem tree is assembled at runtime by <em>mounting</em> filesystems onto directories. The kernel keeps a per-mount-namespace table; a process in a new mount namespace starts with a copy of its parent's table and can change it without affecting anyone else. That is what gives a container its own <code>/</code>.</p>
+<pre><code class="lang-bash">$ findmnt                                  # the tree, with source, fstype and options
+$ findmnt /                                # what backs the root
+$ findmnt -t overlay                       # every container rootfs on this node
+$ cat /proc/self/mountinfo | head -5       # the raw table: mount id, parent, root, mount point, options, fstype, source
+$ findmnt -N $(pgrep -o nginx)             # a container's view (its mount namespace) from the host
+$ sudo mount -t tmpfs -o size=64m tmpfs /mnt/scratch     # RAM-backed
+$ sudo mount --bind /srv/data /mnt/data                  # same directory, second path
+$ sudo mount -o remount,ro,bind /mnt/data                # make that view read-only
+$ sudo umount /mnt/data /mnt/scratch</code></pre>
+<dl class="kv">
+<dt>bind mount</dt><dd>Exposes an existing directory (or file) at another path. No copy; same inodes. Docker <code>-v /host:/ctr</code>, every Kubernetes volume mount into a container, and CSI's "publish" step are bind mounts.</dd>
+<dt>tmpfs</dt><dd>A filesystem in page cache/RAM (may swap). <code>emptyDir medium: Memory</code>, Secret and ConfigMap volumes, <code>/dev/shm</code>. Counts against the cgroup's memory.</dd>
+<dt>propagation</dt><dd><code>private</code> (default for containers: new mounts under it are invisible outside), <code>rslave</code> (see host mounts appear), <code>rshared</code> (both ways). Kubernetes <code>mountPropagation: HostToContainer|Bidirectional</code>; needed by CSI node plugins that mount on behalf of the host.</dd>
+<dt>read-only</dt><dd><code>readOnly: true</code> on a volumeMount = a read-only bind mount; <code>readOnlyRootFilesystem</code> = the overlay root remounted read-only.</dd>
+</dl>
+
+<h2>OverlayFS</h2>
+<figure data-anim="overlay"></figure>
+<pre><code class="lang-bash">$ mkdir -p /tmp/ov/{lower1,lower2,upper,work,merged}
+$ echo "from layer 1" &gt; /tmp/ov/lower1/a.txt; echo "from layer 2" &gt; /tmp/ov/lower2/b.txt; echo "layer1 version" &gt; /tmp/ov/lower1/c.txt; echo "layer2 version" &gt; /tmp/ov/lower2/c.txt
+$ sudo mount -t overlay overlay -o lowerdir=/tmp/ov/lower2:/tmp/ov/lower1,upperdir=/tmp/ov/upper,workdir=/tmp/ov/work /tmp/ov/merged
+$ ls /tmp/ov/merged                        # a.txt b.txt c.txt — the union
+$ cat /tmp/ov/merged/c.txt                 # "layer2 version" — leftmost lowerdir wins
+$ echo "changed" &gt;&gt; /tmp/ov/merged/a.txt   # write → COPY-UP: a.txt is copied to upper, then modified there
+$ ls /tmp/ov/upper                         # a.txt (the modified copy); lower1/a.txt is untouched
+$ rm /tmp/ov/merged/b.txt                  # delete → a WHITEOUT in upper hides it
+$ ls -l /tmp/ov/upper                      # c--------- b.txt  (character device 0/0 = whiteout)
+$ ls /tmp/ov/merged                        # a.txt c.txt — b.txt is hidden, still present in lower2
+$ sudo umount /tmp/ov/merged</code></pre>
+<dl class="kv">
+<dt>lowerdir</dt><dd>One or more read-only layers, colon-separated, <em>rightmost is the bottom</em>. The image layers.</dd>
+<dt>upperdir</dt><dd>The single writable layer: every write, new file and deletion marker lands here. The container layer. Delete the container = delete this directory.</dd>
+<dt>workdir</dt><dd>Scratch space overlayfs needs for atomic operations; same filesystem as upper.</dd>
+<dt>merged</dt><dd>The union view: what the container sees as <code>/</code>.</dd>
+<dt>copy-up</dt><dd>First write to a file from a lower layer copies the whole file to upper. Writing one byte to a 1 GB file in a lower layer copies 1 GB — why databases and logs must not live in the container layer.</dd>
+<dt>whiteout</dt><dd>A 0/0 character device in upper marks a lower file as deleted; an <code>opaque</code> xattr on a directory hides everything below. Deleting files in a later image layer does not shrink the image (<a href="../lessons/d05-multistage-builds.html">Day 5</a>).</dd>
+</dl>
+
+<h2>How containerd stores it</h2>
+<pre><code class="lang-bash">$ sudo ls /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/    # numbered dirs: one per layer AND per container
+$ sudo ls /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/42/fs   # a layer's files
+$ sudo ctr -n k8s.io snapshots ls | head          # KEY (digest or container id) PARENT KIND (Committed = layer, Active = container)
+$ sudo ctr -n k8s.io content ls | head            # the compressed blobs as pulled (deleted after unpack unless kept)
+$ findmnt -t overlay | head -3                    # each running container = one overlay mount:
+# lowerdir=/var/lib/containerd/…/snapshots/38/fs:/…/37/fs:/…/36/fs,upperdir=/…/snapshots/42/fs,workdir=/…/42/work
+$ sudo crictl imagefsinfo                         # bytes used by images
+$ sudo du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/* | sort -h | tail</code></pre>
+<p>Pull = download blobs → unpack each into a snapshot whose parent is the previous layer. Run = create an <em>active</em> snapshot (empty upper) on top of the image's top layer and mount the overlay. Ten Pods from one image share every lower snapshot; each has its own tiny upper. <code>kubectl exec … df -h /</code> inside a container reports the <em>node's</em> filesystem size and usage, because the overlay upper lives on it — a confusing but correct number.</p>
+
+<h2>Where a container's writes go — and what they cost</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Path in container</th><th>Backed by</th><th>Survives restart?</th><th>Survives Pod deletion?</th><th>Counted as</th></tr>
+<tr><td>anything not a mount (e.g. <code>/tmp</code>, <code>/var/cache</code>)</td><td>overlay upperdir</td><td>No (new container = new upper)</td><td>No</td><td>ephemeral-storage</td></tr>
+<tr><td><code>emptyDir</code> mount</td><td>dir under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes</code></td><td>Yes</td><td>No</td><td>ephemeral-storage</td></tr>
+<tr><td><code>emptyDir medium: Memory</code></td><td>tmpfs</td><td>Yes</td><td>No</td><td>memory limit</td></tr>
+<tr><td>ConfigMap/Secret/downwardAPI/projected</td><td>tmpfs (read-only)</td><td>Yes</td><td>—</td><td>memory (tiny)</td></tr>
+<tr><td><code>hostPath</code></td><td>node directory (bind)</td><td>Yes</td><td>Yes, on that node</td><td>not accounted</td></tr>
+<tr><td>PVC</td><td>CSI mount (block device / NFS / …)</td><td>Yes</td><td>Yes (per reclaim policy)</td><td>the PV's capacity</td></tr>
+<tr><td>container logs</td><td><code>/var/log/pods</code> (written by the shim)</td><td>Rotated</td><td>No</td><td>ephemeral-storage</td></tr>
+</table></div>
+
+<h2>Disk accounting and DiskPressure</h2>
+<pre><code class="lang-bash">$ df -h / /var/lib/containerd /var/lib/kubelet /var/log        # filesystem-level: what the kubelet watches (nodefs, imagefs)
+$ sudo du -xsh /var/lib/containerd /var/lib/kubelet/pods /var/log/pods 2&gt;/dev/null   # who is using it
+$ sudo du -xsh /var/log/pods/* | sort -h | tail -5                                    # the log hog
+$ sudo crictl rmi --prune                                       # unused images
+$ sudo journalctl --vacuum-size=200M
+$ kubectl describe node worker-1 | grep -A3 DiskPressure         # kubelet evicts when nodefs.available &lt; 10% (default) or imagefs &lt; 15%
+$ kubectl get pod x -o jsonpath='{.spec.containers[0].resources.limits.ephemeral-storage}'   # per-container cap; exceeding evicts the Pod</code></pre>
+<p><code>df</code> counts blocks the filesystem considers used (including deleted-but-open files — a rotated log still held by a process); <code>du</code> sums files it can see. A large gap between them means an unlinked open file: <code>lsof +L1</code> or <code>find /proc/*/fd -lname '*(deleted)'</code>.</p>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash"># overlay by hand: run the OverlayFS block above, then observe copy-up cost
+$ dd if=/dev/zero of=/tmp/ov/lower1/big bs=1M count=200 status=none
+$ sudo mount -t overlay overlay -o lowerdir=/tmp/ov/lower1,upperdir=/tmp/ov/upper,workdir=/tmp/ov/work /tmp/ov/merged
+$ du -sh /tmp/ov/upper; time sh -c 'echo x &gt;&gt; /tmp/ov/merged/big'; du -sh /tmp/ov/upper     # one byte → 200 MB copied
+$ sudo umount /tmp/ov/merged
+# a real container's mounts
+$ docker run -d --name m -v $(pwd):/host:ro --tmpfs /scratch:size=16m nginx; PID=$(docker inspect -f '{{.State.Pid}}' m)
+$ sudo findmnt -N $PID | grep -E ' / |/host|/scratch|/etc/(hosts|resolv)'      # overlay root, bind, tmpfs, and the kubelet-style /etc files
+$ docker exec m df -h / /host /scratch
+$ docker exec m sh -c 'echo hi &gt; /newfile'; docker diff m                        # A /newfile — the upper dir
+$ docker rm -f m</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A container's filesystem is a mount table in its own namespace: an overlay root plus bind/tmpfs mounts for every volume.</li>
+<li>OverlayFS = read-only lowerdirs (image layers) + one upperdir (container writes) + a merged view; writes copy-up, deletes whiteout.</li>
+<li>containerd keeps layers as snapshots shared by all containers; each container adds an active snapshot.</li>
+<li>Writes outside a volume die with the container and count as ephemeral-storage; Secrets/ConfigMaps are tmpfs; PVCs are CSI mounts.</li>
+<li><code>df</code>/<code>du</code>/<code>findmnt</code>/<code>crictl imagefsinfo</code> explain DiskPressure.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const L = (id, y, t, cls, hidden) => S.box(id, 40, y, 300, 34, t, { fs: 10, lcls: 'mono', cls, hidden });
+  let svg = S.text('t', 190, 24, 'layers on disk', { cls: 'b' }) + S.text('t2', 540, 24, 'merged view (container /)', { cls: 'b' })
+    + L('l1', 230, 'lower1: a.txt  c.txt  big (200MB)', 'soft') + L('l2', 190, 'lower2: b.txt  c.txt', 'soft') + L('up', 150, 'upper:  (empty)', 'ok')
+    + S.term('m', 400, 60, 300, 130, ['/', '  a.txt   (lower1)', '  b.txt   (lower2)', '  c.txt   (lower2 wins)', '  big     (lower1)'], { fs: 9.5 })
+    + S.text('msg', 360, 300, '', { cls: 'sm b' });
+  Anim.define('overlay', { w: 720, h: 315, title: 'OverlayFS: union, copy-up, whiteout', ms: 2800, svg, steps: [
+    { c: 'Two read-only layers and an empty upper. The merged view shows the <b>union</b>; where a name exists in both, the upper-most (leftmost in lowerdir=) wins: c.txt comes from lower2.', on(q){} },
+    { c: 'Read <code>big</code>: served straight from lower1. No copy. Ten containers on this image share the same 200 MB on disk.', on(q){ q('#m-l4').style('fill', 'var(--green)'); q('#msg').text('reads pass through'); } },
+    { c: 'Append one byte to <code>big</code>: <b>copy-up</b>. The whole 200 MB file is copied into upper first, then modified. lower1 is untouched.', on(q){ q('#up').text('upper:  big (200MB, modified)'); q('#up rect').set('warn'); q('#m-l4').text('  big     (upper — copied up)').style('fill', 'var(--amber)'); q('#msg').text('first write = full-file copy'); } },
+    { c: 'Delete <code>b.txt</code>: overlay writes a <b>whiteout</b> (a 0/0 char device) in upper. b.txt disappears from the view but still occupies lower2.', on(q){ q('#up').text('upper:  big · b.txt (whiteout)'); q('#m-l2').text('  (b.txt hidden)').style('fill', 'var(--red)'); q('#msg').text('RUN rm never shrinks an image'); } },
+    { c: 'Remove the container: only <code>upper</code> is deleted. The layers stay for the next container, which starts with a fresh empty upper — the same files, unmodified.', on(q){ q('#up').text('upper:  (deleted with container)'); q('#up rect').set('bad'); q('#m-l2').text('  b.txt   (lower2)').style('fill', 'var(--code-text)'); q('#m-l4').text('  big     (lower1)').style('fill', 'var(--code-text)'); q('#msg').text('layers shared, writes disposable'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

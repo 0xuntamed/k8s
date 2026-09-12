@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 55 · Upgrade a Cluster with kubeadm · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d55" data-root="../" data-linux="l07" data-related="d54,d33,d57">
+<article class="lesson">
+<p class="lead">Kubernetes ships three minor versions a year and supports each for about fourteen months, so upgrading is routine — and it is a guaranteed CKA task. The procedure is the same every time: upgrade kubeadm, upgrade the control plane, upgrade the kubelet, node by node, one minor version at a time, draining workloads off each node first. This lesson is that runbook, with the version-skew rules that make the order non-negotiable and an etcd backup before you touch anything.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Version skew: why control plane first, one minor at a time, kubelet never ahead</li>
+<li>etcd snapshot and restore — the safety net (and its own exam task)</li>
+<li>Control plane: <code>kubeadm upgrade plan</code> / <code>apply</code>, then kubelet + kubectl</li>
+<li>Workers: drain → upgrade kubeadm → <code>kubeadm upgrade node</code> → kubelet → uncordon</li>
+<li>What <code>drain</code> really does, PodDisruptionBudgets, and verifying the result</li>
+</ul></div>
+
+<h2>Version skew rules</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Component</th><th>Relative to kube-apiserver (vX.Y)</th></tr>
+<tr><td>Other API servers (HA)</td><td>Same minor, or one behind during the upgrade</td></tr>
+<tr><td>kube-controller-manager, kube-scheduler, cloud-controller-manager</td><td>Same or one minor behind — never ahead</td></tr>
+<tr><td>kubelet</td><td>Up to <strong>three</strong> minors behind — never ahead</td></tr>
+<tr><td>kube-proxy</td><td>Same as kubelet on that node (three behind), never ahead</td></tr>
+<tr><td>kubectl</td><td>Within one minor either way</td></tr>
+<tr><td>kubeadm</td><td>Must be the target version when you run it; can upgrade a cluster only one minor at a time (1.30 → 1.31 → 1.32, never 1.30 → 1.32)</td></tr>
+</table></div>
+<p>Hence the order: <strong>kubeadm binary → control plane → kubelets</strong>, per minor version, repeated for each hop.</p>
+
+<h2>Step 0 — Back up etcd</h2>
+<pre><code class="lang-bash"># on cp-1 (etcdctl from the etcd image, or apt install etcd-client)
+$ sudo ETCDCTL_API=3 etcdctl snapshot save /var/backups/etcd-$(date +%F).db \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key
+$ sudo ETCDCTL_API=3 etcdctl snapshot status /var/backups/etcd-*.db -w table    # (older etcdctl) or: etcdutl snapshot status
+$ sudo cp -r /etc/kubernetes/pki /var/backups/pki-$(date +%F)                   # certs too</code></pre>
+<details class="quiz"><summary>How do you restore it? (exam task)</summary><div>
+<pre><code class="lang-bash">$ sudo ETCDCTL_API=3 etcdctl snapshot restore /var/backups/etcd-2025-01-01.db --data-dir /var/lib/etcd-restored   # or etcdutl snapshot restore
+$ sudo sed -i 's#/var/lib/etcd#/var/lib/etcd-restored#' /etc/kubernetes/manifests/etcd.yaml   # hostPath volume + --data-dir
+# the kubelet notices the manifest change and restarts etcd from the restored directory
+$ watch crictl ps | grep etcd; kubectl get nodes</code></pre>
+<p>Restore into a <em>new</em> directory and repoint the static Pod; never restore over a running etcd's data dir. In an HA cluster restore on all members with matching <code>--initial-cluster</code> flags.</p></div></details>
+
+<h2>Step 1 — Control plane</h2>
+<figure data-anim="upgrade-flow"></figure>
+<pre><code class="lang-bash"># 1. new package repo for the target minor
+$ sudo sed -i 's#/v1.31/#/v1.32/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update
+$ apt-cache madison kubeadm | head -3                       # pick the exact version, e.g. 1.32.1-1.1
+# 2. upgrade kubeadm only
+$ sudo apt-mark unhold kubeadm && sudo apt-get install -y kubeadm=1.32.1-1.1 && sudo apt-mark hold kubeadm
+$ kubeadm version -o short
+# 3. see what would happen
+$ sudo kubeadm upgrade plan                                 # component versions, target, "You can now apply the upgrade by executing…"
+# 4. do it — this rewrites static pod manifests one at a time and renews certificates
+$ sudo kubeadm upgrade apply v1.32.1
+[upgrade/successful] SUCCESS! Your cluster was upgraded to "v1.32.1". Enjoy!
+# 5. the node's own kubelet and kubectl
+$ kubectl drain cp-1 --ignore-daemonsets                    # only needed if workloads run on the control plane
+$ sudo apt-mark unhold kubelet kubectl && sudo apt-get install -y kubelet=1.32.1-1.1 kubectl=1.32.1-1.1 && sudo apt-mark hold kubelet kubectl
+$ sudo systemctl daemon-reload && sudo systemctl restart kubelet
+$ kubectl uncordon cp-1
+$ kubectl get nodes                                         # cp-1 VERSION v1.32.1; workers still v1.31.x — allowed (skew)</code></pre>
+<p><code>kubeadm upgrade apply</code>: pulls the new images, upgrades etcd (if bundled), then for each of API server / controller-manager / scheduler writes a new manifest to <code>/etc/kubernetes/manifests</code> and waits for the kubelet to restart it healthy before moving on; renews all certificates; updates the kubelet ConfigMap, kube-proxy and CoreDNS add-ons. Workloads keep running throughout — the data plane does not depend on the control plane being up. For additional control-plane nodes run <code>kubeadm upgrade node</code> (not <code>apply</code>) after the first.</p>
+
+<h2>Step 2 — Each worker</h2>
+<pre><code class="lang-bash"># from cp-1 (or anywhere with kubectl): move workloads away
+$ kubectl drain worker-1 --ignore-daemonsets --delete-emptydir-data     # cordon + evict; blocks until pods are gone
+# on worker-1:
+$ sudo sed -i 's#/v1.31/#/v1.32/#' /etc/apt/sources.list.d/kubernetes.list && sudo apt-get update
+$ sudo apt-mark unhold kubeadm && sudo apt-get install -y kubeadm=1.32.1-1.1 && sudo apt-mark hold kubeadm
+$ sudo kubeadm upgrade node                              # updates the kubelet config from the cluster's ConfigMap
+$ sudo apt-mark unhold kubelet kubectl && sudo apt-get install -y kubelet=1.32.1-1.1 kubectl=1.32.1-1.1 && sudo apt-mark hold kubelet kubectl
+$ sudo systemctl daemon-reload && sudo systemctl restart kubelet
+# from cp-1:
+$ kubectl uncordon worker-1
+$ kubectl get nodes                                      # worker-1 v1.32.1 Ready
+# repeat for worker-2. Never drain more nodes at once than your capacity and PDBs allow.</code></pre>
+
+<h2>What drain does</h2>
+<ol class="steps">
+<li><strong>Cordon</strong> — <code>spec.unschedulable: true</code> (+ the unschedulable taint). No new Pods land here. Running ones are untouched.</li>
+<li><strong>Evict</strong> — for every Pod on the node, POST an <code>Eviction</code> (the Eviction API, which respects <strong>PodDisruptionBudgets</strong>: if evicting would drop a Deployment below its PDB's <code>minAvailable</code>, the request is refused with 429 and drain retries until it can). Controllers re-create the Pods elsewhere.</li>
+<li><strong>Flags you need</strong>: <code>--ignore-daemonsets</code> (DaemonSet Pods cannot be moved; drain refuses without it), <code>--delete-emptydir-data</code> (Pods with emptyDir lose that data — confirm you accept), <code>--force</code> (bare Pods with no controller would be lost forever — required to proceed). <code>--timeout</code>, <code>--grace-period</code> as needed.</li>
+<li><strong>Uncordon</strong> — <code>spec.unschedulable: false</code>. Pods do <em>not</em> move back automatically; the next scheduling decisions may use the node.</li>
+</ol>
+<pre><code class="lang-yaml">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: api-pdb}
+spec:
+  minAvailable: 2               # or maxUnavailable: 1 / 25%
+  selector: {matchLabels: {app: api}}</code></pre>
+<pre><code class="lang-bash">$ kubectl create pdb api-pdb --selector=app=api --min-available=2
+$ kubectl get pdb                      # ALLOWED DISRUPTIONS: 1 — drain proceeds one pod at a time</code></pre>
+<div class="callout warn"><div class="ct">Drain hangs</div><p>Usually a PDB that can never be satisfied (<code>minAvailable: 3</code> with 3 replicas → 0 allowed disruptions) or a Pod whose remaining replicas cannot schedule anywhere else. <code>kubectl get pdb -A</code> and <code>describe</code> the stuck Pod. Fix the PDB/capacity rather than <code>--disable-eviction</code>, which bypasses PDBs and defeats their purpose.</p></div>
+
+<h2>Verify</h2>
+<pre><code class="lang-bash">$ kubectl get nodes                                          # every VERSION the target
+$ kubectl version                                            # client and server
+$ kubectl get pods -n kube-system -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image | grep -E 'apiserver|scheduler|controller|proxy|coredns'
+$ sudo kubeadm certs check-expiration                        # renewed: one year from today
+$ kubectl get --raw /readyz?verbose | tail -3
+$ kubectl rollout status deploy -A 2&gt;/dev/null | head       # workloads healthy</code></pre>
+
+<div class="callout linux" data-ref="l07"><div class="ct">Under the hood · Linux</div><p>An upgrade is mostly package management and systemd: <code>apt-mark hold/unhold</code> keeps unattended upgrades from bumping the kubelet unexpectedly (which would break skew rules); <code>systemctl daemon-reload</code> is required because the package installs a new unit file and drop-in; <code>systemctl restart kubelet</code> hands the node to the new binary while containers keep running (the runtime is separate — containerd is upgraded independently and can be restarted without killing containers thanks to the shim design from <a href="d01-docker-fundamentals.html">Day 1</a>). The control-plane upgrade is a file swap in <code>/etc/kubernetes/manifests</code>: <code>kubeadm upgrade apply -v=5</code> shows it moving manifests into <code>/etc/kubernetes/tmp/</code> and back, with backups you can restore by hand if it fails halfway.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>The exam question says which node and which version. Sequence: <code>drain</code> → (on node) repo → kubeadm → <code>upgrade plan/apply</code> or <code>upgrade node</code> → kubelet + kubectl → <code>daemon-reload</code> + restart → <code>uncordon</code>. Do not skip <code>daemon-reload</code>; do not forget to <code>uncordon</code>.</li>
+<li>Match the <em>exact</em> package version string (<code>apt-cache madison kubeadm</code>). The version in <code>kubeadm upgrade apply vX.Y.Z</code> needs the <code>v</code>.</li>
+<li>etcd backup/restore is a separate, frequent task: memorise the three cert flags (<code>pki/etcd/ca.crt</code>, <code>server.crt</code>, <code>server.key</code>) and the data-dir swap in the static Pod manifest.</li>
+<li>Drain needs <code>--ignore-daemonsets</code>; add <code>--delete-emptydir-data</code> if it complains.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (45 min) — on the Day 54 cluster</h3>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx --replicas=4 && kubectl create pdb web --selector=app=web --min-available=3
+$ sudo ETCDCTL_API=3 etcdctl snapshot save /tmp/pre-upgrade.db --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key
+# control plane: follow Step 1 to the next minor
+# worker-1: watch the PDB in action
+$ kubectl get pdb web -w &amp;
+$ kubectl drain worker-1 --ignore-daemonsets --delete-emptydir-data       # evicts web pods one at a time, keeping 3 available
+# … Step 2 on worker-1 … uncordon … repeat worker-2
+$ kubectl get nodes; kubectl get pods -o wide                             # all upgraded, web still 4/4
+# restore drill (destructive — do it last, then rebuild if it goes wrong):
+$ kubectl create cm marker --from-literal=before=restore
+$ sudo ETCDCTL_API=3 etcdctl snapshot restore /tmp/pre-upgrade.db --data-dir /var/lib/etcd-restored
+$ sudo sed -i 's#/var/lib/etcd$#/var/lib/etcd-restored#; s#path: /var/lib/etcd$#path: /var/lib/etcd-restored#' /etc/kubernetes/manifests/etcd.yaml
+$ sleep 30; kubectl get cm marker      # NotFound — the cluster state is from before the snapshot</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Order: kubeadm → control plane (<code>upgrade apply</code>) → kubelets (<code>upgrade node</code>), one minor at a time; kubelet never ahead of the API server.</li>
+<li>Snapshot etcd (and copy pki) first; restore into a new data dir and repoint the etcd static Pod.</li>
+<li>Per node: drain (cordon + PDB-aware evict) → packages with hold/unhold → <code>daemon-reload</code> + restart kubelet → uncordon.</li>
+<li><code>kubeadm upgrade apply</code> swaps static Pod manifests and renews all certificates; workloads keep running.</li>
+<li>PDBs make drains safe and can make them hang; fix the budget, do not bypass it.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.node('cp', 20, 30, 210, 130, 'cp-1', { sub: 'v1.31.2' }) + S.node('w1', 255, 30, 210, 130, 'worker-1', { sub: 'v1.31.2' }) + S.node('w2', 490, 30, 210, 130, 'worker-2', { sub: 'v1.31.2' })
+    + S.pod('c1', 80, 100, 'apiserver', { w: 70, cls: 'pur' }) + S.pod('c2', 165, 100, 'etcd', { w: 56, cls: 'pur' })
+    + S.pod('p1', 300, 100, 'web', { w: 50, cls: 'ok' }) + S.pod('p2', 360, 100, 'web', { w: 50, cls: 'ok' }) + S.pod('p3', 420, 100, 'api', { w: 50, cls: 'ok' })
+    + S.pod('p4', 540, 100, 'web', { w: 50, cls: 'ok' }) + S.pod('p5', 600, 100, 'web', { w: 50, cls: 'ok' }) + S.pod('p6', 660, 100, 'api', { w: 50, cls: 'ok' })
+    + S.term('log', 20, 180, 680, 110, ['runbook:', '', '', '', ''], { fs: 9.5 })
+    + S.text('m', 360, 310, '', { cls: 'sm b' });
+  const L = (q, i, t, c) => q('#log-l' + i).text(t).style('fill', c || 'var(--accent)');
+  Anim.define('upgrade-flow', { w: 720, h: 325, title: 'Rolling cluster upgrade', ms: 3000, svg, steps: [
+    { c: 'Three nodes on 1.31.2, workloads spread across the workers. Target: 1.32.1. First, an etcd snapshot.', on(q){ L(q, 1, '0. etcdctl snapshot save … (+ copy /etc/kubernetes/pki)', 'var(--amber)'); } },
+    { c: '<b>Control plane</b>: upgrade the kubeadm package, <code>kubeadm upgrade plan</code>, then <code>kubeadm upgrade apply v1.32.1</code>. Static Pod manifests are swapped one by one; etcd data is untouched; certs are renewed.', on(q){ q('#c1 rect,#c2 rect').set('warn'); L(q, 2, '1. cp-1: apt kubeadm → upgrade apply v1.32.1 → kubelet/kubectl → restart kubelet'); q('#m').text('workloads on workers unaffected'); } },
+    { c: 'Then cp-1\'s own kubelet and kubectl. cp-1 reports v1.32.1. Workers are still 1.31 — allowed by the skew policy (kubelet up to 3 minors behind).', on(q){ q('#c1 rect,#c2 rect').set('pur'); q('#cp text:nth-of-type(2)').text('v1.32.1'); q('#cp rect').set('ok'); } },
+    { c: '<b>worker-1</b>: <code>kubectl drain</code> cordons it and evicts its Pods (respecting PDBs); they are re-created on worker-2.', on(q){ q('#p1').to(540, 140); q('#p2').to(600, 140); q('#p3').to(660, 140); q('#w1 rect').set('warn'); L(q, 3, '2. drain worker-1 → pods rescheduled to worker-2'); q('#m').text('capacity check: can worker-2 hold everything?'); } },
+    { c: 'On the empty node: kubeadm package → <code>kubeadm upgrade node</code> → kubelet + kubectl packages → <code>systemctl daemon-reload && restart kubelet</code> → <code>kubectl uncordon</code>.', on(q){ q('#w1 text:nth-of-type(2)').text('v1.32.1'); q('#w1 rect').set('ok'); L(q, 4, '3. worker-1: kubeadm → upgrade node → kubelet → uncordon'); q('#m').text('pods do not move back by themselves'); } },
+    { c: 'Repeat for worker-2. Its Pods land on the now-upgraded worker-1. Every node on 1.32.1, certificates renewed, zero workload downtime — provided replicas &gt; 1 and PDBs were sane.', on(q){ q('#p4').to(300, 140); q('#p5').to(360, 140); q('#p6').to(420, 140); q('#w2 text:nth-of-type(2)').text('v1.32.1'); q('#w2 rect').set('ok'); L(q, 4, '4. worker-2: same → all nodes v1.32.1', 'var(--green)'); q('#m').text('next minor? repeat from step 0'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

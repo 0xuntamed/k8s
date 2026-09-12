@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 51 · Ingress 3: TLS & Subdomain Routing · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d51" data-root="../" data-linux="l09" data-related="d31,d40,d50">
+<article class="lesson">
+<p class="lead">Production ingress means HTTPS and real hostnames: <code>shop.example.com</code> to the storefront, <code>api.example.com</code> to the API, both on one load balancer, each with a valid certificate. Two mechanisms make it work: <strong>host-based routing</strong> (the proxy reads the <code>Host</code> header / SNI) and <strong>TLS termination</strong> (the proxy holds the certificate and decrypts). This lesson does it on AWS with ACM and Route 53, then shows the portable equivalent with cert-manager and Let's Encrypt on any controller.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Host-based (subdomain) routing rules and how SNI selects the certificate</li>
+<li>TLS termination: <code>spec.tls</code> with a <code>kubernetes.io/tls</code> Secret vs an ACM certificate on the ALB</li>
+<li>HTTP → HTTPS redirect, and what the backend sees after termination</li>
+<li>DNS: Route 53 records by hand or with external-dns</li>
+<li>Automatic certificates with cert-manager + Let's Encrypt (HTTP-01 / DNS-01)</li>
+</ul></div>
+
+<h2>Host-based routing</h2>
+<pre><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+spec:
+  ingressClassName: alb            # or nginx
+  rules:
+  - host: shop.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend: {service: {name: web, port: {number: 80}}}
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend: {service: {name: api, port: {number: 5678}}}
+  - host: "*.preview.example.com"   # wildcard: one label
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend: {service: {name: preview, port: {number: 80}}}</code></pre>
+<p>Both hostnames resolve to the <em>same</em> address; the proxy distinguishes them by the <code>Host</code> header (HTTP) and by <strong>SNI</strong> (the hostname the client sends in the TLS ClientHello — before any HTTP is readable). A rule without <code>host</code> is the catch-all.</p>
+
+<h2>TLS termination</h2>
+<figure data-anim="tls-ingress"></figure>
+<div class="compare">
+<div><h4>In-cluster controllers (nginx, Traefik…)</h4><pre><code class="lang-yaml">spec:
+  tls:
+  - hosts: [shop.example.com, api.example.com]
+    secretName: example-tls        # type kubernetes.io/tls, same namespace
+  rules: …</code></pre><pre><code class="lang-bash">$ kubectl create secret tls example-tls --cert=fullchain.pem --key=privkey.pem -n shop</code></pre><p>The controller loads the cert/key from the Secret and presents it for those hosts. One Secret per host, or a multi-SAN/wildcard cert. Without a matching entry, clients get the controller's self-signed "Kubernetes Ingress Controller Fake Certificate".</p></div>
+<div><h4>AWS ALB</h4><pre><code class="lang-yaml">metadata:
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-west-1:123:certificate/abc…   # or omit: auto-discovered by host
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+spec:
+  # no tls: section needed — ACM holds the cert; the ALB terminates</code></pre><p>The certificate lives in <strong>ACM</strong> (free, auto-renewed, validated by a DNS CNAME in Route 53). The controller attaches it to the HTTPS listener; with no ARN given, it discovers ACM certs matching the Ingress hosts. Multiple certs → SNI picks the right one.</p></div>
+</div>
+<p>After termination the backend receives <strong>plain HTTP</strong> with headers <code>X-Forwarded-Proto: https</code>, <code>X-Forwarded-For: &lt;client IP&gt;</code>, <code>X-Forwarded-Host</code>. Apps that generate absolute URLs or enforce HTTPS must trust these headers (from the proxy only). If the backend itself must speak TLS (end-to-end encryption), use <code>alb.ingress.kubernetes.io/backend-protocol: HTTPS</code> or nginx's <code>backend-protocol: "HTTPS"</code> annotation — the proxy re-encrypts to the Pod.</p>
+
+<h2>DNS</h2>
+<pre><code class="lang-bash"># by hand: an alias/CNAME per host → the ALB (or the nginx LoadBalancer hostname)
+$ ALB=$(kubectl get ingress shop -n shop -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+$ aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch "{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"shop.example.com\",\"Type\":\"CNAME\",\"TTL\":60,\"ResourceRecords\":[{\"Value\":\"$ALB\"}]}}]}"
+# automatically: external-dns watches Ingress hosts and manages records
+$ helm install external-dns external-dns/external-dns -n kube-system --set provider=aws --set policy=sync --set txtOwnerId=cka
+$ dig +short shop.example.com                                 # the ALB's IPs
+$ curl -sv https://shop.example.com 2&gt;&1 | grep -E 'subject:|issuer:|HTTP/'
+$ curl -sI http://shop.example.com | head -1                  # 301 → https (ssl-redirect)</code></pre>
+
+<h2>Automatic certificates: cert-manager + Let's Encrypt</h2>
+<p>For in-cluster controllers, <a href="d40-operators.html">cert-manager</a> can obtain and renew public certificates from Let's Encrypt via ACME. You declare an <code>Issuer</code>; an annotation on the Ingress asks for a cert; the operator solves the challenge, stores the cert in the Secret the Ingress references, and renews it 30 days before expiry — forever.</p>
+<pre><code class="lang-yaml">apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    privateKeySecretRef: {name: letsencrypt-account-key}
+    solvers:
+    - http01:                       # LE fetches http://host/.well-known/acme-challenge/… through your Ingress
+        ingress: {ingressClassName: nginx}
+    # - dns01:                      # or prove ownership via a TXT record (needed for wildcards, private clusters)
+    #     route53: {region: eu-west-1}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt     # ← this line requests the certificate
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts: [shop.example.com, api.example.com]
+    secretName: shop-tls                            # cert-manager creates and renews this Secret
+  rules: …</code></pre>
+<pre><code class="lang-bash">$ kubectl get certificate,order,challenge -n shop      # progress of the ACME flow
+$ kubectl describe certificate shop-tls -n shop | tail -6
+$ kubectl get secret shop-tls -n shop -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -issuer -dates -ext subjectAltName</code></pre>
+
+<div class="callout linux" data-ref="l09"><div class="ct">Under the hood · Linux</div><p>Watch SNI-based selection happen: <code>openssl s_client -connect &lt;lb&gt;:443 -servername api.example.com &lt; /dev/null | openssl x509 -noout -subject</code> vs <code>-servername shop.example.com</code> — same IP, different certificate. Omit <code>-servername</code> and you get the default (or fake) cert, which is exactly what a client without SNI support (or a monitoring probe by IP) sees. A <code>kubernetes.io/tls</code> Secret's <code>tls.crt</code> must contain the <em>full chain</em> (leaf then intermediates) or clients that lack the intermediate will fail verification; <code>openssl s_client -showcerts</code> shows what the proxy actually sends, and <code>openssl verify -untrusted chain.pem leaf.pem</code> checks it.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Secure the Ingress with the given cert and key" → <code>kubectl create secret tls NAME --cert --key -n ns</code>, then <code>spec.tls[].secretName</code> with the hosts. <code>kubectl create ingress … --rule="host/*=svc:port,tls=NAME"</code> does it in one line.</li>
+<li>Host rules: the <code>Host</code> header must match exactly (or a wildcard). Test with <code>curl -k --resolve host:443:IP https://host/</code>.</li>
+<li>cert-manager and ACM are outside the CKA; the TLS Secret + <code>spec.tls</code> mechanics are inside it.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min, KIND + ingress-nginx)</h3>
+<pre><code class="lang-bash"># self-signed cert with two SANs (Day 31 skills)
+$ openssl req -x509 -newkey rsa:2048 -nodes -keyout tls.key -out tls.crt -days 30 -subj "/CN=shop.local" -addext "subjectAltName=DNS:shop.local,DNS:api.local"
+$ kubectl create secret tls local-tls --cert=tls.crt --key=tls.key
+$ kubectl create deploy web --image=nginx && kubectl expose deploy web --port=80
+$ kubectl create deploy api --image=hashicorp/http-echo --port=5678 -- -text=api && kubectl expose deploy api --port=5678
+$ kubectl create ingress hosts --class=nginx --rule="shop.local/*=web:80,tls=local-tls" --rule="api.local/*=api:5678,tls=local-tls"
+$ curl -sk --resolve shop.local:443:127.0.0.1 https://shop.local/ | grep -o '&lt;title&gt;.*&lt;/title&gt;'
+$ curl -sk --resolve api.local:443:127.0.0.1 https://api.local/          # api
+$ openssl s_client -connect 127.0.0.1:443 -servername api.local &lt; /dev/null 2&gt;/dev/null | openssl x509 -noout -subject -ext subjectAltName   # your cert
+$ openssl s_client -connect 127.0.0.1:443 &lt; /dev/null 2&gt;/dev/null | openssl x509 -noout -subject                                       # no SNI → Fake Certificate
+$ curl -sI --resolve shop.local:80:127.0.0.1 http://shop.local/ | head -1   # 308 redirect to https (nginx default when tls is set)
+$ kubectl delete ingress hosts; kubectl delete deploy web api; kubectl delete svc web api; kubectl delete secret local-tls</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Host-based routing: one address, many hostnames; the proxy matches <code>Host</code>/SNI. Wildcards match one label.</li>
+<li>TLS terminates at the proxy: in-cluster controllers read a <code>kubernetes.io/tls</code> Secret via <code>spec.tls</code>; the ALB uses ACM certificates via annotations. Backends then see HTTP + X-Forwarded-* headers.</li>
+<li>DNS records point every host at the controller's address — by hand or with external-dns.</li>
+<li>cert-manager + Let's Encrypt automates issuance and renewal for in-cluster controllers; ACM does it for ALB.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('u1', 50, 80, 'user', { label: 'https://shop.example.com', ly: 28, lcls: 'mono' }) + S.icon('u2', 50, 220, 'user', { label: 'https://api.example.com', ly: 28, lcls: 'mono' })
+    + S.box('lb', 200, 120, 160, 70, ['load balancer / proxy', '203.0.113.7:443', 'SNI → cert · Host → rule'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.term('certs', 200, 210, 160, 70, ['certificates', ' shop.example.com', ' api.example.com'], { fs: 8.5 })
+    + S.box('web', 480, 60, 100, 44, ['svc web', ':80 http'], { subfs: 9, subcls: 'mono muted' }) + S.box('api', 480, 200, 100, 44, ['svc api', ':5678 http'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('dns', 200, 30, 160, 40, ['DNS: both hosts', '→ 203.0.113.7'], { subfs: 9, subcls: 'mono muted' })
+    + S.arrow('a1', 90, 90, 198, 140, { d: 'M 90 90 L 198 140', cls: 'hid', label: 'TLS ClientHello SNI=shop', lx: 120, ly: 120 }) + S.arrow('a2', 90, 210, 198, 170, { d: 'M 90 210 L 198 172', cls: 'hid', label: 'SNI=api', lx: 120, ly: 200 })
+    + S.arrow('a3', 360, 140, 478, 85, { d: 'M 360 140 L 478 85', cls: 'hid', label: 'HTTP + X-Forwarded-Proto: https', lx: 430, ly: 100 }) + S.arrow('a4', 360, 170, 478, 220, { d: 'M 360 170 L 478 220', cls: 'hid' })
+    + S.text('m', 360, 300, '', { cls: 'sm b' });
+  Anim.define('tls-ingress', { w: 720, h: 315, title: 'SNI + TLS termination + host routing', ms: 2800, svg, steps: [
+    { c: 'Two hostnames, one DNS answer: both point at the same load balancer address.', on(q){ q('#dns rect').set('hl'); } },
+    { c: 'A browser opens <code>shop.example.com</code>. Its TLS ClientHello carries the hostname in the <b>SNI</b> extension — visible before any encryption exists.', on(q){ q('#a1').show().set('hl'); } },
+    { c: 'The proxy uses SNI to pick the matching certificate, completes the handshake, and <b>terminates</b> TLS — it now holds plain HTTP.', on(q){ q('#certs-l1').style('fill', 'var(--green)'); q('#lb rect').set('pur'); q('#m').text('cert for shop.example.com presented; TLS ends here'); } },
+    { c: 'It reads <code>Host: shop.example.com</code>, matches the rule, and forwards <b>plain HTTP</b> to the web Service with <code>X-Forwarded-Proto: https</code> and the client IP in <code>X-Forwarded-For</code>.', on(q){ q('#a3').show().set('ok'); q('#web rect').set('ok'); } },
+    { c: 'Another client hits <code>api.example.com</code>: different SNI → different cert → different rule → the api Service. Same IP, same proxy, same port 443.', on(q){ q('#a2').show().set('hl'); q('#certs-l2').style('fill', 'var(--green)'); q('#a4').show().set('ok'); q('#api rect').set('ok'); q('#m').text('one listener, N hosts, N certs'); } },
+    { c: 'On AWS the "proxy" is the ALB and the certs are in ACM; with nginx they are <code>kubernetes.io/tls</code> Secrets. cert-manager or ACM renew them; the apps never handle TLS.', on(q){ q('#m').text('termination at the edge; apps speak HTTP'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

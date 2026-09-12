@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 36 · RBAC Authorization · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d36" data-root="../" data-linux="l06" data-related="d35,d37,d14">
+<article class="lesson">
+<p class="lead">Role-Based Access Control is four objects and one idea. A <strong>Role</strong> is a list of permissions (verbs on resources) in a namespace; a <strong>ClusterRole</strong> is the same list without a namespace. A <strong>RoleBinding</strong> grants a Role or ClusterRole to subjects in a namespace; a <strong>ClusterRoleBinding</strong> grants a ClusterRole everywhere. The idea: permissions are purely <em>additive</em> — there is no deny, so the question is always "does <em>any</em> binding give this subject this verb on this resource here?"</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Role and ClusterRole rules: apiGroups, resources, verbs, resourceNames, nonResourceURLs</li>
+<li>RoleBinding and ClusterRoleBinding: subjects (User, Group, ServiceAccount) and roleRef</li>
+<li>The four combinations and what scope each grants — including the ClusterRole-via-RoleBinding trick</li>
+<li>Default ClusterRoles (cluster-admin, admin, edit, view) and aggregation</li>
+<li>Verifying with <code>auth can-i</code>, impersonation, and debugging 403s</li>
+</ul></div>
+
+<h2>Roles: what may be done</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: dev
+rules:
+- apiGroups: [""]                 # core group
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["app-config"]   # only this one object
+  verbs: ["get", "update"]</code></pre>
+<ul class="notes">
+<li><b>apiGroups</b> — <code>""</code> for core (pods, services, configmaps, secrets, nodes…); <code>apps</code>, <code>batch</code>, <code>networking.k8s.io</code>… <code>"*"</code> = all.</li>
+<li><b>resources</b> — lowercase plural, as in <code>kubectl api-resources</code>. Subresources as <code>pods/log</code>, <code>pods/exec</code>, <code>deployments/scale</code>.</li>
+<li><b>verbs</b> — <code>get list watch create update patch delete deletecollection</code>, or <code>"*"</code>. Remember: <code>get pods</code> ≠ <code>list pods</code>; <code>edit</code>/<code>apply</code> need <code>patch</code> or <code>update</code>.</li>
+<li><b>resourceNames</b> — restrict to named objects. Cannot be used with <code>list</code>/<code>create</code> (the name is not known yet).</li>
+<li>Each rule is independent; the Role is the union.</li>
+</ul>
+</div>
+<pre><code class="lang-yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-viewer            # no namespace
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "persistentvolumes", "namespaces"]   # cluster-scoped resources need a ClusterRole
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/healthz", "/metrics"]                 # non-resource endpoints, ClusterRole only
+  verbs: ["get"]</code></pre>
+<pre><code class="lang-bash">$ kubectl create role pod-reader --verb=get,list,watch --resource=pods,pods/log -n dev
+$ kubectl create clusterrole node-viewer --verb=get,list,watch --resource=nodes,persistentvolumes
+$ kubectl create role cm-editor --verb=get,update --resource=configmaps --resource-name=app-config -n dev</code></pre>
+
+<h2>Bindings: who may do it</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: dev
+subjects:
+- kind: User
+  name: jane                          # from the client cert CN / OIDC claim
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: developers                    # cert O= / OIDC groups claim / system:* groups
+  apiGroup: rbac.authorization.k8s.io
+- kind: ServiceAccount
+  name: ci-runner
+  namespace: build                    # SAs are namespaced; may bind across namespaces
+roleRef:                              # exactly one; immutable after creation
+  kind: Role                          # or ClusterRole
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io</code></pre>
+<ul class="notes">
+<li><b>subjects</b> — any mix of Users, Groups and ServiceAccounts. Users and Groups are just strings the authenticator produced; Kubernetes has no user objects.</li>
+<li><b>roleRef</b> — the Role or ClusterRole being granted. Immutable: to change it, delete and re-create the binding.</li>
+<li>A <b>RoleBinding</b> grants within its namespace only — even when it references a ClusterRole.</li>
+<li>A <b>ClusterRoleBinding</b> (no namespace) grants a ClusterRole across every namespace and cluster-scoped resources.</li>
+</ul>
+</div>
+<pre><code class="lang-bash">$ kubectl create rolebinding read-pods --role=pod-reader --user=jane --group=developers --serviceaccount=build:ci-runner -n dev
+$ kubectl create rolebinding dev-edit --clusterrole=edit --group=developers -n dev        # ClusterRole, namespace-scoped grant
+$ kubectl create clusterrolebinding ops-view --clusterrole=view --group=ops                # everywhere</code></pre>
+
+<h2>The four combinations</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Binding</th><th>roleRef</th><th>Grants</th><th>Typical use</th></tr>
+<tr><td>RoleBinding (ns)</td><td>Role (same ns)</td><td>The Role's rules, in that namespace</td><td>Custom, namespace-specific permissions</td></tr>
+<tr><td>RoleBinding (ns)</td><td><strong>ClusterRole</strong></td><td>The ClusterRole's rules, <em>but only in that namespace</em></td><td>Reuse one definition (e.g. <code>edit</code>) across many namespaces without copying it — <strong>the most common pattern</strong></td></tr>
+<tr><td>ClusterRoleBinding</td><td>ClusterRole</td><td>The rules in all namespaces + cluster-scoped resources</td><td>Cluster admins, node readers, controllers</td></tr>
+<tr><td>ClusterRoleBinding</td><td>Role</td><td>— not allowed</td><td></td></tr>
+</table></div>
+<figure data-anim="rbac-eval"></figure>
+
+<h2>Default ClusterRoles</h2>
+<dl class="kv">
+<dt>cluster-admin</dt><dd><code>*</code> on <code>*</code>, plus all non-resource URLs. Bound to group <code>system:masters</code> by a ClusterRoleBinding — which is why the kubeadm admin cert's <code>O=system:masters</code> (or <code>kubeadm:cluster-admins</code>) is all-powerful. Note that the <code>system:masters</code> group is special-cased in the API server and <em>bypasses</em> RBAC entirely.</dd>
+<dt>admin</dt><dd>Full control within a namespace, including creating Roles and RoleBindings — for namespace owners. Cannot touch quotas or the namespace object itself.</dd>
+<dt>edit</dt><dd>Read/write most namespaced objects (Deployments, Services, ConfigMaps, Secrets, PVCs…) but not RBAC — for developers.</dd>
+<dt>view</dt><dd>Read-only on most namespaced objects, <strong>excluding Secrets</strong> — for auditors, dashboards.</dd>
+<dt>system:*</dt><dd>Roles for components: <code>system:node</code>, <code>system:kube-scheduler</code>, <code>system:controller:*</code>, <code>system:discovery</code>, <code>system:basic-user</code> (lets every authenticated user run <code>auth can-i</code> on themselves). Bound automatically; do not edit them (the API server reconciles them on start).</dd>
+</dl>
+<pre><code class="lang-bash">$ kubectl get clusterroles | grep -v system:
+$ kubectl describe clusterrole edit | head -40
+$ kubectl get clusterrolebinding cluster-admin -o yaml       # subject: Group system:masters</code></pre>
+<p><strong>Aggregation:</strong> <code>admin</code>, <code>edit</code> and <code>view</code> are built by <em>aggregating</em> any ClusterRole labelled e.g. <code>rbac.authorization.k8s.io/aggregate-to-edit: "true"</code>. A CRD's operator ships a small ClusterRole with that label and its resources automatically become editable by everyone with <code>edit</code> — no changes to the built-ins.</p>
+
+<h2>Verifying and debugging</h2>
+<pre><code class="lang-bash">$ kubectl auth can-i list pods -n dev --as=jane
+$ kubectl auth can-i '*' '*' --as=jane                          # is she cluster-admin?
+$ kubectl auth can-i --list --as=jane -n dev                    # everything jane can do in dev
+$ kubectl get rolebindings,clusterrolebindings -A -o wide | grep -E 'jane|developers'   # where is she bound?
+$ kubectl get rolebinding read-pods -n dev -o yaml
+$ kubectl --as=jane --as-group=developers get pods -n dev       # impersonate for a real request (needs "impersonate" verb)
+# Reading a 403:
+# Error from server (Forbidden): pods is forbidden: User "jane" cannot list resource "pods" in API group "" in the namespace "dev"
+#   → user jane · verb list · resource pods · group "" · namespace dev: find or create a binding that covers exactly those</code></pre>
+<div class="callout warn"><div class="ct">Common mistakes</div><ul>
+<li>Binding a Role from namespace A in a RoleBinding in namespace B — not allowed; the Role must be in the binding's namespace (or use a ClusterRole).</li>
+<li>Granting <code>get</code> and expecting <code>kubectl get pods</code> to work: that is <code>list</code>.</li>
+<li>Granting <code>pods</code> and expecting <code>logs</code>/<code>exec</code> to work: those are <code>pods/log</code> and <code>pods/exec</code> (exec needs <code>create</code>).</li>
+<li>Expecting a Role to grant access to <code>nodes</code> or <code>persistentvolumes</code>: cluster-scoped resources need a ClusterRole + ClusterRoleBinding.</li>
+<li>Granting <code>edit</code> and being surprised the user can read Secrets: <code>edit</code> includes Secrets; <code>view</code> does not.</li>
+<li>Privilege escalation: you can only grant permissions you hold yourself (unless you have the <code>escalate</code>/<code>bind</code> verbs).</li>
+</ul></div>
+
+<div class="callout linux" data-ref="l06"><div class="ct">Under the hood · Linux</div><p>RBAC is the cluster-level analogue of Unix permissions with groups: subjects are like users/groups, verbs like rwx, and namespaces like directories — except there is no owner, no deny bit, and evaluation is "union of all matching grants". Just as <code>id</code> shows your uid and groups on Linux, <code>kubectl auth whoami</code> shows the identity RBAC is evaluating. And the reason <code>system:masters</code> is dangerous is the same reason uid 0 is: it is a hard-coded bypass, not a policy you can edit — never issue certificates with that group to humans.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Imperative forms save minutes: <code>create role/clusterrole --verb --resource</code>, <code>create rolebinding/clusterrolebinding --role|--clusterrole --user|--group|--serviceaccount=ns:name</code>.</li>
+<li>Always finish with <code>kubectl auth can-i &lt;verb&gt; &lt;resource&gt; --as=&lt;user&gt; -n &lt;ns&gt;</code> — it checks the exact thing the grader checks.</li>
+<li>For a ServiceAccount subject use <code>--serviceaccount=namespace:name</code>; for can-i use <code>--as=system:serviceaccount:namespace:name</code>.</li>
+<li>Copy the exact resource/verb words from the 403 message.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl create ns dev
+$ kubectl create role pod-reader --verb=get,list,watch --resource=pods -n dev
+$ kubectl create rolebinding jane-pods --role=pod-reader --user=jane -n dev
+$ kubectl auth can-i list pods -n dev --as=jane          # yes
+$ kubectl auth can-i list pods -n default --as=jane      # no — RoleBinding is namespaced
+$ kubectl auth can-i get pods --subresource=log -n dev --as=jane    # no — pods/log not granted
+$ kubectl create rolebinding jane-edit --clusterrole=edit --user=jane -n dev
+$ kubectl auth can-i delete deployments -n dev --as=jane  # yes, via ClusterRole in a RoleBinding
+$ kubectl auth can-i get nodes --as=jane                  # no
+$ kubectl create clusterrolebinding jane-nodes --clusterrole=node-viewer --user=jane 2&gt;/dev/null || kubectl create clusterrole node-viewer --verb=get,list --resource=nodes && kubectl create clusterrolebinding jane-nodes --clusterrole=node-viewer --user=jane
+$ kubectl auth can-i get nodes --as=jane                  # yes
+$ kubectl auth can-i --list --as=jane -n dev | head
+$ kubectl delete ns dev; kubectl delete clusterrolebinding jane-nodes; kubectl delete clusterrole node-viewer</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Role/ClusterRole = rules (apiGroups + resources + verbs); RoleBinding/ClusterRoleBinding = subjects + one roleRef.</li>
+<li>RoleBinding → namespace scope, even with a ClusterRole (the reuse pattern). ClusterRoleBinding → everywhere.</li>
+<li>Additive only; no deny. The 403 message names the exact user/verb/resource/group/namespace to grant.</li>
+<li>Use the built-ins: cluster-admin (careful), admin, edit, view. <code>system:masters</code> bypasses RBAC — never give it to people.</li>
+<li>Verify with <code>auth can-i --as</code>; find grants with <code>get rolebindings,clusterrolebindings -A -o wide</code>.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.term('req', 20, 20, 300, 70, ['request', 'user: jane  groups: [developers]', 'verb: delete  resource: pods  ns: dev'], { fs: 9.5 })
+    + S.zone('b', 20, 110, 680, 190, 'bindings the RBAC authorizer scans')
+    + S.box('rb1', 40, 140, 200, 64, ['RoleBinding jane-pods (ns dev)', 'subject: User jane', 'roleRef: Role pod-reader'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('rb2', 260, 140, 200, 64, ['RoleBinding dev-edit (ns dev)', 'subject: Group developers', 'roleRef: ClusterRole edit'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('crb', 480, 140, 200, 64, ['ClusterRoleBinding ops-view', 'subject: Group ops', 'roleRef: ClusterRole view'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('r1', 40, 225, 200, 56, ['Role pod-reader', 'pods: get list watch'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('r2', 260, 225, 200, 56, ['ClusterRole edit', 'pods: … delete …'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('r3', 480, 225, 200, 56, ['ClusterRole view', 'pods: get list watch'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.text('d', 500, 60, '', { cls: 'sm b' }) + S.text('d2', 500, 82, '', { cls: 'xs muted' });
+  Anim.define('rbac-eval', { w: 720, h: 315, title: 'How RBAC evaluates a request', ms: 3000, svg, steps: [
+    { c: 'Request: jane (in group developers) wants to <b>delete pods</b> in <b>dev</b>. RBAC collects every binding whose subjects match jane or any of her groups, in this namespace or cluster-wide.', on(q){ q('#req-l1').style('fill', 'var(--accent)'); } },
+    { c: '<code>jane-pods</code> matches (User jane, namespace dev). Its Role grants <code>get list watch</code> on pods — not delete. No match yet; keep looking. There is no deny, only "not yet".', on(q){ q('#rb1 rect').set('hl'); q('#r1 rect').set('warn'); q('#d').text('pod-reader: delete? no'); } },
+    { c: '<code>dev-edit</code> matches (Group developers, namespace dev). It references the ClusterRole <code>edit</code> — scoped to dev by the RoleBinding — which includes <code>delete</code> on pods. <b>Allow.</b>', on(q){ q('#rb1 rect,#r1 rect').set(); q('#rb2 rect').set('ok'); q('#r2 rect').set('ok'); q('#d').text('edit (via RoleBinding in dev): delete pods → ALLOW').style('fill', 'var(--green)'); } },
+    { c: '<code>ops-view</code> is never consulted — jane is not in group ops — and it would not matter anyway: one allow is enough. Permissions are the union of all matching grants.', on(q){ q('#crb rect,#r3 rect').set('dim'); q('#d2').text('first matching allow ends evaluation'); } },
+    { c: 'Same request in namespace <b>prod</b>: neither RoleBinding lives there; only ClusterRoleBindings apply, and none name jane or developers. <b>403 Forbidden</b>: "cannot delete resource pods in API group \'\' in the namespace prod".', on(q){ q('#req-l2').text('verb: delete  resource: pods  ns: prod').style('fill', 'var(--red)'); q('#rb1 rect,#rb2 rect,#r1 rect,#r2 rect').set('dim'); q('#d').text('no binding in prod → DENY (403)').style('fill', 'var(--red)'); q('#d2').text('RoleBindings never reach outside their namespace'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

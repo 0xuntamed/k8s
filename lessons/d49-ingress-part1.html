@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 49 · Ingress 1: What, Why & the Real-World Flow · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d49" data-root="../" data-related="d12,d48,d52">
+<article class="lesson">
+<p class="lead">A <code>type: LoadBalancer</code> Service gives every application its own cloud load balancer, its own IP, and no idea what HTTP is. <strong>Ingress</strong> puts one L7 proxy in front of many Services and routes by <em>hostname</em> and <em>path</em>, terminates TLS, and costs one load balancer instead of twenty. The Ingress object is just the routing table; an <strong>Ingress controller</strong> you install is what actually proxies. This lesson is the model and the request flow; the next two are hands-on on AWS.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Why Services alone are not enough for HTTP: cost, L7 routing, TLS</li>
+<li>Ingress resource vs Ingress controller vs IngressClass</li>
+<li>Rules: host, paths, pathType, backends, defaultBackend; TLS section</li>
+<li>The full request path from DNS to Pod, and what each hop needs to be correct</li>
+<li>Controller landscape: nginx, Traefik, HAProxy, cloud controllers (AWS ALB, GKE)</li>
+</ul></div>
+
+<h2>The problem</h2>
+<div class="compare bad-good">
+<div><h4>One LoadBalancer Service per app</h4><ul><li>An external IP and a cloud LB per Service — $15–25/month each, and IPs to manage in DNS</li><li>L4 only: no routing by URL, no TLS termination, no redirects, no rewrites</li><li>Certificates live in each app</li></ul></div>
+<div><h4>One Ingress controller</h4><ul><li>One LB, one IP; <code>shop.example.com</code> and <code>api.example.com</code> both point at it</li><li>Routes <code>/api</code> to one Service and <code>/</code> to another; virtual hosts; TLS terminated once with centrally managed certs</li><li>Rate limiting, auth, canary weights, rewrites — via controller features</li></ul></div>
+</div>
+
+<h2>Three pieces</h2>
+<dl class="kv">
+<dt>Ingress (resource)</dt><dd>A namespaced API object: "for host H and path P, send to Service S port N". Pure data; does nothing by itself.</dd>
+<dt>Ingress controller</dt><dd>A Deployment/DaemonSet running a reverse proxy (nginx, Envoy, HAProxy, Traefik) plus a controller that watches Ingress objects and rewrites the proxy's config. Exposed by its <em>own</em> Service of type LoadBalancer (or NodePort). <strong>Not installed by default</strong> — a cluster without one accepts Ingress objects and ignores them.</dd>
+<dt>IngressClass</dt><dd>Cluster-scoped: names a controller (<code>spec.controller: k8s.io/ingress-nginx</code>). An Ingress picks one with <code>spec.ingressClassName</code>; one class may be annotated default. Multiple controllers (internal/external) coexist by class.</dd>
+</dl>
+<figure data-anim="ingress-flow"></figure>
+
+<h2>The resource</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /   # controller-specific knobs
+spec:
+  ingressClassName: nginx
+  defaultBackend:                       # anything not matched by a rule
+    service:
+      name: web
+      port: {number: 80}
+  tls:
+  - hosts: [shop.example.com]
+    secretName: shop-tls                # kubernetes.io/tls Secret in this namespace
+  rules:
+  - host: shop.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix                # /api, /api/, /api/orders …
+        backend:
+          service:
+            name: api
+            port: {number: 8080}
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web
+            port: {name: http}
+  - host: admin.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service: {name: admin, port: {number: 80}}</code></pre>
+<ul class="notes">
+<li><b>ingressClassName</b> — which controller should act. Omit only if a default class exists.</li>
+<li><b>rules[].host</b> — matched against the HTTP <code>Host</code> header (and SNI for TLS). Omit host → applies to any host. Wildcards: <code>*.example.com</code> matches one label.</li>
+<li><b>pathType</b> — <code>Prefix</code> (path-segment prefix: <code>/api</code> matches <code>/api/x</code> but not <code>/apix</code>), <code>Exact</code>, or <code>ImplementationSpecific</code> (controller decides; nginx treats it as a regex-capable prefix). Longest match wins; Exact beats Prefix.</li>
+<li><b>backend.service</b> — a Service <em>in the same namespace</em>, by name and port (number or name). The controller resolves it to endpoints; most controllers proxy straight to Pod IPs, bypassing kube-proxy.</li>
+<li><b>tls[]</b> — terminate TLS for these hosts using the certificate in <code>secretName</code>. Without it, the controller serves HTTP (or its default fake cert on 443).</li>
+<li><b>defaultBackend</b> — catch-all; otherwise the controller's own 404 page.</li>
+<li><b>annotations</b> — the escape hatch for features the spec lacks (rewrites, timeouts, CORS, auth, canary). Different per controller — the main reason Gateway API exists (Day 52).</li>
+</ul>
+</div>
+<pre><code class="lang-bash">$ kubectl create ingress shop --class=nginx --rule="shop.example.com/api*=api:8080" --rule="shop.example.com/*=web:80,tls=shop-tls"
+$ kubectl get ingress -n shop
+NAME   CLASS   HOSTS                                ADDRESS        PORTS     AGE
+shop   nginx   shop.example.com,admin.example.com   203.0.113.7    80, 443   1m
+$ kubectl describe ingress shop -n shop               # rules, backends → endpoints; events from the controller</code></pre>
+
+<h2>The request path, hop by hop</h2>
+<ol class="steps">
+<li><strong>DNS.</strong> <code>shop.example.com</code> → the controller's external address (the LB IP/hostname in the ADDRESS column). You manage this record (or external-dns does).</li>
+<li><strong>Cloud LB → controller Service.</strong> The LB forwards TCP 80/443 to the ingress controller's Service (NodePort on every node, or directly to Pod IPs with cloud target-type ip).</li>
+<li><strong>Controller Pod.</strong> nginx/Envoy receives the connection, terminates TLS using the cert from <code>shop-tls</code>, reads Host and path, matches an Ingress rule.</li>
+<li><strong>Upstream.</strong> The proxy forwards to a Pod IP from the backend Service's EndpointSlice (it watches them itself), adding <code>X-Forwarded-For</code>/<code>X-Real-IP</code> headers.</li>
+<li><strong>Pod.</strong> Your app answers on <code>targetPort</code>; the response goes back the same way.</li>
+</ol>
+<p>Each hop has a failure mode: wrong DNS → nothing arrives; controller Service pending → no external address; no IngressClass match → controller ignores the object; backend Service name/port typo → 503 from the controller; Pod not Ready → 502/503; missing TLS Secret → the controller's fake certificate.</p>
+
+<h2>Controllers</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Controller</th><th>Proxy</th><th>Where the LB is</th><th>Notes</th></tr>
+<tr><td>ingress-nginx (kubernetes/ingress-nginx)</td><td>nginx</td><td>In-cluster Pods behind a LoadBalancer Service</td><td>The most common; hundreds of annotations. Not the same as NGINX Inc's "nginx-ingress".</td></tr>
+<tr><td>Traefik</td><td>Traefik</td><td>In-cluster</td><td>Default in k3s; CRDs for advanced routing; good dashboard.</td></tr>
+<tr><td>HAProxy, Kong, Contour/Envoy</td><td>various</td><td>In-cluster</td><td>Envoy-based ones are usually Gateway-API-first now.</td></tr>
+<tr><td>AWS Load Balancer Controller</td><td>none — the ALB <em>is</em> the proxy</td><td>Outside the cluster (AWS)</td><td>Ingress → ALB listener rules → target groups of Pod IPs. Days 50–51.</td></tr>
+<tr><td>GKE Ingress, AKS AGIC</td><td>cloud L7 LB</td><td>Outside</td><td>Same idea on other clouds.</td></tr>
+</table></div>
+<pre><code class="lang-bash"># ingress-nginx on KIND (uses the extraPortMappings from Day 8)
+$ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+$ kubectl -n ingress-nginx wait --for=condition=Ready pod -l app.kubernetes.io/component=controller --timeout=120s
+$ kubectl get ingressclass                      # nginx
+$ curl -H 'Host: shop.example.com' http://localhost/                  # Host header instead of DNS</code></pre>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Exam clusters have a controller installed; check <code>kubectl get ingressclass</code> and use that name.</li>
+<li><code>kubectl create ingress NAME --class=X --rule="host/path*=svc:port"</code> is fast; the trailing <code>*</code> makes pathType Prefix. Add <code>,tls=secret</code> for TLS.</li>
+<li>Ingress and its backend Services must share a namespace.</li>
+<li>Test without DNS: <code>curl -H "Host: h" http://&lt;address&gt;/path</code> or <code>curl --resolve h:80:&lt;ip&gt;</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min) — KIND with the Day 8 port mappings</h3>
+<pre><code class="lang-bash">$ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+$ kubectl -n ingress-nginx wait --for=condition=Ready pod -l app.kubernetes.io/component=controller --timeout=180s
+$ kubectl create deploy web --image=nginx && kubectl expose deploy web --port=80
+$ kubectl create deploy api --image=hashicorp/http-echo --port=5678 -- -text=api && kubectl expose deploy api --port=5678
+$ kubectl create ingress shop --class=nginx --rule="shop.local/api*=api:5678" --rule="shop.local/*=web:80"
+$ kubectl get ingress shop; kubectl describe ingress shop | grep -A6 Rules
+$ curl -s -H 'Host: shop.local' http://localhost/ | grep -o '&lt;title&gt;.*&lt;/title&gt;'
+$ curl -s -H 'Host: shop.local' http://localhost/api           # api
+$ curl -s -H 'Host: other.local' http://localhost/ | head -3   # 404 from the controller: no rule for that host
+$ kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=5   # access log lines with host, path, upstream
+$ kubectl delete ingress shop; kubectl delete deploy web api; kubectl delete svc web api</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Ingress = one L7 entry point for many Services: host/path routing, TLS termination, one LB.</li>
+<li>Resource (routing rules) + controller (the proxy, installed separately) + IngressClass (which controller).</li>
+<li>Rules match Host then path (Prefix/Exact, longest wins) → Service in the same namespace → Pod IPs from endpoints.</li>
+<li>Request path: DNS → LB → controller Service → proxy Pod → backend Pod; each hop has a recognisable failure.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('u', 40, 150, 'user', { label: 'shop.example.com/api/orders', ly: 28, lcls: 'mono' })
+    + S.box('dns', 20, 30, 120, 40, ['DNS', '→ 203.0.113.7'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('lb', 160, 125, 100, 50, ['cloud LB', '203.0.113.7'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.zone('cl', 290, 20, 410, 290, 'cluster')
+    + S.box('ic', 310, 110, 150, 80, ['ingress controller', 'nginx pod', 'TLS · Host · path'], { subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.term('rules', 310, 205, 150, 90, ['Ingress shop', ' /api → api:8080', ' /    → web:80', 'tls: shop-tls'], { fs: 8.5 })
+    + S.box('sapi', 500, 60, 90, 40, ['svc api', ':8080'], { subfs: 9, subcls: 'mono muted' }) + S.box('sweb', 500, 200, 90, 40, ['svc web', ':80'], { subfs: 9, subcls: 'mono muted' })
+    + S.pod('pa1', 640, 55, 'api', { cls: 'ok', w: 50 }) + S.pod('pa2', 640, 100, 'api', { cls: 'ok', w: 50 }) + S.pod('pw1', 640, 210, 'web', { cls: 'ok', w: 50 })
+    + S.arrow('a0', 60, 130, 60, 72, { cls: 'hid' })
+    + S.arrow('a1', 70, 150, 158, 150, { cls: 'hid' }) + S.arrow('a2', 260, 150, 308, 150, { cls: 'hid' })
+    + S.arrow('a3', 460, 130, 498, 85, { d: 'M 460 130 L 498 85', cls: 'hid' })
+    + S.arrow('a4', 590, 80, 612, 100, { d: 'M 590 80 L 614 98', cls: 'hid', label: 'to pod IP', lx: 610, ly: 130 })
+    + S.text('m', 360, 320, '', { cls: 'sm b' });
+  Anim.define('ingress-flow', { w: 720, h: 335, title: 'One HTTP request through Ingress', ms: 2800, svg, steps: [
+    { c: 'The user opens <code>https://shop.example.com/api/orders</code>. DNS for the host points at the ingress controller\'s external address — one record for every app behind it.', on(q){ q('#a0').show().set('hl'); q('#dns rect').set('hl'); } },
+    { c: 'The cloud load balancer (created by the controller\'s <code>type: LoadBalancer</code> Service) accepts TCP 443 and forwards to the controller Pods.', on(q){ q('#a1,#a2').show().set('hl'); q('#lb rect').set('pur'); } },
+    { c: 'The nginx Pod terminates TLS with the cert from Secret <code>shop-tls</code>, reads <code>Host: shop.example.com</code> and path <code>/api/orders</code>, and matches the Ingress rule <code>/api → api:8080</code> (longest prefix wins).', on(q){ q('#ic rect').set('cy'); q('#rules-l1').style('fill', 'var(--green)'); q('#m').text('TLS terminated · rule matched'); } },
+    { c: 'It resolves Service <code>api</code> to its EndpointSlice and proxies straight to a Pod IP — kube-proxy is bypassed; the controller does its own load balancing across endpoints.', on(q){ q('#a3,#a4').show().set('ok'); q('#pa2 rect').set('hl'); q('#m').text('nginx → 10.244.2.9:8080 (X-Forwarded-For added)'); } },
+    { c: 'The response returns the same way. A request to <code>/</code> would have hit <code>web</code>; a request for <code>other.example.com</code> would get the controller\'s 404. Same LB, same IP, same cert store.', on(q){ q('#m').text('one entry point, many services'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

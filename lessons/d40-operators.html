@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 40 · Kubernetes Operators · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d40" data-root="../" data-related="d06,d39,d37">
+<article class="lesson">
+<p class="lead">An <strong>Operator</strong> is a CRD plus a controller: a program running in the cluster that watches your custom resources and does whatever a human operator would do to make reality match them — create a StatefulSet, run a backup, fail over a primary, rotate a certificate. It uses the exact same watch-and-reconcile pattern as the built-in controllers from Day 6; the only difference is that you (or a vendor) wrote the reconcile function. This lesson explains the pattern, runs a real operator, and shows what a reconcile loop looks like in code.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Controller = watch + reconcile; why reconciles must be idempotent and level-triggered</li>
+<li>Owner references, status, conditions, finalizers — the conventions that make operators behave</li>
+<li>Installing and using a real operator (cert-manager) and reading its CRDs</li>
+<li>What an operator's Deployment, RBAC and ServiceAccount look like</li>
+<li>Building one: kubebuilder / Operator SDK, and the shape of the Reconcile function</li>
+</ul></div>
+
+<h2>The controller pattern, again</h2>
+<figure data-anim="reconcile"></figure>
+<p>A controller keeps an <strong>informer</strong> — a cached, watched view of the objects it cares about. Every change (and periodic resyncs) puts the object's <em>key</em> (namespace/name) on a work queue. A worker pops a key and calls <strong>Reconcile(key)</strong>, which:</p>
+<ol>
+<li>Reads the current object (the desired state) — and if it is gone, cleans up.</li>
+<li>Reads the current world (the StatefulSets, Secrets, Services it manages).</li>
+<li>Computes the difference and makes the <em>minimal</em> API calls to close it.</li>
+<li>Updates <code>status</code> to report what it observed.</li>
+<li>Returns; if anything failed, the key is re-queued with back-off.</li>
+</ol>
+<div class="callout mental"><div class="ct">Level-triggered and idempotent</div><p>Reconcile does not receive "what changed" — only "look at this object". It must reach the correct end state from <em>any</em> starting point, and running it twice must change nothing the second time. This is why controllers survive restarts, missed events and partial failures: the next reconcile simply looks again. It is also why writing one is mostly about reading state carefully, not reacting to events.</p></div>
+
+<h2>The conventions that make operators well-behaved</h2>
+<dl class="kv">
+<dt>ownerReferences</dt><dd>Every child object (StatefulSet, Service) carries a reference to the CR that created it. Delete the CR → garbage collector deletes the children. <code>kubectl get sts -o jsonpath='{.items[*].metadata.ownerReferences}'</code>.</dd>
+<dt>status + conditions</dt><dd>Written only by the controller, via the <code>/status</code> subresource. <code>status.conditions[]</code> with <code>type/status/reason/message/lastTransitionTime</code> (e.g. <code>Ready=True</code>) is the standard shape; <code>kubectl wait --for=condition=Ready db/orders</code> works with it.</dd>
+<dt>finalizers</dt><dd>A string the controller adds to <code>metadata.finalizers</code>. Deleting the CR then only sets <code>deletionTimestamp</code>; the controller sees it, does external cleanup (delete the cloud disk, deregister from DNS), removes its finalizer, and only then is the object gone. A stuck <code>Terminating</code> object means the controller that owns the finalizer is not running.</dd>
+<dt>Leader election</dt><dd>Operators run 1–3 replicas; a <code>Lease</code> object elects one active reconciler so two replicas never fight.</dd>
+<dt>RBAC</dt><dd>The operator's ServiceAccount needs a ClusterRole for its CRD (all verbs), for the child types it manages, and for <code>events</code> and <code>leases</code>. Least privilege matters: an operator that can create Pods cluster-wide is a powerful thing.</dd>
+<dt>Events</dt><dd>Controllers emit Events on the CR (<code>kubectl describe db orders</code>) — the first place to look when a CR is not progressing.</dd>
+</dl>
+
+<h2>A real operator: cert-manager</h2>
+<pre><code class="lang-bash">$ kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+$ kubectl get crds | grep cert-manager.io          # certificates, issuers, clusterissuers, certificaterequests, orders, challenges
+$ kubectl -n cert-manager get deploy,sa,pods       # the controller, its webhook, its cainjector
+$ kubectl get clusterrole cert-manager-controller-certificates -o yaml | head -30   # what it may touch</code></pre>
+<pre><code class="lang-yaml">apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+  namespace: default
+spec:
+  secretName: web-tls                 # the operator will CREATE this Secret
+  dnsNames: [web.example.internal]
+  duration: 2160h                     # 90 days
+  renewBefore: 360h                   # renew 15 days before expiry — forever
+  issuerRef: {name: selfsigned, kind: ClusterIssuer}</code></pre>
+<pre><code class="lang-bash">$ kubectl apply -f cert.yaml
+$ kubectl get certificate web-tls                  # READY True after a few seconds
+$ kubectl get secret web-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -dates
+$ kubectl get secret web-tls -o jsonpath='{.metadata.ownerReferences[0].kind}'    # Certificate — owned
+$ kubectl describe certificate web-tls | tail -8   # Events: Issuing, Generated, Requested, Issued
+$ kubectl delete secret web-tls; sleep 5; kubectl get secret web-tls     # it is back: reconcile restored desired state</code></pre>
+<p>That last line is the whole point. You declared "a valid certificate for this name must exist in this Secret"; the operator creates it, renews it before expiry, and re-creates it if deleted. A human operator's runbook — <em>"check expiry monthly, regenerate, update the Secret, restart the pods"</em> — became a controller.</p>
+
+<h2>Anatomy of an operator deployment</h2>
+<pre><code class="lang-yaml"># typical manifest bundle (what Helm charts / OLM install)
+CustomResourceDefinition   databases.stable.example.com
+Namespace                  db-operator-system
+ServiceAccount             db-operator
+ClusterRole                db-operator     # databases/*; statefulsets, services, secrets, pvcs: CRUD; events: create; leases: CRUD
+ClusterRoleBinding         db-operator
+Deployment                 db-operator     # 1–2 replicas, image with the controller binary, --leader-elect
+Service                    db-operator-metrics   # /metrics for Prometheus
+(optional) ValidatingWebhookConfiguration for the CRD</code></pre>
+<p><strong>OLM</strong> (Operator Lifecycle Manager, OperatorHub.io) packages these with upgrade channels for OpenShift-style clusters; most other clusters install operators with Helm (<a href="d43-helm.html">Day 43</a>).</p>
+
+<h2>Writing one</h2>
+<p><strong>kubebuilder</strong> and <strong>Operator SDK</strong> (Go), <strong>kopf</strong> (Python) and <strong>Java Operator SDK</strong> generate the CRD, RBAC, main loop and a Reconcile stub from a type definition. Your job is the middle of this function:</p>
+<pre data-title="controllers/database_controller.go (controller-runtime)"><code>func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    var db stablev1.Database
+    if err := r.Get(ctx, req.NamespacedName, &amp;db); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)      // deleted: children are GC'd via ownerRefs
+    }
+    // 1. desired child: a StatefulSet derived from db.Spec
+    desired := buildStatefulSet(&amp;db)
+    ctrl.SetControllerReference(&amp;db, desired, r.Scheme)      // ownerReference
+
+    // 2. observe + act: create if missing, patch if different
+    var current appsv1.StatefulSet
+    err := r.Get(ctx, client.ObjectKeyFromObject(desired), &amp;current)
+    switch {
+    case apierrors.IsNotFound(err):
+        if err := r.Create(ctx, desired); err != nil { return ctrl.Result{}, err }
+    case err != nil:
+        return ctrl.Result{}, err
+    case !equality.Semantic.DeepEqual(current.Spec.Replicas, desired.Spec.Replicas):
+        current.Spec.Replicas = desired.Spec.Replicas
+        if err := r.Update(ctx, &amp;current); err != nil { return ctrl.Result{}, err }
+    }
+
+    // 3. report
+    db.Status.Phase = phaseFrom(&amp;current)
+    if err := r.Status().Update(ctx, &amp;db); err != nil { return ctrl.Result{}, err }
+    return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil   // periodic re-check
+}
+
+func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&amp;stablev1.Database{}).          // watch our CRs
+        Owns(&amp;appsv1.StatefulSet{}).         // and re-reconcile when a child changes
+        Complete(r)
+}</code></pre>
+<p>Notice: no event types, no "on create / on update" branches. Read, compare, act, report. The framework handles caching, queues, retries, leader election and metrics.</p>
+
+<h2>Operators you will meet</h2>
+<div class="grid-3">
+<div class="card"><h4>Infrastructure</h4><p>cert-manager (certificates), external-dns (DNS records), ExternalSecrets (secret sync), Prometheus Operator (monitoring stacks)</p></div>
+<div class="card"><h4>Data</h4><p>CloudNativePG / Zalando (Postgres), Strimzi (Kafka), Redis, MongoDB, Elastic (ECK), Vitess — failover, backups, upgrades as reconciles</p></div>
+<div class="card"><h4>Platform</h4><p>Argo CD (GitOps: an Application CR = "this git path should be deployed here"), Istio, Crossplane (cloud resources as CRs), KEDA (autoscaling)</p></div>
+</div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>You will not write an operator, but you will <em>use</em> one: install from a URL/Helm, create a CR from its docs, check <code>kubectl get &lt;kind&gt;</code> READY/STATUS columns and <code>describe</code> events.</li>
+<li>CR stuck with no status → is the operator Pod running? <code>kubectl -n &lt;op-ns&gt; logs deploy/&lt;operator&gt;</code> — RBAC errors ("forbidden") are the classic cause.</li>
+<li>Object stuck Terminating → a finalizer whose controller is gone. Fix the controller or remove the finalizer.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+$ kubectl -n cert-manager rollout status deploy/cert-manager deploy/cert-manager-webhook
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: selfsigned}
+spec: {selfSigned: {}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: web-tls}
+spec:
+  secretName: web-tls
+  dnsNames: [web.example.internal]
+  duration: 1h
+  renewBefore: 55m
+  issuerRef: {name: selfsigned, kind: ClusterIssuer}
+EOF
+$ kubectl wait --for=condition=Ready certificate/web-tls --timeout=60s
+$ kubectl get certificate,certificaterequest,secret web-tls
+$ kubectl get secret web-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -enddate
+$ kubectl delete secret web-tls && sleep 8 && kubectl get secret web-tls        # reconciled back
+$ kubectl get secret web-tls -o yaml | grep -A5 ownerReferences
+$ kubectl -n cert-manager logs deploy/cert-manager --tail=20 | grep -i web-tls
+$ kubectl delete certificate web-tls; kubectl get secret web-tls                # gone with its owner
+$ kubectl delete -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Operator = CRD + controller. The controller watches CRs and reconciles: read desired, read actual, act minimally, write status, requeue.</li>
+<li>Reconcile is level-triggered and idempotent — it must work from any state and be safe to repeat.</li>
+<li>Conventions: ownerReferences (GC), status/conditions (reporting), finalizers (cleanup before deletion), leader election, least-privilege RBAC, Events.</li>
+<li>cert-manager, Prometheus Operator, database operators and Argo CD are controllers of this exact shape; you operate them by creating CRs and reading their status.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('api', 20, 20, 180, 54, ['API server', 'watch: Database'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('q', 260, 20, 160, 54, ['work queue', 'default/orders'], { subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('rec', 480, 20, 220, 54, ['Reconcile(default/orders)', 'db-operator pod'], { subfs: 9, subcls: 'muted', cls: 'pur' })
+    + S.arrow('a1', 200, 47, 258, 47, { label: 'event / resync', ly: 38 }) + S.arrow('a2', 420, 47, 478, 47)
+    + S.term('cr', 20, 100, 320, 100, ['Database orders (desired)', '  engine: postgres', '  replicas: 1', 'status:', '  phase: —'], { fs: 9.5 })
+    + S.term('world', 380, 100, 320, 100, ['owned objects (actual)', '  StatefulSet orders-pg: —', '  Service orders-pg: —', '  Secret orders-pg-creds: —', ''], { fs: 9.5 })
+    + S.arrow('r1', 560, 74, 200, 100, { d: 'M 560 76 L 200 104', cls: 'hid', label: 'read', lx: 340, ly: 92 })
+    + S.arrow('r2', 600, 74, 560, 100, { cls: 'hid' })
+    + S.text('m', 360, 240, '', { cls: 'sm b' }) + S.text('m2', 360, 262, '', { cls: 'xs muted' });
+  Anim.define('reconcile', { w: 720, h: 275, title: 'One reconcile', ms: 2800, svg, steps: [
+    { c: 'A developer creates <code>Database orders</code>. The operator\'s informer sees the watch event and enqueues the key <code>default/orders</code>. Nothing about "what changed" is kept — only the key.', on(q){ q('#a1').set('hl'); q('#q rect').set('hl'); } },
+    { c: 'A worker calls <b>Reconcile</b>. Step 1: <b>read the desired state</b> — the Database object. Step 2: <b>read the actual state</b> — do a StatefulSet, Service and Secret owned by it exist?', on(q){ q('#a2').set('hl'); q('#rec rect').set('pur'); q('#r1,#r2').show().set('hl'); q('#m').text('desired: 1 postgres · actual: nothing'); } },
+    { c: 'Step 3: <b>act</b>. Create the Secret (generated password), the Service and the StatefulSet, each with an <b>ownerReference</b> to the Database. Minimal, idempotent API calls.', on(q){ q('#world-l1').text('  StatefulSet orders-pg: created (replicas 1)').style('fill', 'var(--green)'); q('#world-l2').text('  Service orders-pg: created').style('fill', 'var(--green)'); q('#world-l3').text('  Secret orders-pg-creds: created').style('fill', 'var(--green)'); q('#m').text('3 creates, owner = Database orders'); } },
+    { c: 'Step 4: <b>report</b>. Write <code>status.phase: Provisioning</code> via the /status subresource and requeue in 30 s to check on the StatefulSet.', on(q){ q('#cr-l4').text('  phase: Provisioning').style('fill', 'var(--amber)'); q('#m').text('status is the operator\'s output, spec is its input'); } },
+    { c: 'Later reconciles find the Pod Ready and flip status to <code>Ready</code>, endpoint filled in. Someone deletes the Service by mistake → the child watch triggers a reconcile → it is re-created. Someone sets <code>replicas: 3</code> → the StatefulSet is patched.', on(q){ q('#cr-l4').text('  phase: Ready  endpoint: orders-pg:5432').style('fill', 'var(--green)'); q('#cr-l2').text('  replicas: 3').style('fill', 'var(--accent)'); q('#world-l1').text('  StatefulSet orders-pg: patched (replicas 3)').style('fill', 'var(--accent)'); q('#m').text('every path is the same function'); q('#m2').text('read → compare → act → report, from any starting state'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

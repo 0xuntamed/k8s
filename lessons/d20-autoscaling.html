@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 20 · Autoscaling: HPA & VPA · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d20" data-root="../" data-linux="l03" data-related="d19,d56">
+<article class="lesson">
+<p class="lead">Once Pods declare resource requests, Kubernetes can scale them automatically. The <strong>HorizontalPodAutoscaler</strong> changes the replica count of a Deployment based on measured load; the <strong>VerticalPodAutoscaler</strong> changes the requests themselves; the <strong>Cluster Autoscaler</strong> (or Karpenter) adds and removes nodes when Pods cannot be scheduled. All three depend on a metrics pipeline, and all three are just controllers running the observe → compare → act loop from Day 6 with a formula in the middle.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>metrics-server and the resource metrics API that <code>kubectl top</code> and the HPA read</li>
+<li>HPA v2: targets on CPU/memory utilisation, the scaling formula, min/max, and stabilisation behaviour</li>
+<li>VPA: recommendation modes and why HPA and VPA must not both manage CPU</li>
+<li>Cluster-level scaling: Cluster Autoscaler vs Karpenter</li>
+</ul></div>
+
+<h2>The metrics pipeline</h2>
+<p>The kubelet on every node already collects container CPU and memory usage (from cgroups, via cAdvisor). <strong>metrics-server</strong> scrapes every kubelet every 15 s, keeps only the latest values in memory, and serves them through the aggregated API at <code>metrics.k8s.io</code>. That is the <em>only</em> source the HPA uses for CPU and memory. It is an add-on — KIND and kubeadm clusters do not ship it.</p>
+<pre><code class="lang-bash">$ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# KIND / self-signed kubelets: add --kubelet-insecure-tls to the metrics-server container args
+$ kubectl -n kube-system patch deploy metrics-server --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+$ kubectl top nodes
+$ kubectl top pods -A --sort-by=memory
+$ kubectl get --raw /apis/metrics.k8s.io/v1beta1/pods | jq '.items[0]'</code></pre>
+<div class="callout info"><div class="ct">Three metric APIs</div><ul>
+<li><code>metrics.k8s.io</code> — resource metrics (CPU, memory) from metrics-server. HPA <code>type: Resource</code>.</li>
+<li><code>custom.metrics.k8s.io</code> — per-object metrics like requests-per-second, served by an adapter (usually prometheus-adapter). HPA <code>type: Pods</code> / <code>Object</code>.</li>
+<li><code>external.metrics.k8s.io</code> — metrics from outside the cluster (queue length in SQS, Kafka lag). HPA <code>type: External</code>. KEDA is the popular implementation.</li>
+</ul></div>
+
+<h2>HorizontalPodAutoscaler</h2>
+<pre><code class="lang-bash">$ kubectl autoscale deployment api --cpu-percent=70 --min=2 --max=10        # imperative (v1: CPU only)
+$ kubectl get hpa api -w
+NAME   REFERENCE        TARGETS   MINPODS   MAXPODS   REPLICAS
+api    Deployment/api   45%/70%   2         10        2</code></pre>
+<pre><code class="lang-yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment          # anything with a /scale subresource: Deployment, StatefulSet, RS…
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization     # % of the container's REQUEST, averaged across pods
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: AverageValue    # absolute, e.g. 400Mi per pod
+        averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100            # at most double every 15 s
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300   # wait 5 min of consistently low load before shrinking
+      policies:
+      - type: Pods
+        value: 1              # remove at most one pod per minute
+        periodSeconds: 60</code></pre>
+<h3>The formula</h3>
+<blockquote><code>desiredReplicas = ceil( currentReplicas × ( currentMetricValue / desiredMetricValue ) )</code></blockquote>
+<p>With 4 replicas averaging 140% of their CPU request and a target of 70%: <code>ceil(4 × 140/70) = 8</code>. With several metrics, the HPA computes a desired count for each and takes the <strong>largest</strong>. Changes within a 10% tolerance are ignored to avoid flapping. Pods without a CPU request cannot be scaled on CPU utilisation — the HPA shows <code>&lt;unknown&gt;</code> and does nothing.</p>
+<figure data-anim="hpa-loop"></figure>
+<dl class="kv">
+<dt>sync period</dt><dd>The controller-manager evaluates every HPA every 15 s (<code>--horizontal-pod-autoscaler-sync-period</code>).</dd>
+<dt>stabilizationWindowSeconds</dt><dd>For scale-down (default 300 s), the HPA uses the <em>highest</em> desired count seen in the window — so a brief dip does not shrink the fleet. Scale-up default is 0.</dd>
+<dt>behavior.policies</dt><dd>Rate limits: at most N pods or N% per period. Multiple policies → the most permissive wins unless <code>selectPolicy: Min</code>.</dd>
+<dt>Not-yet-ready Pods</dt><dd>Newly started Pods are excluded from the average for a while (<code>--horizontal-pod-autoscaler-initial-readiness-delay</code>) and CPU spikes during start-up are ignored, so a scale-up does not immediately trigger another.</dd>
+<dt>HPA + Deployment replicas</dt><dd>Once an HPA manages a Deployment, remove <code>replicas</code> from your manifest (or every <code>kubectl apply</code> will fight the HPA — Day 9's three-way merge in action).</dd>
+</dl>
+
+<h2>VerticalPodAutoscaler</h2>
+<p>VPA is not built in; install it from the autoscaler repo. It watches usage history and recommends (or applies) new <em>requests</em> per container. Because a Pod's requests are immutable, applying a change means <strong>re-creating the Pod</strong> (in-place resize is beta since 1.33 and used by VPA's <code>InPlaceOrRecreate</code> mode where available).</p>
+<pre><code class="lang-yaml">apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  updatePolicy:
+    updateMode: "Off"        # Off = only recommend · Initial = set on creation · Auto/Recreate = evict & re-create
+  resourcePolicy:
+    containerPolicies:
+    - containerName: '*'
+      minAllowed: {cpu: 50m, memory: 64Mi}
+      maxAllowed: {cpu: "2", memory: 2Gi}
+      controlledResources: [cpu, memory]</code></pre>
+<pre><code class="lang-bash">$ kubectl describe vpa api | grep -A12 'Container Recommendations'
+    Lower Bound: cpu 63m  memory 110Mi
+    Target:      cpu 120m memory 180Mi      # what it would set
+    Upper Bound: cpu 900m memory 512Mi</code></pre>
+<div class="callout warn"><div class="ct">HPA and VPA on the same metric = oscillation</div><p>If HPA scales replicas on CPU utilisation (a % of the request) while VPA changes the request, each one's action changes the other's input. Use VPA in <code>Off</code> mode to <em>inform</em> your requests, or let HPA drive CPU and VPA drive memory only (<code>controlledResources: [memory]</code>), or scale HPA on custom metrics like RPS instead.</p></div>
+
+<h2>Scaling nodes</h2>
+<div class="compare">
+<div><h4>Cluster Autoscaler</h4><p>Watches for Pods that are <code>Pending</code> with <code>FailedScheduling: Insufficient …</code>. Asks the cloud's node-group API (ASG, MIG, VMSS) to add a node of that group's fixed type; removes nodes that have been under-utilised for 10 min after draining them. Node groups are pre-defined; it picks among them.</p></div>
+<div><h4>Karpenter</h4><p>Same trigger, but it reads the Pending Pods' requests, affinities and topology constraints and provisions the <em>cheapest instance type that fits</em> directly through the cloud API, in seconds, with no node groups. Consolidates by replacing several small nodes with one larger one. AWS-first, now multi-cloud.</p></div>
+</div>
+<p>Node scaling only works if Pods have accurate requests — the autoscaler reasons about requests, not usage, exactly like the scheduler. And it needs Pods to be evictable: PodDisruptionBudgets (<code>kubectl create pdb api --selector=app=api --min-available=2</code>) tell drains how many replicas must stay up.</p>
+
+<div class="callout linux" data-ref="l03"><div class="ct">Under the hood · Linux</div><p>"CPU utilisation" in the HPA is <code>cpu.stat usage_usec</code> from the container's cgroup, sampled by the kubelet, divided by the request converted to the same units. Memory is <code>memory.current</code> (working set: total minus inactive file cache). Neither number exists at the Pod level in the kernel — the kubelet sums the container cgroups under the Pod's cgroup. This is why a Pod with no CPU request shows <code>&lt;unknown&gt;</code>: the denominator is missing, not the measurement.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li><code>kubectl autoscale deploy X --min=A --max=B --cpu-percent=N</code> is all you need for the classic task; verify with <code>kubectl get hpa</code>.</li>
+<li><code>TARGETS &lt;unknown&gt;</code> → metrics-server missing/unhealthy (<code>kubectl top</code> fails too) or Pods have no CPU request.</li>
+<li>HPA never scales to zero (minReplicas ≥ 1); scale-to-zero needs KEDA or Knative.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+$ kubectl -n kube-system patch deploy metrics-server --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+$ kubectl create deploy php --image=registry.k8s.io/hpa-example --port=80 && kubectl set resources deploy/php --requests=cpu=200m
+$ kubectl expose deploy php --port=80
+$ kubectl autoscale deploy php --cpu-percent=50 --min=1 --max=6
+$ kubectl run load --rm -it --image=busybox:1.36 -- sh -c 'while true; do wget -qO- http://php &gt; /dev/null; done'   # in a second terminal
+$ kubectl get hpa php -w            # TARGETS climb past 50%, REPLICAS follow: 1 → 2 → 4 …
+# stop the load, watch it hold for ~5 min (stabilization) then scale down
+$ kubectl describe hpa php | tail -15     # Events: "New size: 4; reason: cpu resource utilization above target"
+$ kubectl delete hpa php; kubectl delete deploy php; kubectl delete svc php</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>metrics-server → <code>metrics.k8s.io</code> → <code>kubectl top</code> and HPA. Install it; it is not built in.</li>
+<li>HPA: <code>desired = ceil(current × metric/target)</code>, evaluated every 15 s, bounded by min/max and <code>behavior</code> rate limits, with a 5-minute scale-down stabilisation.</li>
+<li>Utilisation is relative to <em>requests</em> — no request, no scaling. Remove <code>replicas</code> from manifests the HPA owns.</li>
+<li>VPA right-sizes requests (by re-creating Pods); do not let it fight the HPA on the same resource.</li>
+<li>Cluster Autoscaler / Karpenter add nodes when Pods are unschedulable — again based on requests.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('hpa', 20, 20, 220, 70, ['HPA api', 'target 70% · min 2 · max 10', 'desired = ceil(cur × util/70)'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('ms', 280, 30, 150, 50, ['metrics-server', 'every 15 s'], { subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.box('dep', 470, 30, 220, 50, ['Deployment api', 'replicas: 2'], { subfs: 10, subcls: 'mono muted' })
+    + S.arrow('a1', 280, 55, 242, 55) + S.arrow('a2', 240, 70, 468, 70, { d: 'M 240 78 L 468 78', cls: 'dashed', label: '/scale', ly: 96 });
+  svg += S.bar('util', 120, 130, 460, 20, { label: 'avg CPU util', v: 200, cls: 'ok' }) + S.text('utilv', 600, 145, '45%', { cls: 'sm mono left' });
+  svg += S.text('tl', 120 + 460 * 0.7, 125, '▼ 70%', { cls: 'xs warnc' });
+  for (let i = 0; i < 10; i++) svg += S.pod(`p${i}`, 60 + i * 66, 200, 'api', { cls: 'ok', w: 54, hidden: i > 1 });
+  svg += S.text('m', 360, 260, '', { cls: 'sm b' }) + S.text('m2', 360, 280, '', { cls: 'xs muted' });
+  const show = (q, n) => { for (let i = 0; i < 10; i++) { if (i < n) q(`#p${i}`).show(); else q(`#p${i}`).add('hid'); } q('#dep').text('Deployment api'); q('#dep text:nth-of-type(2)').text(`replicas: ${n}`); };
+  const util = (q, u) => { q('#util-fill').attr('width', Math.min(460, 460 * u / 100)); q('#utilv').text(u + '%'); q('#util-fill').set(u > 70 ? 'bad' : 'ok'); };
+  Anim.define('hpa-loop', { w: 720, h: 295, title: 'HPA control loop', ms: 2800, svg, steps: [
+    { c: 'Steady state: 2 replicas at 45% of their CPU request. Every 15 s the HPA reads the average from metrics-server; 45 &lt; 70 (and within tolerance) → nothing to do.', on(q){ util(q, 45); } },
+    { c: 'Traffic doubles. Average utilisation climbs to <b>140%</b> — each Pod is using 1.4× its request (allowed, since limits are higher).', on(q){ util(q, 140); q('#m').text('ceil(2 × 140 / 70) = 4'); } },
+    { c: 'The HPA computes <code>ceil(2 × 140/70) = 4</code> and PATCHes the Deployment\'s <code>/scale</code> subresource. The ReplicaSet creates two Pods.', on(q){ show(q, 4); q('#hpa rect').set('hl'); } },
+    { c: 'New Pods take a moment to become Ready; the HPA ignores them until then so their start-up CPU does not trigger another scale-up. Load is now spread over 4: utilisation ≈ 70%.', on(q){ util(q, 72); q('#hpa rect').set(); q('#m').text('within 10% tolerance → hold'); } },
+    { c: 'A bigger spike: 210%. <code>ceil(4 × 210/70) = 12</code>, capped by <b>maxReplicas = 10</b>. The scaleUp policy (100% per 15 s) allows 4 → 8 first, then 8 → 10 on the next tick.', on(q){ util(q, 210); show(q, 8); q('#m').text('12 wanted → capped at 10; policy: 4 → 8 → 10'); } },
+    { c: 'Ten replicas. Utilisation falls to 60%. Fine.', on(q){ util(q, 60); show(q, 10); q('#m').text('at max'); } },
+    { c: 'Traffic drops; utilisation is 20%, formula says 3 replicas. But <b>stabilizationWindowSeconds: 300</b> makes the HPA use the highest recommendation of the last 5 minutes — it holds at 10.', on(q){ util(q, 20); q('#m').text('formula: 3 · window max: 10 → hold'); q('#m2').text('scale-down stabilisation prevents flapping'); } },
+    { c: 'Five quiet minutes later the window has emptied and the scaleDown policy (1 Pod per minute) shrinks the fleet gradually toward 3, never below <b>minReplicas = 2</b>.', on(q){ show(q, 3); util(q, 55); q('#m').text('10 → 9 → … → 3, one per minute'); q('#m2').text(''); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L2 · Linux Namespaces · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l02" data-root="../" data-related="d01,d21,d41">
+<article class="lesson">
+<p class="lead">A namespace wraps a global kernel resource — the process table, the network stack, the mount table, hostnames — so that a group of processes sees its own private copy. Eight of them together are what a "container" is: not a thing the kernel knows about, but a process started inside a fresh set of namespaces. Build one by hand and Docker, containerd and Pods stop being abstractions.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The eight namespace types and what each one isolates</li>
+<li>Seeing namespaces: <code>lsns</code>, <code>/proc/&lt;pid&gt;/ns</code>, <code>nsenter</code></li>
+<li>Creating them: <code>unshare</code>, and the syscalls (<code>clone</code>, <code>unshare</code>, <code>setns</code>) runc uses</li>
+<li>How a Pod shares some namespaces and not others</li>
+<li>User namespaces and why they matter for rootless containers</li>
+</ul></div>
+
+<h2>The eight namespaces</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Namespace</th><th>Isolates</th><th>Inside a container you see…</th><th>Pod-level?</th></tr>
+<tr><td><strong>pid</strong></td><td>Process IDs</td><td>Your own PID 1 and children; nothing else. <code>/proc</code> shows only these.</td><td>Per container (shared with <code>shareProcessNamespace</code>)</td></tr>
+<tr><td><strong>net</strong></td><td>Network stack: interfaces, IPs, routes, iptables, sockets, ports</td><td><code>lo</code> + <code>eth0</code> (a veth), your own routing table and port space</td><td><strong>Shared</strong> across the Pod (localhost)</td></tr>
+<tr><td><strong>mnt</strong></td><td>Mount table</td><td>Your image's rootfs at <code>/</code>, plus volumes</td><td>Per container</td></tr>
+<tr><td><strong>uts</strong></td><td>Hostname and domain name</td><td><code>hostname</code> = Pod name</td><td>Shared</td></tr>
+<tr><td><strong>ipc</strong></td><td>System V IPC, POSIX message queues, shared memory</td><td>Only IPC objects created in the Pod</td><td>Shared</td></tr>
+<tr><td><strong>user</strong></td><td>UID/GID mappings</td><td>Optionally: UID 0 inside maps to an unprivileged UID outside</td><td>Per Pod (<code>hostUsers: false</code>, beta)</td></tr>
+<tr><td><strong>cgroup</strong></td><td>The cgroup hierarchy root</td><td><code>/sys/fs/cgroup</code> rooted at your own cgroup</td><td>Per container</td></tr>
+<tr><td><strong>time</strong></td><td>Monotonic/boot clocks (5.6+)</td><td>Rarely used by runtimes</td><td>—</td></tr>
+</table></div>
+<p><code>hostNetwork: true</code>, <code>hostPID: true</code>, <code>hostIPC: true</code> in a Pod spec mean "do not create that namespace — use the host's". That is why a node-exporter Pod can see all host processes and interfaces.</p>
+
+<h2>Seeing them</h2>
+<pre><code class="lang-bash">$ ls -l /proc/$$/ns/                        # each entry is a symlink to an inode: the namespace's identity
+lrwxrwxrwx cgroup -> 'cgroup:[4026531835]'
+lrwxrwxrwx ipc -> 'ipc:[4026531839]'
+lrwxrwxrwx mnt -> 'mnt:[4026531841]'
+lrwxrwxrwx net -> 'net:[4026531840]'
+lrwxrwxrwx pid -> 'pid:[4026531836]'
+lrwxrwxrwx user -> 'user:[4026531837]'
+lrwxrwxrwx uts -> 'uts:[4026531838]'
+$ sudo lsns                                  # every namespace on the host, with the PID that created it and how many processes are in it
+$ sudo lsns -t net                           # one per pod (plus the host)
+$ PID=$(crictl inspect $(crictl ps -q --name nginx) | jq .info.pid); sudo ls -l /proc/$PID/ns/    # a container's set
+$ sudo readlink /proc/$PID/ns/net /proc/1/ns/net     # different inode numbers = different network stacks</code></pre>
+<p>Two processes are in the same namespace if their <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> links point to the same inode. All containers in a Pod share the <code>net</code> inode of the pause container.</p>
+
+<h2>Building a container by hand</h2>
+<figure data-anim="unshare"></figure>
+<pre><code class="lang-bash"># 1. new pid + mount + uts + ipc namespaces, with a forked child as PID 1
+$ sudo unshare --pid --fork --mount --uts --ipc --mount-proc bash
+# inside:
+# echo $$                    → 1            (PID namespace: I am init)
+# ps -ef                     → just bash    (--mount-proc mounted a fresh /proc for this pid ns)
+# hostname box; hostname     → box          (UTS namespace: the host is unaffected)
+# ip addr                    → host's NICs  (we did NOT unshare net)
+# exit
+$ hostname                   # unchanged on the host
+# 2. add a network namespace and wire it (see the Networking page for the veth part)
+$ sudo unshare --net bash -c 'ip addr'      # only lo, and it is DOWN
+# 3. a root filesystem: mount a directory as / (chroot is the crude version; runc uses pivot_root)
+$ mkdir -p /tmp/rootfs && docker export $(docker create alpine) | tar -C /tmp/rootfs -xf -
+$ sudo unshare --pid --fork --mount --uts --mount-proc chroot /tmp/rootfs /bin/sh
+# / # ps; cat /etc/os-release      → Alpine, one process
+# 4. enter an existing container's namespaces (this is what docker exec / kubectl exec do)
+$ sudo nsenter -t $PID -n ip addr             # only the network namespace: see the pod's eth0 from the host
+$ sudo nsenter -t $PID -p -m -u -i -n -- /bin/sh     # all of them: effectively "exec into" it
+$ sudo nsenter -t $PID -n ss -tlnp              # what is listening inside the pod — with host tools, no shell needed in the image</code></pre>
+<p>That last trick is how you debug a distroless container with no shell: enter only its network namespace from the node and use the node's <code>ss</code>, <code>curl</code>, <code>tcpdump</code>. It is also exactly what <code>kubectl debug --target</code> automates.</p>
+
+<h2>The syscalls (what runc actually does)</h2>
+<ul>
+<li><code>clone(CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC …)</code> — create the child <em>in</em> new namespaces. runc's <code>init</code> process is born this way.</li>
+<li><code>unshare(flags)</code> — move the <em>calling</em> process into new namespaces (the <code>unshare</code> command).</li>
+<li><code>setns(fd, type)</code> — join an existing namespace by opening <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> (the <code>nsenter</code> command; how app containers join the pause container's net namespace).</li>
+<li>Then: mount the rootfs, <code>pivot_root</code> into it, mount <code>/proc</code>, <code>/sys</code>, <code>/dev</code>, apply cgroups, capabilities, seccomp, and finally <code>execve</code> the entrypoint.</li>
+</ul>
+<pre><code class="lang-bash">$ sudo strace -f -e trace=clone,clone3,unshare,setns,pivot_root,execve docker run --rm alpine true 2&gt;&1 | grep -E 'CLONE_NEW|pivot_root|execve' | head</code></pre>
+
+<h2>Namespaces in a Pod</h2>
+<figure data-anim="pod-ns"></figure>
+<p>The kubelet asks the runtime for a <em>sandbox</em>: the pause container is created with new net, uts and ipc namespaces (and pid, if shared). Each app container is then created with <code>setns</code> into the sandbox's net/uts/ipc, but with its <em>own</em> mnt (its image), pid (unless shared) and cgroup namespaces. Consequences you have met: one IP per Pod, <code>localhost</code> between containers, separate filesystems, separate <code>ps</code> views, and a Pod IP that survives container restarts because the pause process never restarts.</p>
+
+<h2>User namespaces</h2>
+<p>Without a user namespace, UID 0 in a container <em>is</em> UID 0 on the host kernel — only capabilities and seccomp stand between a container escape and root. A user namespace maps container UID 0 to an unprivileged host UID (e.g. 100000), so even a full escape lands as nobody. Docker's <code>userns-remap</code> and rootless Podman use it; Kubernetes supports it per Pod with <code>hostUsers: false</code> (beta since 1.30, needs runtime + filesystem support). Until it is universal, <code>runAsNonRoot</code> (<a href="../lessons/d41-pod-security.html">Day 41</a>) is the practical defence.</p>
+<pre><code class="lang-bash">$ unshare --user --map-root-user bash        # no sudo needed: you are "root" in a new user namespace
+# id                    → uid=0(root) — but only here
+# cat /proc/self/uid_map → 0 1000 1  (container 0 ↔ host 1000)
+# touch /etc/x           → Permission denied: the kernel checks with the mapped host UID</code></pre>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ sudo lsns -t pid -t net | head
+$ sudo unshare --pid --fork --uts --mount --mount-proc bash -c 'hostname inner; echo "pid=$$ host=$(hostname)"; ps -ef'
+$ hostname                                                              # unchanged
+$ docker run -d --name n nginx; PID=$(docker inspect -f '{{.State.Pid}}' n)
+$ sudo readlink /proc/$PID/ns/{pid,net,mnt} ; readlink /proc/$$/ns/{pid,net,mnt}      # all different
+$ sudo nsenter -t $PID -n ss -tlnp                                      # :80 inside the container, seen from the host
+$ sudo nsenter -t $PID -p -m -- ps -ef                                  # nginx as PID 1
+$ docker run -d --name side --network container:n alpine sleep 3600; SP=$(docker inspect -f '{{.State.Pid}}' side)
+$ sudo readlink /proc/$PID/ns/net /proc/$SP/ns/net                      # SAME inode: shared network ns (the Pod model)
+$ sudo readlink /proc/$PID/ns/mnt /proc/$SP/ns/mnt                      # different: own filesystems
+$ docker rm -f n side</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Namespaces give a process group a private view of PIDs, network, mounts, hostname, IPC, users, cgroups. A container is a process in a fresh set of them.</li>
+<li><code>/proc/&lt;pid&gt;/ns/*</code> identifies namespaces; same inode = same namespace. <code>lsns</code>, <code>unshare</code>, <code>nsenter</code> are the tools.</li>
+<li>Pods share net/uts/ipc via the pause container and keep mnt/pid per container; <code>hostNetwork</code>/<code>hostPID</code> opt out of isolation.</li>
+<li><code>nsenter -t PID -n</code> lets you debug a container's network with host tools — no shell in the image required.</li>
+<li>User namespaces map container root to an unprivileged host UID; until they are default, run as non-root.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let s1 = S.zone('host', 20, 20, 320, 280, 'host namespaces')
+    + S.term('hv', 35, 45, 290, 110, ['pid: 1 systemd, 812 sshd, 2231 bash', 'net: eth0 10.0.0.5, docker0', 'mnt: / ext4, /boot, /home', 'uts: hostname = node-1'], { fs: 9 })
+    + S.zone('new', 380, 20, 320, 280, 'new namespaces (unshare)', { cls: 'hid' })
+    + S.term('nv', 395, 45, 290, 110, ['pid: —', 'net: —', 'mnt: —', 'uts: —'], { fs: 9, gcls: 'hid' })
+    + S.pod('bash', 180, 200, 'bash 2231', { w: 90, cls: 'ok' })
+    + S.text('cmd', 360, 330, '', { cls: 'sm mono b' }) + S.text('m', 360, 285, '', { cls: 'sm b' });
+  Anim.define('unshare', { w: 720, h: 340, title: 'unshare, step by step', ms: 2800, svg: s1, steps: [
+    { c: 'A bash process on the host sees the host\'s process table, network, mounts and hostname — because it is in the host\'s namespaces.', on(q){} },
+    { c: '<code>unshare --pid --fork --mount --uts --mount-proc bash</code>: the kernel creates new pid, mnt and uts namespaces and forks a child bash into them.', on(q){ q('#new,#nv').show(); q('#bash').to(540, 200).text('bash (PID 1)'); q('#cmd').text('unshare --pid --fork --mount --uts --mount-proc bash'); } },
+    { c: 'Inside: <code>echo $$</code> → 1. <code>ps</code> shows one process, because <code>--mount-proc</code> mounted a fresh <code>/proc</code> that reflects the new pid namespace.', on(q){ q('#nv-l0').text('pid: 1 bash   (own /proc)').style('fill', 'var(--green)'); q('#nv-l2').text('mnt: copy of host table + new /proc').style('fill', 'var(--green)'); q('#m').text('private process view'); } },
+    { c: '<code>hostname box</code> changes the name in the new uts namespace only. The host still says node-1.', on(q){ q('#nv-l3').text('uts: hostname = box').style('fill', 'var(--green)'); } },
+    { c: 'We did <b>not</b> unshare <code>net</code>, so <code>ip addr</code> still shows eth0 — the process shares the host network stack. Add <code>--net</code> and it would see only a down loopback. Namespaces are independent; pick the ones you need.', on(q){ q('#nv-l1').text('net: (shared with host) eth0 10.0.0.5').style('fill', 'var(--amber)'); q('#m').text('each namespace type is opt-in'); } },
+    { c: 'Add <code>chroot</code>/<code>pivot_root</code> into an image\'s files, a cgroup, dropped capabilities and a seccomp filter — and you have re-implemented <code>docker run</code>.', on(q){ q('#nv-l2').text('mnt: / = alpine rootfs (pivot_root)'); q('#m').text('namespaces + rootfs + cgroup + caps = container'); } },
+  ]});
+
+  let s2 = S.zone('pod', 20, 20, 680, 280, 'pod (sandbox)')
+    + S.box('pause', 290, 45, 140, 40, ['pause', 'creates net·uts·ipc'], { subfs: 9, subcls: 'muted', cls: 'soft' })
+    + S.term('shared', 200, 100, 320, 60, ['shared: net:[402653…1]  uts:[…2]  ipc:[…3]', '  eth0 10.244.1.9 · hostname api-7f9c'], { fs: 9 })
+    + S.box('a', 40, 190, 200, 90, ['container app', 'mnt: myapi image', 'pid: own (PID 1 = api)', 'setns → shared net/uts/ipc'], { subfs: 8.5, subcls: 'mono muted', cls: 'ok' })
+    + S.box('b', 480, 190, 200, 90, ['container proxy', 'mnt: envoy image', 'pid: own (PID 1 = envoy)', 'setns → shared net/uts/ipc'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.arrow('j1', 140, 190, 240, 160, { d: 'M 140 190 L 240 162', cls: 'hid' }) + S.arrow('j2', 580, 190, 480, 160, { d: 'M 580 190 L 480 162', cls: 'hid' })
+    + S.text('m', 360, 315, '', { cls: 'sm b' });
+  Anim.define('pod-ns', { w: 720, h: 330, title: 'Namespaces in a Pod', ms: 2800, svg: s2, steps: [
+    { c: 'The kubelet asks containerd for a <b>sandbox</b>. containerd starts the pause process with <code>clone(CLONE_NEWNET|NEWUTS|NEWIPC)</code>: three fresh namespaces owned by a process that does nothing.', on(q){ q('#pause rect').set('hl'); } },
+    { c: 'The CNI plugin configures the new net namespace: a veth, the Pod IP, routes. The hostname is set in the uts namespace.', on(q){ q('#shared-l1').style('fill', 'var(--green)'); } },
+    { c: 'Container <code>app</code> is created with <b>its own</b> mnt namespace (the myapi image) and pid namespace, then <code>setns()</code> into the pause process\'s net, uts and ipc namespaces.', on(q){ q('#j1').show().set('ok'); q('#a rect').set('ok'); } },
+    { c: 'Container <code>proxy</code> does the same with its own image and PID 1. Both now share one IP and port space: <code>localhost:15001</code> works between them; each has a private filesystem and process table.', on(q){ q('#j2').show().set('ok'); q('#b rect').set('cy'); q('#m').text('shared: net · uts · ipc — private: mnt · pid · cgroup'); } },
+    { c: 'If <code>app</code> crashes and restarts, it re-joins the same namespaces — same IP, same hostname — because pause never died. Delete the Pod and pause exits; the namespaces disappear with it.', on(q){ q('#m').text('pause anchors the pod\'s identity'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

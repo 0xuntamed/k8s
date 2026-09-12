@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 22 · Pod Lifecycle, Termination & Errors · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d22" data-root="../" data-linux="l01" data-related="d04,d13,d23">
+<article class="lesson">
+<p class="lead">Every STATUS you see in <code>kubectl get pods</code> is a summary of three things: the Pod's <em>phase</em>, each container's <em>state</em>, and the kubelet's <em>reason</em> for that state. Once you can read them, "CrashLoopBackOff" stops being a mystery and becomes "the app exited, exit code N, here is its last log". This lesson also covers what really happens when a Pod is deleted — a 30-second dance between endpoints, hooks and signals that decides whether your users see errors during every deploy.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Pod phases, container states, and Pod conditions — and how <code>kubectl</code> summarises them</li>
+<li><code>restartPolicy</code> and the exponential back-off behind CrashLoopBackOff</li>
+<li><code>imagePullPolicy</code> defaults and the <code>:latest</code> trap</li>
+<li>The termination sequence: deletion → endpoints → preStop → SIGTERM → grace period → SIGKILL</li>
+<li>Lifecycle hooks and a decoder for every common error status</li>
+</ul></div>
+
+<h2>Phases, states and conditions</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Pod phase (<code>status.phase</code>)</th><th>Meaning</th></tr>
+<tr><td><code>Pending</code></td><td>Accepted, but not all containers are running: waiting for scheduling, image pulls, volume mounts, init containers.</td></tr>
+<tr><td><code>Running</code></td><td>Bound to a node, at least one container running or (re)starting.</td></tr>
+<tr><td><code>Succeeded</code></td><td>All containers exited 0 and will not restart (Jobs, <code>restartPolicy: Never/OnFailure</code>).</td></tr>
+<tr><td><code>Failed</code></td><td>All containers terminated, at least one with non-zero exit, no restarts coming. Also <code>Evicted</code> Pods.</td></tr>
+<tr><td><code>Unknown</code></td><td>The node stopped reporting (kubelet down or unreachable).</td></tr>
+</table></div>
+<p>Each container has a <strong>state</strong>: <code>Waiting</code> (with a reason: ContainerCreating, ImagePullBackOff, CrashLoopBackOff…), <code>Running</code> (since when), or <code>Terminated</code> (exit code, reason, finished at). <code>kubectl get pods</code> STATUS shows the phase unless a container has a more specific Waiting reason, in which case it shows that. <code>describe</code> also shows <strong>conditions</strong>: <code>PodScheduled</code>, <code>Initialized</code>, <code>ContainersReady</code>, <code>Ready</code> (all containers ready and readiness gates satisfied — this is what puts the Pod into Service endpoints).</p>
+<pre><code class="lang-bash">$ kubectl get pod api -o jsonpath='{.status.phase}{"\n"}{.status.containerStatuses[*].state}{"\n"}'
+$ kubectl get pod api -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}{"\n"}'</code></pre>
+
+<h2>restartPolicy and back-off</h2>
+<pre><code class="lang-yaml">spec:
+  restartPolicy: Always      # Always (default; required by Deployments) · OnFailure · Never</code></pre>
+<p>The policy is Pod-wide and applies to app containers (init containers use it too; native sidecars override with their own). It is enforced by the <strong>kubelet on the node</strong> — the control plane is not involved, which is why containers restart even while the API server is down.</p>
+<figure data-anim="crashloop"></figure>
+<p>Back-off starts at 10 s and doubles — 10, 20, 40, 80, 160 — capped at 300 s, and <strong>resets</strong> after a container has run for 10 minutes without exiting. RESTARTS in <code>get pods</code> counts them; <code>describe</code> shows <code>Last State: Terminated, Reason, Exit Code</code>; <code>logs --previous</code> shows the crashed container's output.</p>
+<div class="tbl-wrap"><table>
+<tr><th>Exit code</th><th>Typical meaning</th></tr>
+<tr><td>0</td><td>Clean exit. With <code>restartPolicy: Always</code> it is restarted anyway (a container that "finishes" under a Deployment is a bug — use a Job).</td></tr>
+<tr><td>1, 2, 3…</td><td>Application error. Read the logs.</td></tr>
+<tr><td>126 / 127</td><td>Command not executable / not found — wrong <code>command</code>, missing binary in a slim image.</td></tr>
+<tr><td>137</td><td>SIGKILL (128+9): OOMKilled, or grace period expired during termination.</td></tr>
+<tr><td>139</td><td>SIGSEGV (128+11): the process crashed.</td></tr>
+<tr><td>143</td><td>SIGTERM (128+15): asked to stop and did so — normal during a rollout.</td></tr>
+</table></div>
+
+<h2>imagePullPolicy</h2>
+<pre><code class="lang-yaml">containers:
+- name: api
+  image: myapi:2.1
+  imagePullPolicy: IfNotPresent    # Always · IfNotPresent · Never</code></pre>
+<ul>
+<li>Default is <code>IfNotPresent</code> — <strong>except</strong> when the tag is <code>:latest</code> or omitted, where the default is <code>Always</code>.</li>
+<li><code>Always</code> still uses the local cache when the registry's digest matches; it only guarantees a <em>check</em>, not a download.</li>
+<li><code>Never</code> fails if the image is not already on the node — useful with <code>kind load docker-image</code>.</li>
+<li>The trap: you push a new build to <code>myapi:2.1</code> (mutable tag) and Pods on nodes that already cached 2.1 keep running the old bits. Use immutable tags or digests; <code>kubectl rollout restart</code> does not help if the policy is IfNotPresent and the node has the old layer.</li>
+</ul>
+
+<h2>Termination, step by step</h2>
+<figure data-anim="termination"></figure>
+<ol class="steps">
+<li><strong>Deletion requested.</strong> <code>kubectl delete</code>, a rollout, an eviction, a scale-down. The API server sets <code>metadata.deletionTimestamp</code> and the Pod shows <code>Terminating</code>. It is <em>not</em> removed yet.</li>
+<li><strong>Two things happen in parallel.</strong> The EndpointSlice controller removes the Pod from Service endpoints (kube-proxy and ingress controllers update within a second or so), <em>and</em> the kubelet begins shutting containers down. The race between these is why in-flight requests can fail on a naive app.</li>
+<li><strong><code>preStop</code> hook</strong> runs, if defined — inside the container, synchronously. Its duration counts against the grace period.</li>
+<li><strong>SIGTERM</strong> to PID 1 of each container (Day 4: exec form matters). The app should stop accepting new connections, finish in-flight work, and exit.</li>
+<li><strong>Grace period</strong> — <code>terminationGracePeriodSeconds</code>, default 30 s, counted from step 2. If the container exits earlier, done.</li>
+<li><strong>SIGKILL</strong> when the period expires. Exit code 137.</li>
+<li><strong>Pod object removed</strong> from the API once all containers are gone (and finalizers, if any, are cleared).</li>
+</ol>
+<pre><code class="lang-yaml">spec:
+  terminationGracePeriodSeconds: 60
+  containers:
+  - name: api
+    image: myapi:2.1
+    lifecycle:
+      postStart:                          # runs right after the container starts (no ordering guarantee vs ENTRYPOINT)
+        exec: {command: ["sh", "-c", "echo started &gt;&gt; /tmp/log"]}
+      preStop:                            # runs before SIGTERM; typical: sleep to let endpoints propagate
+        exec: {command: ["sh", "-c", "sleep 5"]}
+      # httpGet and sleep (1.30+) are also valid hook handlers</code></pre>
+<div class="callout tip"><div class="ct">The 5-second sleep trick</div><p>A <code>preStop: sleep 5</code> gives kube-proxy and load balancers time to remove the Pod from rotation <em>before</em> the app receives SIGTERM. Combined with an app that handles SIGTERM gracefully, this is what makes rolling updates truly zero-downtime. <code>kubectl delete pod x --grace-period=0 --force</code> skips all of this and removes the object immediately (the container may briefly keep running).</p></div>
+
+<div class="callout linux" data-ref="l01"><div class="ct">Under the hood · Linux</div><p>The kubelet asks containerd to stop the container; containerd's shim sends <code>SIGTERM</code> to the container's PID 1 (its init process in the PID namespace), waits <code>timeout</code> seconds, then sends <code>SIGKILL</code>. The kernel then tears down the namespaces as the last process exits. A PID 1 that ignores SIGTERM — a shell in shell-form CMD, or a Java app without a shutdown hook — cannot be stopped by anything but SIGKILL, which is exactly why "every deploy takes 30 seconds longer than it should" is so common. <code>kill -TERM 1</code> from <code>kubectl exec</code> is a quick way to test whether your app handles it.</p></div>
+
+<h2>Error decoder</h2>
+<div class="tbl-wrap"><table>
+<tr><th>STATUS</th><th>What it means</th><th>First thing to check</th></tr>
+<tr><td><code>Pending</code> (no node)</td><td>Unschedulable, or scheduler down</td><td><code>describe</code> → FailedScheduling reason</td></tr>
+<tr><td><code>ContainerCreating</code></td><td>Pulling image, mounting volumes, CNI setting up network</td><td><code>describe</code> events: FailedMount, FailedCreatePodSandBox (CNI), pull progress</td></tr>
+<tr><td><code>ErrImagePull</code> / <code>ImagePullBackOff</code></td><td>Pull failed (wrong name/tag, private registry, no network); BackOff = retrying with delay</td><td>Image name typo, <code>imagePullSecrets</code>, node can reach registry?</td></tr>
+<tr><td><code>CreateContainerConfigError</code></td><td>Referenced ConfigMap/Secret key missing</td><td><code>describe</code>: "configmap X not found" / "key Y not found"</td></tr>
+<tr><td><code>CreateContainerError</code></td><td>Runtime could not create: bad command, missing binary at exec</td><td><code>describe</code> message; exit code 127</td></tr>
+<tr><td><code>CrashLoopBackOff</code></td><td>App keeps exiting; kubelet backing off</td><td><code>logs --previous</code>, exit code in describe</td></tr>
+<tr><td><code>OOMKilled</code></td><td>Memory limit exceeded (exit 137)</td><td>Raise limit / fix leak (Day 19)</td></tr>
+<tr><td><code>Error</code></td><td>Container exited non-zero and policy is Never/OnFailure</td><td><code>logs</code></td></tr>
+<tr><td><code>Completed</code></td><td>Exited 0 under Never/OnFailure — normal for Jobs</td><td>Nothing, unless it was supposed to be a service</td></tr>
+<tr><td><code>Init:N/M</code>, <code>Init:Error</code>, <code>PodInitializing</code></td><td>Init containers running / failed / done, apps starting</td><td><code>logs -c &lt;init&gt;</code></td></tr>
+<tr><td><code>Running</code> but <code>0/1</code> READY</td><td>Readiness probe failing → not in endpoints</td><td>Probe config vs app (Day 23)</td></tr>
+<tr><td><code>Evicted</code></td><td>Kubelet evicted for node pressure</td><td><code>describe</code> message; node conditions</td></tr>
+<tr><td><code>Terminating</code> (stuck)</td><td>Grace period + finalizers, or node gone</td><td>Wait; node down → <code>--force</code>; finalizers → patch</td></tr>
+<tr><td><code>Unknown</code> / <code>NodeLost</code></td><td>Node not reporting</td><td><code>get nodes</code>, kubelet on the node (Day 58)</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Pod keeps restarting" → <code>logs --previous</code> + exit code. Fix the cause (missing env, wrong command, wrong port), not the symptom.</li>
+<li>"Reduce time to terminate" → <code>terminationGracePeriodSeconds</code>; "run a command before shutdown" → <code>lifecycle.preStop</code>.</li>
+<li>Pod stuck Terminating in the exam is usually a dead node → <code>kubectl delete pod x --force --grace-period=0</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl run boom --image=busybox --command -- sh -c 'echo booting; sleep 3; echo failing; exit 2'
+$ kubectl get pod boom -w                 # Running → Error → CrashLoopBackOff, RESTARTS climbing, growing gaps
+$ kubectl logs boom --previous; kubectl describe pod boom | grep -A4 'Last State'
+$ kubectl run once --image=busybox --restart=Never --command -- sh -c 'echo hi; exit 0'; sleep 5; kubectl get pod once   # Completed
+$ kubectl run cfg --image=nginx --env=X=1 $do | sed 's/value: "1"/valueFrom: {configMapKeyRef: {name: nope, key: k}}/' | kubectl apply -f -
+$ kubectl get pod cfg                     # CreateContainerConfigError
+# termination timing
+$ kubectl run slow --image=nginx $do | sed '/spec:/a\  terminationGracePeriodSeconds: 5' | kubectl apply -f -
+$ kubectl run shell --image=busybox --command -- sleep 3600      # sleep ignores SIGTERM
+$ time kubectl delete pod slow            # ~1 s: nginx handles SIGTERM
+$ time kubectl delete pod shell           # ~30 s: waits the full grace period, then SIGKILL
+$ kubectl delete pod boom once cfg $now</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>STATUS = phase, unless a container's Waiting reason is more specific. Conditions (<code>Ready</code>) decide endpoint membership.</li>
+<li>Restarts are the kubelet's doing: back-off 10 s → 300 s, reset after 10 min stable. <code>logs --previous</code> + exit code diagnose them.</li>
+<li><code>imagePullPolicy</code> defaults to IfNotPresent, or Always for <code>:latest</code>. Mutable tags cause stale Pods.</li>
+<li>Termination: deletionTimestamp → endpoints removed ∥ preStop → SIGTERM → grace (30 s) → SIGKILL. Handle SIGTERM and add a short preStop sleep.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* crashloop backoff */
+  let s1 = S.text('t', 360, 22, 'kubelet restart back-off for one container (restartPolicy: Always)', { cls: 'sm muted' });
+  const waits = [0, 10, 20, 40, 80];
+  let x = 40;
+  const runs = [];
+  waits.forEach((w, i) => { const ww = w * 1.6; if (w) { s1 += S.box(`w${i}`, x, 60, ww, 28, `${w}s`, { fs: 9, cls: 'warn', hidden: true }); x += ww + 4; } s1 += S.box(`r${i}`, x, 60, 34, 28, 'run', { fs: 9, cls: 'ok', hidden: true }); runs.push(x); x += 38; });
+  s1 += S.term('st', 40, 120, 640, 120, ['$ kubectl get pod api', 'NAME  READY  STATUS   RESTARTS  AGE', 'api   0/1    Running  0         3s', '', 'Last State: -', 'Exit Code:  -'], { fs: 10 });
+  s1 += S.text('m', 360, 275, '', { cls: 'sm b' });
+  const line = (q, st, r, age, last, code) => { q('#st-l2').text(`api   0/1    ${st.padEnd(18)} ${String(r).padEnd(9)} ${age}`); q('#st-l4').text('Last State: ' + last); q('#st-l5').text('Exit Code:  ' + code); };
+  Anim.define('crashloop', { w: 720, h: 290, title: 'CrashLoopBackOff', ms: 2500, svg: s1, steps: [
+    { c: 'The container starts, runs for 3 seconds, and exits with code 2 (a config error).', on(q){ q('#r0').show(); line(q, 'Running', 0, '3s', '-', '-'); } },
+    { c: 'Policy is Always, so the kubelet restarts it — but first waits <b>10 s</b>. STATUS shows <code>CrashLoopBackOff</code> during the wait; RESTARTS becomes 1 when it starts again.', on(q){ q('#w1,#r1').show(); line(q, 'CrashLoopBackOff', 1, '18s', 'Terminated (Error)', '2'); q('#st-l2').style('fill', 'var(--amber)'); } },
+    { c: 'Same failure, so the wait doubles: 20 s, then 40 s, then 80 s…', on(q){ q('#w2,#r2,#w3,#r3').show(); line(q, 'CrashLoopBackOff', 3, '1m30s', 'Terminated (Error)', '2'); } },
+    { c: '…up to a cap of 300 s between attempts. Meanwhile <code>kubectl logs api --previous</code> shows what the last run printed before exiting.', on(q){ q('#w4,#r4').show(); line(q, 'CrashLoopBackOff', 4, '3m', 'Terminated (Error)', '2'); q('#st-l4').style('fill', 'var(--red)'); } },
+    { c: 'You fix the config. On the next attempt the container stays up. After <b>10 minutes</b> of running, the back-off counter resets to zero — RESTARTS keeps its count, but future crashes start again at 10 s.', on(q){ q('#r4').width(120).text('running…'); line(q, 'Running', 5, '14m', 'Terminated (Error)', '2'); q('#st-l2').style('fill', 'var(--green)'); q('#m').text('READY 1/1 · back-off reset after 10 min stable'); q('#st-l2').text('api   1/1    Running            5         14m'); } },
+  ]});
+
+  /* termination */
+  let s2 = S.text('t', 20, 24, 'kubectl delete pod api      (terminationGracePeriodSeconds: 30)', { cls: 'sm mono left' });
+  const lane = (id, y, label) => S.text(id + 'l', 20, y + 18, label, { cls: 'xs left muted' });
+  s2 += lane('a', 50, 'API server') + lane('e', 100, 'Endpoints / kube-proxy') + lane('k', 150, 'kubelet → container') + lane('p', 200, 'process (PID 1)');
+  [0, 5, 10, 15, 20, 25, 30].forEach((t, i) => s2 += `<line x1="${180 + i * 80}" y1="40" x2="${180 + i * 80}" y2="240" stroke="var(--border)" stroke-dasharray="3 4"/>` + S.text(`tk${i}`, 180 + i * 80, 255, t + 's', { cls: 'xs muted mono' }));
+  const B = (id, x, y, w, label, cls) => S.box(id, x, y, w, 30, label, { fs: 9.5, cls, hidden: true });
+  s2 += B('a1', 180, 50, 150, 'deletionTimestamp set → Terminating', 'hl');
+  s2 += B('e1', 180, 100, 90, 'removed from EndpointSlice', 'cy') + B('e2', 275, 100, 100, 'iptables updated (~1s)', 'cy');
+  s2 += B('k1', 180, 150, 80, 'preStop: sleep 5', 'warn') + B('k2', 262, 150, 60, 'SIGTERM', 'bad') + B('k3', 660, 150, 40, 'KILL', 'bad');
+  s2 += B('p1', 262, 200, 120, 'drain in-flight, exit 0', 'ok') + B('p2', 262, 200, 440, 'ignores SIGTERM…', 'bad');
+  s2 += S.text('m', 360, 285, '', { cls: 'sm b' });
+  Anim.define('termination', { w: 720, h: 300, title: 'Pod termination timeline', ms: 2800, svg: s2, steps: [
+    { c: '<b>0 s</b>: the API server marks the Pod for deletion. It shows <code>Terminating</code> but still exists. The grace-period clock starts.', on(q){ q('#a1').show(); } },
+    { c: 'In parallel, the endpoint controller drops the Pod from the Service and kube-proxy rewrites iptables on every node — this takes up to a second or two. New connections stop arriving… soon.', on(q){ q('#e1,#e2').show(); } },
+    { c: 'Also in parallel, the kubelet runs the <b>preStop</b> hook: <code>sleep 5</code>. This is deliberate padding so step 2 finishes <i>before</i> the app is told to stop.', on(q){ q('#k1').show(); } },
+    { c: '<b>5 s</b>: preStop done → <b>SIGTERM</b> to PID 1. A well-behaved app stops listening, finishes in-flight requests, closes the DB pool and exits 0 within a couple of seconds.', on(q){ q('#k2,#p1').show(); q('#m').text('graceful: containers gone at ~8 s, Pod object removed'); } },
+    { c: 'A badly behaved PID 1 (shell-form CMD, no signal handler) ignores SIGTERM. The kubelet waits for the rest of the 30 s…', on(q){ q('#p1').add('hid'); q('#p2').show(); q('#m').text('ignoring SIGTERM: nothing happens for 25 more seconds'); } },
+    { c: '<b>30 s</b>: grace period over → <b>SIGKILL</b>. Exit code 137. Connections drop mid-request, and every rollout of this Deployment takes 30 s per Pod for no reason.', on(q){ q('#k3').show(); q('#m').text('SIGKILL at 30 s, exit 137 — fix: exec form + handle SIGTERM'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

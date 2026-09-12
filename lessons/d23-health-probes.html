@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 23 · Health Probes · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d23" data-root="../" data-related="d12,d22,d10">
+<article class="lesson">
+<p class="lead">A process that is running is not necessarily working. It may be deadlocked, still loading a model, or unable to reach its database. Probes let the kubelet ask the application itself, on a schedule, and act on the answer — and there are three of them because there are three different questions: <em>should I restart you?</em> (liveness), <em>should I send you traffic?</em> (readiness), and <em>have you finished starting?</em> (startup). Confusing them causes outages; using them well is what makes rolling updates invisible.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The three probes, what each one's failure triggers, and why they must ask different questions</li>
+<li>Probe mechanisms: httpGet, tcpSocket, exec, grpc</li>
+<li>Timing fields: initialDelay, period, timeout, success/failure thresholds</li>
+<li>The classic mistakes: liveness that checks dependencies, readiness that never passes, missing startup probes on slow apps</li>
+</ul></div>
+
+<h2>Three probes, three questions</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Probe</th><th>Question</th><th>On failure (after failureThreshold)</th><th>Typical check</th></tr>
+<tr><td><strong>liveness</strong></td><td>Is the process irrecoverably broken?</td><td>Kubelet <strong>kills and restarts</strong> the container (per restartPolicy)</td><td>A trivial endpoint proving the event loop responds: <code>/healthz</code> → 200</td></tr>
+<tr><td><strong>readiness</strong></td><td>Can it serve requests right now?</td><td>Pod marked <strong>NotReady</strong> → removed from Service endpoints. No restart.</td><td><code>/ready</code>: warmed up, dependencies reachable, not overloaded, not draining</td></tr>
+<tr><td><strong>startup</strong></td><td>Has it finished starting?</td><td>Kill and restart. <strong>While it runs, liveness and readiness are disabled.</strong></td><td>Same as liveness, with a generous failureThreshold × period budget</td></tr>
+</table></div>
+<figure data-anim="probes"></figure>
+
+<div class="callout danger"><div class="ct">The mistake that causes cascading outages</div><p>A liveness probe that checks <em>dependencies</em> ("can I reach the database?") turns a database blip into a fleet-wide restart storm: every replica fails liveness, every replica is killed, the restarts add load, the database recovers slower. <strong>Liveness must only test the process itself.</strong> Dependency checks belong in <em>readiness</em>, where failure just pauses traffic to that Pod until the dependency returns.</p></div>
+
+<h2>The spec</h2>
+<pre><code class="lang-yaml">containers:
+- name: api
+  image: myapi:2.1
+  ports: [{name: http, containerPort: 8080}]
+  startupProbe:
+    httpGet: {path: /healthz, port: http}
+    periodSeconds: 5
+    failureThreshold: 60          # up to 5 min to start before the first restart
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders: [{name: X-Probe, value: liveness}]
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3           # 3 × 10 s = 30 s of failures → restart
+  readinessProbe:
+    httpGet: {path: /ready, port: http}
+    periodSeconds: 5
+    successThreshold: 1
+    failureThreshold: 2           # out of rotation after 10 s of failures</code></pre>
+<dl class="kv">
+<dt>initialDelaySeconds</dt><dd>Wait before the first probe (default 0). Prefer a startup probe over a large initial delay — the delay is fixed, the startup probe adapts.</dd>
+<dt>periodSeconds</dt><dd>How often (default 10).</dd>
+<dt>timeoutSeconds</dt><dd>How long a single probe may take (default 1 — often too short for HTTP under load).</dd>
+<dt>successThreshold</dt><dd>Consecutive successes to be considered healthy after failing (default 1; must be 1 for liveness and startup).</dd>
+<dt>failureThreshold</dt><dd>Consecutive failures before acting (default 3).</dd>
+<dt>terminationGracePeriodSeconds</dt><dd>Can be set per liveness/startup probe to override the Pod's value for probe-triggered kills.</dd>
+</dl>
+
+<h2>Mechanisms</h2>
+<div class="grid-2">
+<div class="card"><h4>httpGet</h4><p>GET to <code>scheme://podIP:port/path</code>. 200–399 = success. Add headers for auth or to tell probes apart in logs. <code>scheme: HTTPS</code> skips cert verification.</p></div>
+<div class="card"><h4>tcpSocket</h4><p>Can the kubelet open a TCP connection to the port? Cheap; proves the listener exists, not that it works. Good for databases and non-HTTP services.</p></div>
+<div class="card"><h4>exec</h4><p>Run a command in the container; exit 0 = success. Flexible but heavy (a process per probe) and needs the binary in the image. <code>cat /tmp/healthy</code>, <code>pg_isready</code>, <code>redis-cli ping</code>.</p></div>
+<div class="card"><h4>grpc</h4><p>Calls the standard gRPC Health service (<code>grpc.health.v1.Health/Check</code>) on the port; <code>service</code> selects a sub-service. Needs the app to implement the health protocol.</p></div>
+</div>
+<pre><code class="lang-yaml">livenessProbe:
+  exec:
+    command: ["redis-cli", "ping"]
+readinessProbe:
+  tcpSocket: {port: 5432}
+livenessProbe:
+  grpc: {port: 9090, service: ""}</code></pre>
+
+<h2>How probes interact with everything else</h2>
+<ul>
+<li><strong>Services</strong> only route to Pods whose <code>Ready</code> condition is true. Readiness is your traffic switch. A Pod with no readiness probe is Ready as soon as its containers start — before the app is listening.</li>
+<li><strong>Rolling updates</strong> wait for new Pods to be Ready before continuing (<code>maxUnavailable</code> logic, <a href="d10-replicasets-deployments.html">Day 10</a>). No readiness probe → the rollout proceeds on "container started", and a broken build replaces the whole fleet before you notice.</li>
+<li><strong>Termination</strong>: during the grace period the Pod is already out of endpoints; a readiness probe that fails during shutdown does not matter, but an app that flips <code>/ready</code> to 503 on SIGTERM helps external load balancers that poll it.</li>
+<li><strong>Restarts</strong> from liveness follow the same back-off as crashes (<a href="d22-pod-lifecycle.html">Day 22</a>). <code>describe pod</code> shows <code>Liveness probe failed: …</code> events with the HTTP status or exec output.</li>
+<li><strong>Startup</strong> resets when the container restarts, so a slow app gets its full budget every time.</li>
+</ul>
+<pre><code class="lang-bash">$ kubectl describe pod api | grep -E 'Liveness|Readiness|Startup'         # configured probes
+$ kubectl get events --field-selector reason=Unhealthy -w                 # live probe failures
+$ kubectl get pod api -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+$ kubectl get endpointslices -l kubernetes.io/service-name=api -o yaml | grep -B2 ready</code></pre>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Task: "add a liveness probe that runs X every N seconds with initial delay D" — the fields are exactly <code>exec.command</code>, <code>periodSeconds</code>, <code>initialDelaySeconds</code>. Copy the block from <code>kubectl explain pod.spec.containers.livenessProbe</code>.</li>
+<li>Pod <code>Running 0/1</code> with <code>Unhealthy</code> readiness events → check the probe's port/path against the container (<code>kubectl exec … -- wget -qO- localhost:8080/ready</code>).</li>
+<li>Pod restarting with <code>Liveness probe failed</code> → usually a too-short <code>timeoutSeconds</code> or a slow start needing a startup probe.</li>
+<li>Probes go under <code>containers[]</code>, not under <code>spec</code>. For a Deployment: <code>spec.template.spec.containers[]</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: probed, labels: {app: probed}}
+spec:
+  containers:
+  - name: web
+    image: nginx
+    ports: [{containerPort: 80}]
+    readinessProbe: {httpGet: {path: /ready.html, port: 80}, periodSeconds: 3, failureThreshold: 1}
+    livenessProbe:  {httpGet: {path: /, port: 80}, periodSeconds: 5, failureThreshold: 2}
+EOF
+$ kubectl expose pod probed --port=80
+$ kubectl get pod probed -w                  # Running 0/1 — ready.html does not exist
+$ kubectl get endpointslices -l kubernetes.io/service-name=probed   # no ready endpoints
+$ kubectl exec probed -- sh -c 'echo ok &gt; /usr/share/nginx/html/ready.html'
+$ kubectl get pod probed                     # 1/1 within 3 s; endpoint appears
+$ kubectl exec probed -- rm /usr/share/nginx/html/ready.html; sleep 4; kubectl get pod probed    # 0/1 again, RESTARTS still 0
+$ kubectl exec probed -- rm /usr/share/nginx/html/index.html; sleep 12; kubectl get pod probed   # liveness fails → RESTARTS 1
+$ kubectl describe pod probed | grep -E 'Unhealthy|Killing'
+$ kubectl delete pod probed $now; kubectl delete svc probed</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Liveness → restart; readiness → in/out of endpoints; startup → gates the other two while the app boots.</li>
+<li>Liveness checks the process only. Dependencies go in readiness. Slow starts get a startup probe, not a big initialDelay.</li>
+<li>httpGet for web apps, tcpSocket for listeners, exec for everything else, grpc for gRPC.</li>
+<li>Without a readiness probe, Pods receive traffic before they can serve it and rollouts cannot detect a bad release.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('kl', 20, 30, 130, 50, ['kubelet', 'probes every N s'], { subfs: 9, subcls: 'muted' })
+    + S.node('pod', 200, 20, 300, 200, 'pod api-7f  ·  10.244.1.9', {})
+    + S.box('app', 230, 60, 240, 40, ['app process', 'GET /healthz  GET /ready'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('sp', 230, 115, 70, 30, 'startup', { fs: 10, cls: 'warn' }) + S.box('lp', 315, 115, 70, 30, 'liveness', { fs: 10, cls: 'soft' }) + S.box('rp', 400, 115, 70, 30, 'readiness', { fs: 10, cls: 'soft' })
+    + S.text('cond', 350, 175, 'Ready: False', { cls: 'sm mono badc b' })
+    + S.text('rst', 350, 200, 'restarts: 0', { cls: 'xs mono muted' })
+    + S.box('svc', 550, 40, 150, 50, ['Service api', 'endpoints: —'], { subfs: 9, subcls: 'mono muted' })
+    + S.arrow('a1', 150, 55, 198, 55, { cls: 'hl' })
+    + S.arrow('a2', 500, 100, 552, 88, { d: 'M 500 105 L 550 88', cls: 'hid' })
+    + S.term('log', 20, 240, 680, 70, ['events:', '', ''], { fs: 9.5 });
+  Anim.define('probes', { w: 720, h: 320, title: 'Startup → readiness → liveness', ms: 3000, svg, steps: [
+    { c: 'Container just started. Only the <b>startup</b> probe runs; liveness and readiness are held off. The app is still loading (10–90 s) and /healthz returns 503. Failures here are expected and tolerated up to failureThreshold × period.', on(q){ q('#sp rect').set('warn'); q('#app rect').set('warn'); q('#log-l1').text('Startup probe failed: HTTP 503 (attempt 3/60)').style('fill', 'var(--amber)'); } },
+    { c: 'The app finishes loading; /healthz returns 200. Startup probe <b>succeeds once</b> → it stops forever and liveness + readiness begin.', on(q){ q('#sp rect').set('ok'); q('#app rect').set('ok'); q('#lp rect,#rp rect').set('hl'); q('#log-l1').text('Startup probe succeeded').style('fill', 'var(--green)'); } },
+    { c: 'Readiness passes (/ready → 200: DB reachable, cache warm). The Pod condition flips to <b>Ready: True</b> and the EndpointSlice controller adds its IP to the Service.', on(q){ q('#rp rect').set('ok'); q('#cond').text('Ready: True').set('okc'); q('#cond').style('fill', 'var(--green)'); q('#svc text:nth-of-type(2)').text('endpoints: 10.244.1.9'); q('#a2').show().set('ok'); q('#log-l2').text('Pod is Ready → added to endpoints').style('fill', 'var(--green)'); } },
+    { c: 'The database has a hiccup. <b>/ready</b> returns 503; after 2 failures the Pod goes <b>NotReady</b> and leaves the endpoints. No restart — liveness (/healthz, process only) is still fine. Traffic goes to other replicas.', on(q){ q('#rp rect').set('bad'); q('#cond').text('Ready: False').style('fill', 'var(--red)'); q('#svc text:nth-of-type(2)').text('endpoints: —'); q('#a2').add('hid'); q('#log-l1').text('Readiness probe failed: HTTP 503 (db unreachable)').style('fill', 'var(--red)'); q('#log-l2').text('Pod NotReady → removed from endpoints, no restart').style('fill', 'var(--amber)'); } },
+    { c: 'DB recovers, /ready is 200 again → back in rotation automatically. This is why dependency checks belong in readiness: the fleet rode out the blip without a single restart.', on(q){ q('#rp rect').set('ok'); q('#cond').text('Ready: True').style('fill', 'var(--green)'); q('#svc text:nth-of-type(2)').text('endpoints: 10.244.1.9'); q('#a2').show(); q('#log-l1').text('Readiness probe succeeded → Ready').style('fill', 'var(--green)'); q('#log-l2').text(''); } },
+    { c: 'Later the app deadlocks: /healthz times out 3 times in a row (30 s). <b>Liveness</b> fails → the kubelet kills the container and restarts it. The startup probe runs again from the top.', on(q){ q('#lp rect').set('bad'); q('#app rect').set('bad'); q('#rst').text('restarts: 1'); q('#cond').text('Ready: False').style('fill', 'var(--red)'); q('#a2').add('hid'); q('#svc text:nth-of-type(2)').text('endpoints: —'); q('#sp rect').set('warn'); q('#lp rect,#rp rect').set('soft'); q('#log-l1').text('Liveness probe failed: timeout (3/3) → Killing container').style('fill', 'var(--red)'); q('#log-l2').text('Container restarted; startup probe active again').style('fill', 'var(--amber)'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 16 · Taints & Tolerations · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d16" data-root="../" data-related="d17,d18">
+<article class="lesson">
+<p class="lead">A <strong>taint</strong> is a property of a <em>node</em> that says "do not put Pods here unless they explicitly accept this". A <strong>toleration</strong> is a property of a <em>Pod</em> that says "I accept that taint". The direction matters: taints repel; tolerations permit. They never attract. That one sentence resolves most of the confusion between taints and the affinity rules of the next lesson.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Taint syntax: <code>key=value:effect</code> and the three effects — NoSchedule, PreferNoSchedule, NoExecute</li>
+<li>Tolerations with <code>Equal</code> and <code>Exists</code>, and <code>tolerationSeconds</code></li>
+<li>The built-in taints Kubernetes applies automatically (control plane, node conditions) and the default tolerations every Pod gets</li>
+<li>Common uses: dedicated nodes, GPU pools, draining, and the control-plane taint</li>
+</ul></div>
+
+<h2>Taints on nodes</h2>
+<pre><code class="lang-bash">$ kubectl taint nodes worker-1 gpu=true:NoSchedule        # add
+$ kubectl taint nodes worker-1 gpu=true:NoSchedule-       # remove (trailing minus)
+$ kubectl taint nodes worker-1 gpu-                       # remove all taints with key gpu
+$ kubectl describe node worker-1 | grep -A3 Taints
+$ kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Effect</th><th>New Pods without a matching toleration</th><th>Pods already running without one</th></tr>
+<tr><td><code>NoSchedule</code></td><td>Not scheduled here</td><td>Keep running</td></tr>
+<tr><td><code>PreferNoSchedule</code></td><td>Avoided if any other node fits; used as a last resort</td><td>Keep running</td></tr>
+<tr><td><code>NoExecute</code></td><td>Not scheduled here</td><td><strong>Evicted</strong> (immediately, or after <code>tolerationSeconds</code>)</td></tr>
+</table></div>
+<figure data-anim="taints"></figure>
+
+<h2>Tolerations on Pods</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: trainer
+spec:
+  tolerations:
+  - key: gpu                # match this taint key
+    operator: Equal         # value must match too
+    value: "true"
+    effect: NoSchedule      # and this effect (omit effect = any effect)
+  - key: dedicated
+    operator: Exists        # any value, just the key must exist
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 60   # stay 60 s after the taint appears, then be evicted
+  containers:
+  - name: trainer
+    image: nvidia/cuda</code></pre>
+<ul>
+<li>A toleration matches a taint when key and effect match and either <code>operator: Exists</code> or <code>Equal</code> with the same value.</li>
+<li>Empty <code>key</code> with <code>Exists</code> tolerates <em>everything</em> (that is what DaemonSets for monitoring agents use).</li>
+<li>Tolerating a taint does not force the Pod onto the node — it merely allows it. Other nodes without the taint remain candidates. To also <em>attract</em>, combine with node affinity (<a href="d18-taints-vs-affinity.html">Day 18</a>).</li>
+</ul>
+
+<h2>Taints Kubernetes adds by itself</h2>
+<dl class="kv">
+<dt>node-role.kubernetes.io/control-plane:NoSchedule</dt><dd>kubeadm taints control-plane nodes so ordinary workloads stay off them. Single-node clusters remove it: <code>kubectl taint nodes --all node-role.kubernetes.io/control-plane-</code>. (KIND removes it for you; on the exam it is usually present.)</dd>
+<dt>node.kubernetes.io/not-ready · unreachable</dt><dd><code>NoExecute</code> taints applied by the node controller when a node's condition changes. This is the mechanism that moves Pods off a dead node.</dd>
+<dt>node.kubernetes.io/memory-pressure · disk-pressure · pid-pressure</dt><dd><code>NoSchedule</code>, applied by the kubelet when the node is under pressure. New Pods avoid the node; existing ones may be evicted by the kubelet's own eviction logic.</dd>
+<dt>node.kubernetes.io/unschedulable</dt><dd>What <code>kubectl cordon</code> actually sets (<code>spec.unschedulable: true</code> plus this taint).</dd>
+<dt>node.cloudprovider.kubernetes.io/uninitialized</dt><dd>Present until the cloud-controller-manager has initialised the node.</dd>
+</dl>
+<div class="callout info"><div class="ct">The 300-second default</div><p>Every Pod gets two tolerations injected by the <code>DefaultTolerationSeconds</code> admission plugin: <code>not-ready</code> and <code>unreachable</code>, both <code>NoExecute</code> with <code>tolerationSeconds: 300</code>. That is why Pods on a node that goes dark stay "Running" for five minutes before they are evicted and rescheduled. Lower it per Pod if you need faster failover; raise it for workloads that should ride out short network blips.</p></div>
+
+<h2>Typical uses</h2>
+<div class="grid-2">
+<div class="card"><h4>Dedicated node pool</h4><p><code>kubectl taint nodes -l pool=batch dedicated=batch:NoSchedule</code>. Only Pods tolerating <code>dedicated=batch</code> land there. Add node affinity so they land <em>only</em> there.</p></div>
+<div class="card"><h4>Special hardware</h4><p>GPU nodes are tainted <code>nvidia.com/gpu:NoSchedule</code> by the device plugin's installer so cheap web Pods never occupy expensive machines.</p></div>
+<div class="card"><h4>Maintenance</h4><p><code>kubectl drain</code> = cordon (NoSchedule) + evict everything. <a href="d55-kubeadm-upgrade.html">Day 55</a>.</p></div>
+<div class="card"><h4>Testing NoExecute</h4><p>Taint a node <code>NoExecute</code> and watch its Pods disappear and reappear elsewhere — a safe way to practise what a node failure looks like.</p></div>
+</div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Pod Pending, <code>describe</code> says <code>0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }, 2 node(s) had untolerated taint {gpu: true}</code> → add a toleration or remove the taint, whichever the task implies.</li>
+<li>Taint syntax is unforgiving: <code>key=value:Effect</code>, effect capitalised exactly. Removal needs the trailing <code>-</code>.</li>
+<li>The imperative <code>kubectl run</code> has no toleration flag — generate YAML and add the block under <code>spec</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl taint nodes cka-worker gpu=true:NoSchedule
+$ kubectl create deploy web --image=nginx --replicas=4 && kubectl get pods -o wide   # all on worker2 (control-plane may be tainted too)
+$ kubectl run t --image=nginx $do | sed '/spec:/a\  tolerations:\n  - key: gpu\n    operator: Equal\n    value: "true"\n    effect: NoSchedule' | kubectl apply -f -
+$ kubectl get pod t -o wide                                                        # may land on either node
+$ kubectl taint nodes cka-worker gpu=true:NoSchedule- && kubectl taint nodes cka-worker gpu=true:NoExecute
+$ kubectl get pods -o wide -w                                                      # untolerating pods on cka-worker are evicted
+$ kubectl taint nodes cka-worker gpu-
+$ kubectl get pod t -o yaml | grep -B2 -A3 tolerationSeconds                       # the injected 300s defaults</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Taints (on nodes) repel; tolerations (on Pods) permit. Neither attracts.</li>
+<li>NoSchedule blocks new Pods; PreferNoSchedule discourages; NoExecute also evicts running ones (after <code>tolerationSeconds</code>).</li>
+<li>Kubernetes taints nodes itself for control-plane role, readiness/unreachability and resource pressure; every Pod tolerates not-ready/unreachable for 300 s.</li>
+<li>For dedicated nodes, pair a taint (keep others out) with node affinity (keep yours in).</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.node('n1', 30, 60, 200, 200, 'worker-1', { sub: 'taint: gpu=true:NoSchedule' })
+    + S.node('n2', 260, 60, 200, 200, 'worker-2', { sub: 'no taints' })
+    + S.node('n3', 490, 60, 200, 200, 'worker-3', { sub: 'no taints' })
+    + S.pod('a', 100, 20, 'web', { cls: 'ok' }) + S.pod('b', 360, 20, 'web', { cls: 'ok' }) + S.pod('c', 620, 20, 'trainer', { cls: 'pur', w: 66, sub: 'tolerates gpu' })
+    + S.pod('r1', 130, 200, 'web', { cls: 'ok' }) + S.pod('r2', 130, 230, 'api', { cls: 'ok', hidden: true })
+    + S.text('m', 360, 290, '', { cls: 'sm b' });
+  Anim.define('taints', { w: 720, h: 300, title: 'Taints & tolerations', ms: 2600, svg, steps: [
+    { c: 'worker-1 carries <code>gpu=true:NoSchedule</code>. Three Pods wait for scheduling: two plain <code>web</code> Pods and a <code>trainer</code> that tolerates the gpu taint.', on(q){ } },
+    { c: 'The scheduler filters nodes for the first web Pod. worker-1 has an untolerated taint → <b>excluded</b>. worker-2 or worker-3 remain.', on(q){ q('#n1 rect').set('bad'); q('#a').to(330, 150); q('#m').text('web → worker-2 (worker-1 filtered out)'); } },
+    { c: 'Second web Pod: same story. Nothing plain can land on worker-1 while the taint exists.', on(q){ q('#b').to(560, 150); q('#m').text('web → worker-3'); } },
+    { c: 'The trainer <b>tolerates</b> the taint, so worker-1 is a candidate — but so are worker-2 and worker-3. Toleration permits; it does not prefer. Here it happens to pick worker-1 because it is empty.', on(q){ q('#n1 rect').set('hl'); q('#c').to(130, 150); q('#m').text('trainer → worker-1 (allowed, not forced)'); } },
+    { c: 'Someone changes the effect to <b>NoExecute</b>. A web Pod that was already on worker-1 (from before the taint) no longer tolerates it…', on(q){ q('#n1 text:nth-of-type(2)').text('taint: gpu=true:NoExecute'); q('#n1 rect').set('bad'); q('#r1 rect').set('bad'); q('#m').text('NoExecute: evaluate running pods too'); } },
+    { c: '…and is <b>evicted</b> — deleted from the node, re-created by its ReplicaSet and scheduled elsewhere. The trainer stays: it tolerates the key (its toleration has no effect specified, so any effect matches).', on(q){ q('#r1').add('hid'); q('#r2').show().to(560, 200); q('#m').text('web evicted → rescheduled on worker-3; trainer stays'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

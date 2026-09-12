@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L1 · Processes, PID 1 & Signals · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l01" data-root="../" data-related="d04,d22,d21">
+<article class="lesson">
+<p class="lead">A container is a process. A Pod is a few processes. "Restart", "terminate", "graceful shutdown", "exit code 137", "CrashLoopBackOff" — every one of these is a statement about Linux processes and the signals sent between them. This page covers the process model well enough that Day 4 and Day 22 read as obvious consequences.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Processes, PIDs, the parent/child tree, <code>fork</code> + <code>exec</code>, and <code>/proc</code></li>
+<li>Signals: what they are, the important ones, default actions, handlers, and <code>kill</code></li>
+<li>Why PID 1 is special: default handlers ignored, child reaping, zombies</li>
+<li>Exit codes and the 128+N convention</li>
+<li><code>exec</code> in shell scripts, <code>tini</code>, and how this shows up in containers</li>
+</ul></div>
+
+<h2>Processes and the tree</h2>
+<p>Every running program is a <strong>process</strong> with a numeric <strong>PID</strong>, a parent (<strong>PPID</strong>), a user, an environment, open file descriptors, a working directory, and a state. New processes are made by <code>fork()</code> — the parent duplicates itself — and usually then <code>exec()</code> — the copy replaces its program image with a new one, keeping the same PID. The first process, PID 1 (<code>systemd</code> on a normal machine), is started by the kernel and is the ancestor of everything.</p>
+<pre><code class="lang-bash">$ ps -ef                                  # all processes: UID PID PPID … CMD
+$ ps -o pid,ppid,stat,etime,cmd -p $$     # your shell; STAT: R running, S sleeping, D uninterruptible IO, Z zombie, T stopped
+$ pstree -p | head -20                    # the tree
+$ pstree -p $(pgrep -o containerd-shim)   # a container's process subtree under its shim
+$ top / htop                              # live view
+$ ls /proc/1/                             # everything the kernel knows about PID 1
+$ cat /proc/$$/status | head -12          # Name, State, Pid, PPid, Uid, … and (below) capabilities
+$ ls -l /proc/$$/fd                       # open files/sockets
+$ cat /proc/$$/cmdline | tr '\0' ' '; echo
+$ readlink /proc/$$/exe; readlink /proc/$$/cwd; cat /proc/$$/environ | tr '\0' '\n' | head</code></pre>
+<p><code>/proc</code> is a virtual filesystem where the kernel exposes process state as files. Containers get their own <code>/proc</code> mounted inside their PID namespace, so <code>ls /proc</code> inside a container lists only its own processes — that is the entire "isolation" of <code>ps</code> (see <a href="l02-namespaces.html">Namespaces</a>).</p>
+
+<h2>Signals</h2>
+<p>A signal is a one-byte asynchronous notification the kernel delivers to a process. The process either has a <strong>handler</strong> for it (runs a function), <strong>ignores</strong> it, or takes the <strong>default action</strong> — for most signals, terminate.</p>
+<div class="tbl-wrap"><table>
+<tr><th>Signal</th><th>#</th><th>Default</th><th>Sent by / meaning</th><th>Catchable?</th></tr>
+<tr><td><code>SIGTERM</code></td><td>15</td><td>terminate</td><td><code>kill PID</code>, <code>docker stop</code>, Kubernetes Pod deletion: "please shut down"</td><td>Yes — the graceful-shutdown hook</td></tr>
+<tr><td><code>SIGKILL</code></td><td>9</td><td>terminate</td><td><code>kill -9</code>, the OOM killer, grace-period expiry: immediate, no cleanup</td><td><strong>No</strong></td></tr>
+<tr><td><code>SIGINT</code></td><td>2</td><td>terminate</td><td>Ctrl-C in a terminal</td><td>Yes</td></tr>
+<tr><td><code>SIGHUP</code></td><td>1</td><td>terminate</td><td>Terminal closed; by convention "reload config" for daemons (nginx, sshd)</td><td>Yes</td></tr>
+<tr><td><code>SIGQUIT</code></td><td>3</td><td>core dump</td><td>Ctrl-\; nginx uses it for graceful stop</td><td>Yes</td></tr>
+<tr><td><code>SIGUSR1/2</code></td><td>10/12</td><td>terminate</td><td>Application-defined (log rotation, stats dump)</td><td>Yes</td></tr>
+<tr><td><code>SIGSTOP</code> / <code>SIGCONT</code></td><td>19 / 18</td><td>stop / continue</td><td>Pause and resume (what CPU throttling looks like from outside)</td><td>STOP: no</td></tr>
+<tr><td><code>SIGCHLD</code></td><td>17</td><td>ignore</td><td>A child exited — the parent should <code>wait()</code> to reap it</td><td>Yes</td></tr>
+<tr><td><code>SIGSEGV</code></td><td>11</td><td>core dump</td><td>The process touched bad memory — a crash</td><td>Rarely</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ kill -l                                   # names and numbers
+$ kill PID; kill -TERM PID; kill -15 PID     # all SIGTERM
+$ kill -9 PID; kill -KILL PID
+$ kill -HUP $(cat /var/run/nginx.pid)       # reload
+$ pkill -f 'python app.py'; killall nginx   # by name
+$ timeout 10 ./slow-thing                   # SIGTERM after 10 s
+# in a shell script:
+trap 'echo "caught SIGTERM, cleaning up"; rm -f /tmp/lock; exit 0' TERM
+# in Python: signal.signal(signal.SIGTERM, handler); Go: signal.Notify(ch, syscall.SIGTERM); Node: process.on('SIGTERM', …)</code></pre>
+<figure data-anim="signals"></figure>
+
+<h2>Why PID 1 is special</h2>
+<p>Inside a PID namespace the first process is PID 1, and the kernel treats it like <code>init</code>:</p>
+<ol>
+<li><strong>Default signal actions do not apply.</strong> If PID 1 has not installed a handler for a signal, the signal is <em>ignored</em> — even SIGTERM. Only SIGKILL (and SIGSTOP) work unconditionally. This protects init from accidental termination on a real system; in a container it means a naive PID 1 cannot be stopped gracefully.</li>
+<li><strong>It must reap orphans.</strong> When a process exits, it becomes a <strong>zombie</strong> (state <code>Z</code>) until its parent calls <code>wait()</code> to collect its exit status. If the parent has already died, the orphan is re-parented to PID 1, which must reap it. A PID 1 that never calls <code>wait()</code> accumulates zombies until the PID table fills.</li>
+<li><strong>When PID 1 exits, the namespace dies</strong>: every other process in it gets SIGKILL. This is why a container "is" its PID 1: when the main process ends, the container ends.</li>
+</ol>
+<pre><code class="lang-bash">$ docker run -d --name z nginx; docker exec z ps -o pid,stat,cmd     # PID 1 = nginx master; workers as children
+$ docker exec z sh -c 'sleep 30 & sleep 1; kill -9 $!; sleep 1; ps -o pid,stat,cmd'   # a killed child is reaped by nginx (it handles SIGCHLD)
+$ docker run -d --name badinit busybox sh -c 'while true; do sleep 1; done'
+$ time docker stop badinit                 # ~10 s: sh (PID 1) ignores SIGTERM, Docker escalates to SIGKILL
+$ docker run -d --init --name goodinit busybox sh -c 'while true; do sleep 1; done'   # tini as PID 1 forwards signals and reaps
+$ time docker stop goodinit                # &lt; 1 s</code></pre>
+<figure data-anim="zombies"></figure>
+
+<h2>Exit codes</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Code</th><th>Meaning</th></tr>
+<tr><td>0</td><td>Success.</td></tr>
+<tr><td>1–125</td><td>Application-defined error. Conventions: 1 general, 2 misuse.</td></tr>
+<tr><td>126</td><td>Command found but not executable (permissions, wrong arch, missing interpreter).</td></tr>
+<tr><td>127</td><td>Command not found — wrong <code>command</code>/<code>ENTRYPOINT</code>, missing binary in a slim image.</td></tr>
+<tr><td>128 + N</td><td>Killed by signal N: <strong>137</strong> = 9 (SIGKILL: OOM or grace period), <strong>143</strong> = 15 (SIGTERM handled by exiting), 139 = 11 (SIGSEGV), 130 = 2 (SIGINT).</td></tr>
+<tr><td>255</td><td>Out of range / <code>exit -1</code>.</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ ./prog; echo $?                           # last exit code
+$ sh -c 'kill -9 $$'; echo $?               # 137
+$ kubectl describe pod x | grep -A3 'Last State'     # Exit Code: 137, Reason: OOMKilled (or Error)</code></pre>
+
+<h2>exec: replacing the shell</h2>
+<p><code>exec cmd</code> in a shell script replaces the shell process with <code>cmd</code> — same PID, no child. That is why entrypoint scripts end with <code>exec "$@"</code>: the real server becomes PID 1 and receives signals directly. Without <code>exec</code>, the shell stays PID 1, the server is PID 7, and SIGTERM stops at the shell.</p>
+<pre><code class="lang-bash">$ cat entrypoint.sh
+#!/bin/sh
+set -e
+envsubst &lt; /etc/app.tmpl &gt; /etc/app.conf
+exec /usr/bin/myserver --config /etc/app.conf     # ← replaces sh; myserver is now PID 1
+$ docker exec c ps -o pid,cmd                       # PID 1 /usr/bin/myserver — no sh in sight</code></pre>
+
+<h2>How this appears in Kubernetes</h2>
+<ul>
+<li><strong>Pod termination</strong> (<a href="../lessons/d22-pod-lifecycle.html">Day 22</a>): SIGTERM to each container's PID 1 → grace period → SIGKILL. Exit code 143 (handled) vs 137 (killed).</li>
+<li><strong>CMD/ENTRYPOINT forms</strong> (<a href="../lessons/d04-cmd-vs-entrypoint.html">Day 4</a>): shell form puts <code>sh</code> at PID 1; exec form puts your program there.</li>
+<li><strong>OOMKilled</strong>: the kernel sends SIGKILL to the biggest process in the cgroup — exit 137 with reason OOMKilled.</li>
+<li><strong>Liveness probe failure</strong>: the kubelet stops the container (SIGTERM → SIGKILL) and starts a new one.</li>
+<li><strong><code>shareProcessNamespace: true</code></strong> (<a href="../lessons/d21-multi-container-pods.html">Day 21</a>): all containers share one PID namespace; the pause container is PID 1 and reaps for everyone; <code>kill -HUP</code> across containers works.</li>
+<li><strong>Zombies in Pods</strong>: an app that spawns children and never waits shows <code>Z</code> processes in <code>kubectl exec … ps</code>; eventually <code>PIDPressure</code>. Fix the app, or use tini / shared process namespace.</li>
+</ul>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ sleep 300 &amp; P=$!; ps -o pid,ppid,stat,cmd -p $P; kill -TERM $P; wait $P; echo "exit $?"        # 143
+$ sleep 300 &amp; P=$!; kill -KILL $P; wait $P; echo "exit $?"                                        # 137
+$ (trap 'echo got TERM; exit 0' TERM; while true; do sleep 1; done) &amp; P=$!; sleep 1; kill -TERM $P; wait $P; echo $?   # 0 — handled
+# PID 1 in a namespace ignoring SIGTERM (needs util-linux unshare)
+$ sudo unshare --pid --fork sh -c 'echo "I am PID $$"; sleep 300' &amp;
+$ sleep 1; sudo kill -TERM $(pgrep -f 'sleep 300' | head -1); sleep 1; pgrep -f 'sleep 300' &amp;&amp; echo "still alive: PID 1 ignored SIGTERM"
+$ sudo pkill -KILL -f 'sleep 300'
+# zombie
+$ sh -c 'sleep 1 &amp; exec sleep 30' &amp; sleep 2; ps -o pid,ppid,stat,cmd | grep -E 'Z|sleep'      # the "sleep 1" is a zombie: its parent (now sleep 30) never waits
+$ pkill -f 'sleep 30'</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Processes form a tree from PID 1; <code>fork</code> copies, <code>exec</code> replaces; <code>/proc</code> exposes it all.</li>
+<li>SIGTERM asks, SIGKILL forces; only SIGTERM can be handled. Exit 128+N means killed by signal N.</li>
+<li>PID 1 ignores unhandled signals, must reap orphans, and ends the namespace when it exits — so containers need a proper PID 1 (exec form, <code>exec "$@"</code>, or tini).</li>
+<li>Kubernetes termination, restarts, OOMKilled and probes are all signals to PID 1.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let s1 = S.box('k', 20, 30, 120, 44, ['kernel', 'kill(pid, 15)'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('p', 300, 30, 160, 44, ['process 4211', 'handler for TERM: none'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('h', 300, 110, 160, 44, ['process 4211', 'handler for TERM: cleanup()'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('p1', 300, 190, 160, 44, ['PID 1 (in a pid ns)', 'handler for TERM: none'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.dot('sig', 140, 52, { cls: 'bad', label: 'SIGTERM', hidden: true })
+    + S.text('r', 560, 55, '', { cls: 'sm b' }) + S.text('r2', 560, 135, '', { cls: 'sm b' }) + S.text('r3', 560, 215, '', { cls: 'sm b' })
+    + S.text('m', 360, 275, '', { cls: 'sm muted' });
+  Anim.define('signals', { w: 720, h: 290, title: 'Signal delivery', ms: 2600, svg: s1, steps: [
+    { c: 'A signal is delivered by the kernel to a target process. What happens next depends only on the <b>target</b>: handler, ignore, or default action.', on(q){ q('#sig').show().to(280, 52); } },
+    { c: 'Ordinary process, <b>no handler</b>: the default action for SIGTERM is <i>terminate</i>. The process dies immediately, exit status "killed by signal 15" (143 in a shell).', on(q){ q('#p rect').set('bad'); q('#r').text('default: terminated (143)').style('fill', 'var(--red)'); } },
+    { c: 'Ordinary process <b>with a handler</b>: the kernel interrupts it and runs <code>cleanup()</code> — finish requests, flush, close — and the process exits on its own terms.', on(q){ q('#h').show(); q('#sig').to(280, 132); q('#h rect').set('ok'); q('#r2').text('handler runs → exit 0').style('fill', 'var(--green)'); } },
+    { c: '<b>PID 1</b> with no handler: default actions are disabled for init. SIGTERM is <b>ignored</b>. Nothing happens. This is the shell-form CMD problem.', on(q){ q('#p1').show(); q('#sig').to(280, 212); q('#p1 rect').set('warn'); q('#r3').text('ignored — still running').style('fill', 'var(--amber)'); } },
+    { c: 'Only SIGKILL gets through to a handler-less PID 1 — and SIGKILL can never be handled by anyone. That is what the grace-period timeout falls back to: exit 137.', on(q){ q('#sig').text('SIGKILL'); q('#p1 rect').set('bad'); q('#r3').text('SIGKILL → dead (137), no cleanup').style('fill', 'var(--red)'); q('#m').text('handle SIGTERM; be a real PID 1 or use tini'); } },
+  ]});
+
+  let s2 = S.box('init', 300, 20, 120, 40, ['PID 1: app', 'no wait()'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('c1', 120, 110, 110, 40, ['PID 7: worker', 'S'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('c2', 305, 110, 110, 40, ['PID 9: helper', 'S'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('c3', 490, 110, 110, 40, ['PID 12: cron', 'S'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('g1', 490, 190, 110, 40, ['PID 13: job', 'S'], { subfs: 9, subcls: 'mono muted', cls: 'ok', hidden: true })
+    + S.arrow('e1', 340, 60, 175, 108, { d: 'M 340 60 L 178 108' }) + S.arrow('e2', 360, 60, 360, 108) + S.arrow('e3', 380, 60, 545, 108, { d: 'M 380 60 L 542 108' })
+    + S.arrow('e4', 545, 150, 545, 188, { cls: 'hid' })
+    + S.term('ps', 20, 250, 680, 40, ['$ ps -o pid,ppid,stat,cmd      1 app · 7 worker S · 9 helper S · 12 cron S'], { fs: 9 })
+    + S.text('m', 360, 240, '', { cls: 'sm b' });
+  Anim.define('zombies', { w: 720, h: 300, title: 'Reaping and zombies', ms: 2600, svg: s2, steps: [
+    { c: 'PID 1 is the app itself (exec form). It has three children. Children that exit must be <b>reaped</b> by their parent with <code>wait()</code>.', on(q){} },
+    { c: 'helper (PID 9) exits. Until app calls <code>wait()</code>, it is a <b>zombie</b>: state Z, no memory, but it still holds a PID and an exit status.', on(q){ q('#c2 rect').set('bad'); q('#c2').text('PID 9: helper'); q('#c2 text:nth-of-type(2)').text('Z (defunct)'); q('#ps-l0').text('$ ps …      1 app · 7 worker S · 9 [helper] <defunct> Z · 12 cron S'); q('#m').text('exited, not yet waited for'); } },
+    { c: 'If the app handles SIGCHLD and calls <code>wait()</code>, the zombie is reaped and PID 9 is freed. A well-written server does this; nginx, Go\'s runtime and tini all do.', on(q){ q('#c2').add('hid'); q('#e2').add('hid'); q('#ps-l0').text('$ ps …      1 app · 7 worker S · 12 cron S'); q('#m').text('reaped'); } },
+    { c: 'cron (PID 12) spawns a job (PID 13), then cron itself dies. The orphaned job is <b>re-parented to PID 1</b>. When it exits, PID 1 must reap it — even though it never created it.', on(q){ q('#g1').show(); q('#e4').show(); q('#c3 rect').set('bad'); q('#c3 text:nth-of-type(2)').text('exited'); q('#m').text('orphan → adopted by PID 1'); } },
+    { c: 'An app that never calls <code>wait()</code> as PID 1 collects zombies forever: <code>ps</code> fills with <code>&lt;defunct&gt;</code>, PIDs run out, the node reports <code>PIDPressure</code>. Use tini, or make your PID 1 reap.', on(q){ q('#g1 rect').set('bad'); q('#g1 text:nth-of-type(2)').text('Z — never reaped'); q('#ps-l0').text('$ ps …      1 app · 7 worker S · 13 [job] <defunct> Z · 14 Z · 15 Z · 16 Z …'); q('#m').text('zombie accumulation'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

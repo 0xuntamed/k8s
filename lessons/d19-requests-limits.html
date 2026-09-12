@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 19 · Requests, Limits & LimitRange · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d19" data-root="../" data-linux="l03" data-related="d14,d20,d46">
+<article class="lesson">
+<p class="lead">Two numbers per container decide almost everything about how your workload behaves under load: the <strong>request</strong>, which the scheduler uses to find room, and the <strong>limit</strong>, which the kernel uses to enforce a ceiling. CPU and memory react to the ceiling in completely different ways — CPU gets <em>throttled</em>, memory gets the process <em>killed</em> — and the combination of requests and limits determines which Pods die first when a node runs out. All of it is implemented by one Linux feature: cgroups.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Units: millicores and Mi/Gi, and what "1 CPU" means</li>
+<li>Requests (scheduling, guaranteed share) vs limits (enforcement)</li>
+<li>CPU throttling vs memory OOMKill, and how to recognise each</li>
+<li>QoS classes — Guaranteed, Burstable, BestEffort — and eviction order</li>
+<li>LimitRange (per-container defaults/bounds) and ResourceQuota (per-namespace totals)</li>
+</ul></div>
+
+<h2>The spec</h2>
+<pre><code class="lang-yaml">spec:
+  containers:
+  - name: api
+    image: myapi:2.1
+    resources:
+      requests:
+        cpu: 250m        # 0.25 CPU — used for scheduling and as a fair-share weight
+        memory: 128Mi    # used for scheduling and eviction ranking
+      limits:
+        cpu: "1"         # hard ceiling: throttled above 1 CPU
+        memory: 512Mi    # hard ceiling: OOMKilled above 512 MiB</code></pre>
+<dl class="kv">
+<dt>cpu</dt><dd>1 = one core / vCPU / hyperthread. <code>500m</code> = 0.5. Fractions are fine because CPU is time-sliced. Always an absolute quantity, never a percentage.</dd>
+<dt>memory</dt><dd>Bytes. <code>Mi</code>/<code>Gi</code> are powers of two (128Mi = 134 217 728 B); <code>M</code>/<code>G</code> are powers of ten. Use the binary ones.</dd>
+<dt>ephemeral-storage</dt><dd>Node disk used by the writable layer, logs and emptyDir. Exceeding the limit evicts the Pod.</dd>
+<dt>extended resources</dt><dd><code>nvidia.com/gpu: 1</code> — advertised by device plugins, always integer, request must equal limit.</dd>
+</dl>
+<pre><code class="lang-bash">$ kubectl set resources deploy/api --requests=cpu=250m,memory=128Mi --limits=cpu=1,memory=512Mi
+$ kubectl describe node worker-1 | grep -A8 'Allocated resources'    # requests/limits sum vs allocatable
+$ kubectl top pod api-xyz --containers                                # actual usage (metrics-server)</code></pre>
+
+<h2>Requests: how the scheduler packs nodes</h2>
+<p>The scheduler never looks at real usage. It sums the <em>requests</em> of Pods already on a node and compares with the node's <em>allocatable</em> (capacity minus reservations for the kubelet and OS). If your Pod's requests do not fit, the node is filtered out. Over-request and you waste money on idle capacity; under-request and the node is oversubscribed and things get throttled or killed.</p>
+<figure data-anim="requests-packing"></figure>
+
+<h2>Limits: what the kernel does at the ceiling</h2>
+<figure data-anim="limits-enforce"></figure>
+<div class="compare">
+<div><h4>CPU limit → throttling</h4><p>CPU is compressible. The cgroup gets a quota per 100 ms period (<code>limit 500m</code> = 50 ms per 100 ms). When the container uses its 50 ms, the kernel <strong>pauses</strong> its threads until the next period. The process does not crash; latency goes up. Visible as <code>container_cpu_cfs_throttled_seconds_total</code> in metrics, or <code>nr_throttled</code> in <code>cpu.stat</code>.</p></div>
+<div><h4>Memory limit → OOMKilled</h4><p>Memory is not compressible. When the cgroup's usage hits <code>memory.max</code> and nothing can be reclaimed, the kernel's OOM killer terminates the largest process in the cgroup. The container exits with code <strong>137</strong> (128 + SIGKILL 9), the Pod shows <code>OOMKilled</code> in <code>Last State</code>, and the kubelet restarts it per <code>restartPolicy</code> — hence <code>CrashLoopBackOff</code> for chronic leaks.</p></div>
+</div>
+<pre><code class="lang-bash">$ kubectl describe pod api-xyz | grep -A4 'Last State'
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+$ kubectl get pod api-xyz -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'</code></pre>
+<div class="callout linux" data-ref="l03"><div class="ct">Under the hood · Linux</div>
+<p>Every container is a <strong>cgroup v2</strong> directory under <code>/sys/fs/cgroup/kubepods.slice/</code>. The kubelet (via the runtime) writes:</p>
+<ul>
+<li><code>cpu.weight</code> — derived from the CPU <em>request</em> (request 250m → weight ≈ 10, 1000m → 39). Only matters under contention: two containers competing for a saturated core get CPU in proportion to their weights. This is why a request is a <em>guaranteed share</em>, not just a scheduling hint.</li>
+<li><code>cpu.max</code> — from the CPU <em>limit</em>: <code>50000 100000</code> means 50 ms per 100 ms period (CFS bandwidth control).</li>
+<li><code>memory.max</code> — from the memory <em>limit</em>; <code>memory.min</code>/<code>memory.low</code> may reflect the request depending on kubelet configuration.</li>
+</ul>
+<pre><code class="lang-bash"># on the node, find the container's cgroup
+$ CID=$(crictl ps --name api -q); crictl inspect $CID | jq -r '.info.runtimeSpec.linux.cgroupsPath'
+$ cat /sys/fs/cgroup/kubepods.slice/.../cpu.max cpu.weight memory.max
+$ cat /sys/fs/cgroup/kubepods.slice/.../cpu.stat | grep throttled     # nr_throttled, throttled_usec
+$ cat /sys/fs/cgroup/kubepods.slice/.../memory.events                 # oom_kill counter
+$ dmesg | grep -i 'killed process'                                     # the OOM killer's log line</code></pre>
+<p>The kubelet reserves capacity for itself and the OS (<code>--kube-reserved</code>, <code>--system-reserved</code>) in sibling cgroups, which is why <em>allocatable</em> is smaller than <em>capacity</em>.</p></div>
+
+<h2>QoS classes and eviction</h2>
+<p>Kubernetes derives a Quality-of-Service class from your requests and limits. It is not something you set; it is how the kubelet ranks Pods when the <em>node</em> (not a single container) runs short of memory or disk.</p>
+<div class="tbl-wrap"><table>
+<tr><th>Class</th><th>Condition</th><th>Under node pressure</th><th>OOM score adj</th></tr>
+<tr><td><strong>Guaranteed</strong></td><td>Every container has limits = requests for both CPU and memory</td><td>Evicted last; only if using more than requested (impossible) or system needs it</td><td>-997</td></tr>
+<tr><td><strong>Burstable</strong></td><td>At least one request or limit set, but not Guaranteed</td><td>Evicted after BestEffort, ordered by usage above request</td><td>2 – 999 (scaled by request)</td></tr>
+<tr><td><strong>BestEffort</strong></td><td>No requests or limits anywhere</td><td>Evicted first</td><td>1000</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ kubectl get pod api-xyz -o jsonpath='{.status.qosClass}'</code></pre>
+<p>Two different mechanisms use this ranking: the <strong>kubelet's eviction manager</strong> (soft/hard thresholds like <code>memory.available &lt; 100Mi</code> → evicts Pods, phase <code>Failed</code>, reason <code>Evicted</code>) and the <strong>kernel OOM killer</strong> when the node runs out before the kubelet reacts (uses <code>oom_score_adj</code> — BestEffort processes die first).</p>
+<div class="callout tip"><div class="ct">Practical guidance</div><ul>
+<li>Always set memory requests and limits, and set them <strong>equal</strong> — memory cannot be reclaimed, so a burst that works today is an OOM tomorrow.</li>
+<li>Set CPU requests; consider <strong>not</strong> setting CPU limits for latency-sensitive services (throttling hurts tail latency, and the request already guarantees a share). Set them for batch jobs and noisy neighbours.</li>
+<li>Requests too high → Pending Pods and idle nodes. Use <code>kubectl top</code> / VPA recommendations (<a href="d20-autoscaling.html">Day 20</a>) to right-size.</li>
+</ul></div>
+
+<h2>LimitRange: defaults and bounds per namespace</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: dev
+spec:
+  limits:
+  - type: Container
+    defaultRequest: {cpu: 100m, memory: 64Mi}   # injected if the container sets no request
+    default:        {cpu: 500m, memory: 256Mi}  # injected if the container sets no limit
+    min:            {cpu: 50m,  memory: 32Mi}   # reject smaller
+    max:            {cpu: "2",  memory: 2Gi}    # reject larger
+    maxLimitRequestRatio: {cpu: "4"}            # limit ≤ 4 × request
+  - type: Pod
+    max: {cpu: "4", memory: 4Gi}                # sum over containers
+  - type: PersistentVolumeClaim
+    min: {storage: 1Gi}
+    max: {storage: 50Gi}</code></pre>
+<p>Applied by the <code>LimitRanger</code> admission plugin at Pod creation: defaults are injected (you will see them in <code>get -o yaml</code> though you never wrote them), violations are rejected with a clear message. It does not affect Pods that already exist.</p>
+
+<h2>ResourceQuota: totals per namespace</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a
+  namespace: dev
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    requests.nvidia.com/gpu: "2"
+  scopeSelector:                       # optional: quota only for a priority class
+    matchExpressions:
+    - operator: In
+      scopeName: PriorityClass
+      values: [high]</code></pre>
+<p>When a quota constrains a resource, every Pod must <em>specify</em> it, or it is rejected with <code>must specify requests.cpu</code> — pair quotas with a LimitRange that supplies defaults. <code>kubectl describe quota</code> shows Used vs Hard. Quotas count requests/limits, not usage.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Pod Pending with <code>Insufficient cpu/memory</code> → requests exceed what any node has free. Lower the request or find the node hog with <code>kubectl describe nodes | grep -A5 Allocated</code>.</li>
+<li>Exit code 137 / <code>OOMKilled</code> → raise the memory limit (or fix the leak). Exit code 137 without OOMKilled = something sent SIGKILL (e.g. grace period expired).</li>
+<li>"Pod rejected: must specify…" or "exceeded quota" → look at the namespace's LimitRange and ResourceQuota.</li>
+<li><code>kubectl set resources</code> is the fastest way to add requests/limits to a Deployment.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash"># OOMKill on purpose
+$ kubectl run hog --image=polinux/stress --restart=Never --limits=memory=100Mi --requests=memory=50Mi -- stress --vm 1 --vm-bytes 200M --vm-hang 1
+$ sleep 15; kubectl describe pod hog | grep -A3 'Last State'; kubectl get pod hog   # OOMKilled, exit 137
+# CPU throttling: limit 200m, try to burn a full core
+$ kubectl run burn --image=busybox --restart=Never --limits=cpu=200m --requests=cpu=100m -- sh -c 'while true; do :; done'
+$ kubectl top pod burn        # stays at ~200m — throttled, not killed
+$ docker exec cka-worker sh -c 'cat /sys/fs/cgroup/kubepods.slice/*/*/cpu.stat 2>/dev/null | grep nr_throttled | head' 2>/dev/null
+# QoS
+$ kubectl run be --image=nginx; kubectl get pod be -o jsonpath='{.status.qosClass}{"\n"}'        # BestEffort
+$ kubectl run g --image=nginx --requests=cpu=100m,memory=64Mi --limits=cpu=100m,memory=64Mi; kubectl get pod g -o jsonpath='{.status.qosClass}{"\n"}'   # Guaranteed
+# LimitRange defaults
+$ kubectl create ns lr && kubectl apply -n lr -f - &lt;&lt;EOF
+apiVersion: v1
+kind: LimitRange
+metadata: {name: d}
+spec: {limits: [{type: Container, default: {cpu: 300m, memory: 128Mi}, defaultRequest: {cpu: 100m, memory: 64Mi}}]}
+EOF
+$ kubectl run x --image=nginx -n lr && kubectl get pod x -n lr -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+$ kubectl delete pod hog burn be g $now; kubectl delete ns lr</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Requests: scheduling + guaranteed share (<code>cpu.weight</code>). Limits: enforcement (<code>cpu.max</code>, <code>memory.max</code>).</li>
+<li>CPU over limit → throttled (slow). Memory over limit → OOMKilled, exit 137, restart.</li>
+<li>QoS: Guaranteed (req = lim) &gt; Burstable &gt; BestEffort in eviction and OOM order. Set memory req = lim.</li>
+<li>LimitRange injects defaults and bounds per container; ResourceQuota caps namespace totals and forces requests to be specified.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* packing by requests */
+  let s1 = S.text('t', 360, 22, 'node allocatable: 4 CPU · 8 GiB   (scheduler sums REQUESTS, ignores usage)', { cls: 'sm muted' });
+  s1 += S.bar('cpu', 120, 60, 500, 22, { label: 'CPU', cls: '' }) + S.text('cpuv', 640, 76, '0 / 4', { cls: 'sm mono left' });
+  s1 += S.bar('mem', 120, 110, 500, 22, { label: 'memory', cls: 'pur' }) + S.text('memv', 640, 126, '0 / 8Gi', { cls: 'sm mono left' });
+  s1 += S.pod('p1', 100, 200, 'api', { cls: 'ok', w: 64, sub: '1 CPU · 2Gi' }) + S.pod('p2', 220, 200, 'web', { cls: 'ok', w: 64, sub: '500m · 1Gi' }) + S.pod('p3', 340, 200, 'cache', { cls: 'ok', w: 64, sub: '2 CPU · 4Gi' }) + S.pod('p4', 460, 200, 'batch', { cls: 'warn', w: 64, sub: '1 CPU · 2Gi' }) + S.pod('p5', 580, 200, 'tiny', { cls: 'cy', w: 64, sub: '200m · 256Mi' });
+  s1 += S.text('m', 360, 275, '', { cls: 'sm b' });
+  const set = (q, c, m) => { q('#cpu-fill').attr('width', 500 * c / 4); q('#mem-fill').attr('width', 500 * m / 8); q('#cpuv').text(`${c} / 4`); q('#memv').text(`${m}Gi / 8Gi`); };
+  Anim.define('requests-packing', { w: 720, h: 290, title: 'Scheduling by requests', ms: 2400, svg: s1, steps: [
+    { c: 'An empty node with 4 CPU and 8 GiB <b>allocatable</b>. Five Pods arrive with different <b>requests</b>.', on(q){ set(q, 0, 0); } },
+    { c: '<code>api</code> requests 1 CPU / 2 Gi. Fits. The scheduler\'s view of the node is now 1 CPU / 2 Gi used — regardless of what api actually consumes.', on(q){ set(q, 1, 2); q('#p1 rect').set('hl'); } },
+    { c: '<code>web</code> (500m / 1 Gi) and <code>cache</code> (2 CPU / 4 Gi) fit too. Requested: 3.5 CPU, 7 Gi.', on(q){ set(q, 3.5, 7); q('#p2 rect,#p3 rect').set('hl'); } },
+    { c: '<code>batch</code> requests 1 CPU / 2 Gi. Only 0.5 CPU and 1 Gi are unrequested → <b>Insufficient cpu, Insufficient memory</b>. This node is filtered out, even if real usage is low.', on(q){ q('#p4 rect').set('bad'); q('#m').text('batch: does not fit by requests → another node, or Pending'); } },
+    { c: '<code>tiny</code> requests 200m / 256 Mi — fits in the remaining space. Small, accurate requests pack densely; inflated ones strand capacity.', on(q){ set(q, 3.7, 7.25); q('#p5 rect').set('hl'); q('#m').text('tiny fits: 3.7 / 4 CPU, 7.25 / 8 Gi requested'); } },
+  ]});
+
+  /* limits enforcement */
+  let s2 = S.zone('c1', 20, 20, 330, 250, 'container A · cpu limit 500m') + S.zone('c2', 370, 20, 330, 250, 'container B · memory limit 256Mi');
+  s2 += S.bar('cq', 110, 70, 200, 18, { label: 'quota/100ms', v: 100 }) + S.text('cqv', 320, 84, '50 ms', { cls: 'xs mono left' });
+  s2 += S.bar('cu', 110, 110, 200, 18, { label: 'demand', v: 60, cls: 'warn' }) + S.text('cuv', 320, 124, '', { cls: 'xs mono left' });
+  s2 += S.term('cs', 40, 150, 290, 100, ['cpu.max: 50000 100000', 'cpu.stat:', '  nr_periods   1200', '  nr_throttled 0', '  throttled_usec 0'], { fs: 9.5 });
+  s2 += S.bar('mq', 470, 70, 200, 18, { label: 'memory.max', v: 200, cls: 'pur' }) + S.text('mqv', 680, 84, '256Mi', { cls: 'xs mono left' });
+  s2 += S.bar('mu', 470, 110, 200, 18, { label: 'usage', v: 80, cls: 'ok' }) + S.text('muv', 680, 124, '100Mi', { cls: 'xs mono left' });
+  s2 += S.term('ms', 390, 150, 300, 100, ['memory.max: 268435456', 'memory.events:', '  oom_kill 0', 'exit code: -', 'state: Running'], { fs: 9.5 });
+  Anim.define('limits-enforce', { w: 720, h: 280, title: 'CPU throttling vs OOMKill', ms: 2600, svg: s2, steps: [
+    { c: 'Two containers at their ceilings. A has a CPU limit of 500m = 50 ms of CPU per 100 ms period. B has a memory limit of 256 MiB.', on(q){ q('#cuv').text('30 ms — fine'); } },
+    { c: 'A gets busy and wants 90 ms per period. The kernel lets it run 50 ms, then <b>throttles</b> it: threads are descheduled until the next period starts.', on(q){ q('#cu-fill').attr('width', 180); q('#cuv').text('90 ms wanted'); q('#cu-fill').set('bad'); q('#cs-l3').text('  nr_throttled 412').style('fill', 'var(--amber)'); q('#cs-l4').text('  throttled_usec 16480000').style('fill', 'var(--amber)'); } },
+    { c: 'Nothing crashes. Requests just take longer; p99 latency climbs. The only evidence is <code>nr_throttled</code> climbing in cpu.stat (and in Prometheus).', on(q){ q('#cs-l3').style('fill', 'var(--red)'); } },
+    { c: 'B has a slow leak. Usage climbs toward 256 MiB. The kernel first tries to reclaim page cache in the cgroup…', on(q){ q('#mu-fill').attr('width', 190).set('warn'); q('#muv').text('248Mi'); } },
+    { c: '…then, at the limit with nothing left to reclaim, the <b>OOM killer</b> sends SIGKILL to the largest process in the cgroup. The container exits 137.', on(q){ q('#mu-fill').attr('width', 200).set('bad'); q('#muv').text('256Mi'); q('#ms-l2').text('  oom_kill 1').style('fill', 'var(--red)'); q('#ms-l3').text('exit code: 137').style('fill', 'var(--red)'); q('#ms-l4').text('state: Terminated (OOMKilled)').style('fill', 'var(--red)'); } },
+    { c: 'The kubelet sees the exit, records <code>OOMKilled</code> in Last State, and restarts the container with exponential back-off. A leak becomes <code>CrashLoopBackOff</code>; a genuine need becomes "raise the limit".', on(q){ q('#mu-fill').attr('width', 20).set('ok'); q('#muv').text('24Mi'); q('#ms-l4').text('state: Running (restarts: 1)').style('fill', 'var(--amber)'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

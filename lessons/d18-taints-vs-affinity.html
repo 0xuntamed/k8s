@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 18 · Taints vs Affinity — Mastering Pod Placement · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d18" data-root="../" data-related="d16,d17,d46">
+<article class="lesson">
+<p class="lead">Taints and affinity answer different questions. A taint answers "who is allowed here?" from the node's side; affinity answers "where do I want to go?" from the Pod's side. Used alone, each has a hole: a taint cannot stop your special Pods from landing on <em>ordinary</em> nodes, and affinity cannot stop <em>ordinary</em> Pods from landing on your special nodes. Used together they give you a truly dedicated node pool. This lesson also completes the picture with Pod affinity/anti-affinity, topology spread, and the full scheduling cycle.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The two-sided problem and the taint + affinity recipe for dedicated nodes</li>
+<li>Pod affinity and anti-affinity: placing Pods relative to <em>other Pods</em> with <code>topologyKey</code></li>
+<li>Topology spread constraints for even distribution across zones/nodes</li>
+<li>The scheduling cycle end to end: queue → filter → score → reserve → bind</li>
+</ul></div>
+
+<h2>The two-sided problem</h2>
+<div class="compare">
+<div><h4>Taint alone</h4><p>Taint the GPU nodes. Ordinary Pods stay off them ✔. But the GPU Pods, which tolerate the taint, are <em>allowed</em> anywhere — and may be scheduled onto a cheap node with no GPU ✘.</p></div>
+<div><h4>Affinity alone</h4><p>Give GPU Pods a required affinity for <code>gpu=true</code>. They always land on GPU nodes ✔. But nothing stops ordinary Pods from filling those nodes first ✘.</p></div>
+</div>
+<figure data-anim="dedicated"></figure>
+<pre data-title="the recipe for a dedicated pool"><code class="lang-bash">$ kubectl label nodes gpu-1 gpu-2 pool=gpu                      # the attractor
+$ kubectl taint nodes gpu-1 gpu-2 pool=gpu:NoSchedule            # the repellent</code></pre>
+<pre><code class="lang-yaml">spec:
+  tolerations:                                    # allowed onto the pool
+  - key: pool
+    operator: Equal
+    value: gpu
+    effect: NoSchedule
+  affinity:                                       # and only onto the pool
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: pool
+            operator: In
+            values: [gpu]</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th></th><th>Set on</th><th>Direction</th><th>Hard/soft</th><th>Affects running Pods?</th></tr>
+<tr><td>Taint / toleration</td><td>Node / Pod</td><td>Repel (opt-in to be allowed)</td><td>NoSchedule hard, PreferNoSchedule soft</td><td>Only NoExecute</td></tr>
+<tr><td>Node affinity</td><td>Pod</td><td>Attract</td><td>required hard, preferred soft</td><td>Never</td></tr>
+<tr><td>Pod (anti-)affinity</td><td>Pod</td><td>Attract to / repel from other Pods</td><td>required / preferred</td><td>Never</td></tr>
+<tr><td>Topology spread</td><td>Pod</td><td>Even distribution</td><td>DoNotSchedule / ScheduleAnyway</td><td>Never</td></tr>
+</table></div>
+
+<h2>Pod affinity and anti-affinity</h2>
+<p>Node affinity looks at <em>node labels</em>. Pod affinity looks at <em>the labels of Pods already running</em> and at a <strong>topologyKey</strong> — a node label that defines "the same place": <code>kubernetes.io/hostname</code> for "same node", <code>topology.kubernetes.io/zone</code> for "same zone".</p>
+<pre><code class="lang-yaml">spec:
+  affinity:
+    podAffinity:                       # run NEAR pods matching the selector
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels: {app: cache}
+        topologyKey: kubernetes.io/hostname      # same node as a cache pod
+    podAntiAffinity:                   # run AWAY from pods matching the selector
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels: {app: web}                # my own label → one web pod per node
+        topologyKey: kubernetes.io/hostname
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels: {app: web}
+          topologyKey: topology.kubernetes.io/zone   # and prefer spreading across zones</code></pre>
+<ul>
+<li><strong>Anti-affinity to yourself</strong> with <code>hostname</code> is the classic HA rule: three replicas on three different nodes. With <code>required</code> and only two nodes, the third replica is Pending — use <code>preferred</code> or topology spread if that is not acceptable.</li>
+<li><code>namespaces</code> / <code>namespaceSelector</code> in the term let you match Pods in other namespaces; default is the Pod's own.</li>
+<li>Pod affinity is expensive for the scheduler on very large clusters (it must inspect all Pods); prefer topology spread when you just want distribution.</li>
+</ul>
+
+<h2>Topology spread constraints</h2>
+<pre><code class="lang-yaml">spec:
+  topologySpreadConstraints:
+  - maxSkew: 1                                  # max difference in pod count between any two domains
+    topologyKey: topology.kubernetes.io/zone    # domains = zones
+    whenUnsatisfiable: DoNotSchedule            # or ScheduleAnyway (soft)
+    labelSelector:
+      matchLabels: {app: web}
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway</code></pre>
+<p>"Keep the count of <code>app=web</code> Pods per zone within 1 of each other." Simpler and cheaper than anti-affinity for the common "spread evenly" case, and it scales to any replica count. Clusters have default constraints (<code>maxSkew: 3</code> on hostname, <code>5</code> on zone, both soft) so Deployments spread reasonably even with nothing specified.</p>
+
+<h2>The scheduling cycle, end to end</h2>
+<figure data-anim="sched-cycle"></figure>
+<ol class="steps">
+<li><strong>Queue.</strong> Unscheduled Pods are queued, ordered by <a href="d46-pod-priority.html">priority</a> then time. Pods that fail scheduling go to a back-off queue and are retried when the cluster changes (node added, Pod deleted).</li>
+<li><strong>Filter (predicates).</strong> Plugins reject nodes: <code>NodeResourcesFit</code> (requests ≤ allocatable), <code>TaintToleration</code>, <code>NodeAffinity</code> (nodeSelector + required affinity), <code>NodeUnschedulable</code> (cordon), <code>NodePorts</code> (hostPort conflicts), <code>VolumeBinding</code> / <code>VolumeZone</code> (can the PV be attached here?), <code>InterPodAffinity</code>, <code>PodTopologySpread</code>. Zero survivors → <code>FailedScheduling</code> event listing why each node failed, and possibly <strong>preemption</strong> of lower-priority Pods.</li>
+<li><strong>Score (priorities).</strong> Each survivor gets 0–100 from each scoring plugin, multiplied by plugin weight: <code>NodeAffinity</code> preferences, <code>InterPodAffinity</code> preferences, <code>NodeResourcesBalancedAllocation</code>, <code>LeastAllocated</code> (default) or <code>MostAllocated</code> (bin-packing), <code>ImageLocality</code>, <code>TaintToleration</code> (PreferNoSchedule), <code>PodTopologySpread</code>.</li>
+<li><strong>Reserve &amp; permit.</strong> The winning node's resources are reserved in the scheduler's cache so the next Pod in the queue sees them as used (this avoids two Pods "winning" the same last slot).</li>
+<li><strong>Bind.</strong> The scheduler POSTs a Binding; the API server sets <code>nodeName</code>. The kubelet takes over.</li>
+</ol>
+<div class="callout info"><div class="ct">Reading FailedScheduling messages</div><pre><code>0/5 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+2 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector,
+1 node(s) had volume node affinity conflict. preemption: 0/5 nodes are available: 5 No preemption victims found…</code></pre><p>Every node is accounted for, by plugin. Fix the reason that applies to the nodes you <em>intended</em> — the control-plane taint line is usually noise.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Ensure the Pod runs only on nodes labelled X and no other Pod runs there" → taint + toleration + node affinity (or nodeSelector).</li>
+<li>"Each replica on a different node" → <code>podAntiAffinity</code> on its own label with <code>topologyKey: kubernetes.io/hostname</code>.</li>
+<li>Look at the <code>FailedScheduling</code> message before changing anything; it tells you exactly which plugin rejected which node.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl label node cka-worker pool=gpu && kubectl taint node cka-worker pool=gpu:NoSchedule
+$ kubectl create deploy plain --image=nginx --replicas=3 && kubectl get pods -o wide   # none on cka-worker
+$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: gpu}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: gpu}}
+  template:
+    metadata: {labels: {app: gpu}}
+    spec:
+      tolerations: [{key: pool, operator: Equal, value: gpu, effect: NoSchedule}]
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms: [{matchExpressions: [{key: pool, operator: In, values: [gpu]}]}]
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: {matchLabels: {app: gpu}}
+            topologyKey: kubernetes.io/hostname
+      containers: [{name: n, image: nginx}]
+EOF
+$ kubectl get pods -o wide            # one gpu pod on cka-worker, the other Pending (anti-affinity + only one gpu node)
+$ kubectl describe pod -l app=gpu | grep -A2 FailedScheduling
+$ kubectl taint node cka-worker pool-; kubectl label node cka-worker pool-; kubectl delete deploy plain gpu</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Dedicated nodes = taint (keep others out) + toleration (let mine in) + node affinity (keep mine in).</li>
+<li>Pod affinity/anti-affinity place Pods relative to other Pods within a <code>topologyKey</code> domain; anti-affinity to self on hostname = one per node.</li>
+<li>Topology spread constraints are the cheap, scalable way to distribute evenly.</li>
+<li>Scheduler: queue → filter (hard rules) → score (soft rules) → reserve → bind. The FailedScheduling message names the failing plugin per node.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.node('g1', 30, 40, 200, 180, 'gpu-1', { sub: 'label pool=gpu' }) + S.node('g2', 260, 40, 200, 180, 'gpu-2', { sub: 'label pool=gpu' }) + S.node('c1', 490, 40, 200, 180, 'cheap-1', { sub: 'no label' })
+    + S.pod('w1', 100, 150, 'web', { cls: 'ok' }) + S.pod('w2', 330, 150, 'web', { cls: 'ok' }) + S.pod('w3', 560, 150, 'web', { cls: 'ok' })
+    + S.pod('t1', 130, 250, 'train', { cls: 'pur', w: 60 }) + S.pod('t2', 360, 250, 'train', { cls: 'pur', w: 60 })
+    + S.text('m', 360, 292, '', { cls: 'sm b' });
+  Anim.define('dedicated', { w: 720, h: 300, title: 'Why you need both', ms: 2800, svg: s1, steps: [
+    { c: 'Two expensive GPU nodes and one cheap node. Web Pods and training Pods need placing. Start with <b>affinity only</b>: training Pods require <code>pool=gpu</code>.', on(q){} },
+    { c: 'Training Pods land on GPU nodes ✔ — but web Pods have no rule and the scheduler happily spreads them onto GPU nodes too, taking the space ✘.', on(q){ q('#w1 rect,#w2 rect').set('bad'); q('#m').text('affinity alone: ordinary pods still take the GPU nodes'); } },
+    { c: 'Now <b>taint only</b>: <code>pool=gpu:NoSchedule</code> on both GPU nodes. Web Pods are kept off ✔.', on(q){ q('#w1').to(600, 120); q('#w2').to(540, 190); q('#w1 rect,#w2 rect').set('ok'); q('#g1 rect,#g2 rect').set('warn'); q('#m').text('taint alone: web pods pushed to cheap-1'); } },
+    { c: 'But a training Pod that merely <i>tolerates</i> the taint is allowed everywhere — and if cheap-1 has free capacity, it may land there, with no GPU ✘.', on(q){ q('#t2').to(620, 190); q('#t2 rect').set('bad'); q('#w2').to(560, 120); q('#m').text('toleration allows any node, including cheap-1'); } },
+    { c: 'With <b>both</b>: the taint keeps web out, the affinity keeps training in. Every Pod is where it belongs.', on(q){ q('#t1').to(130, 150); q('#t2').to(360, 150); q('#t2 rect').set('pur'); q('#g1 rect,#g2 rect').set('ok'); q('#m').text('taint + toleration + node affinity'); } },
+  ]});
+
+  const N = ['n1', 'n2', 'n3', 'n4', 'n5'];
+  let s2 = S.box('q', 20, 20, 130, 44, ['scheduling queue', 'pod: api-7f (prio 0)'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('filter', 200, 20, 150, 44, ['Filter', 'hard rules'], { subfs: 9, subcls: 'muted' })
+    + S.box('score', 400, 20, 150, 44, ['Score', 'soft rules'], { subfs: 9, subcls: 'muted' })
+    + S.box('bind', 600, 20, 100, 44, ['Bind', 'nodeName'], { subfs: 9, subcls: 'muted' })
+    + S.arrow('q1', 150, 42, 198, 42) + S.arrow('q2', 350, 42, 398, 42) + S.arrow('q3', 550, 42, 598, 42);
+  N.forEach((n, i) => { s2 += S.box(n, 30 + i * 136, 110, 120, 70, [n, ''], { subfs: 9, subcls: 'mono muted' }) + S.text(n + 'r', 90 + i * 136, 195, '', { cls: 'xs badc' }) + S.text(n + 's', 90 + i * 136, 215, '', { cls: 'xs okc b' }); });
+  s2 += S.text('m', 360, 265, '', { cls: 'sm b' });
+  Anim.define('sched-cycle', { w: 720, h: 280, title: 'One scheduling cycle', ms: 2800, svg: s2, steps: [
+    { c: 'A Pod (<code>api-7f</code>, requests 2 CPU, tolerates nothing special, prefers zone a) reaches the head of the queue. Five nodes are candidates.', on(q){ q('#q rect').set('hl'); } },
+    { c: '<b>Filter</b>: <code>TaintToleration</code> rejects n1 (control-plane taint). <code>NodeResourcesFit</code> rejects n2 (only 1 CPU free). <code>NodeUnschedulable</code> rejects n5 (cordoned).', on(q){ q('#q rect').set(); q('#filter rect').set('hl'); q('#n1 rect,#n2 rect,#n5 rect').set('bad'); q('#n1r').text('untolerated taint'); q('#n2r').text('insufficient cpu'); q('#n5r').text('unschedulable'); q('#n3 rect,#n4 rect').set('hl'); } },
+    { c: '<b>Score</b>: n3 is in zone a (+100 × affinity weight) and has an image cached; n4 is emptier (LeastAllocated). Weighted totals: n3 = 86, n4 = 71.', on(q){ q('#filter rect').set(); q('#score rect').set('hl'); q('#n3s').text('score 86'); q('#n4s').text('score 71'); } },
+    { c: '<b>Reserve</b> n3\'s 2 CPU in the scheduler cache, then <b>Bind</b>: POST a Binding, API server sets <code>nodeName: n3</code>. The kubelet on n3 takes it from here.', on(q){ q('#score rect').set(); q('#bind rect').set('ok'); q('#n3 rect').set('ok'); q('#n4 rect').set(); q('#m').text('api-7f → n3'); } },
+    { c: 'Had no node survived the filter, the Pod would get a <code>FailedScheduling</code> event naming every rejection, and — if it has higher priority than some running Pods — the scheduler would try <b>preemption</b> (Day 46).', on(q){ q('#m').text('0 survivors → FailedScheduling (+ maybe preemption)'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

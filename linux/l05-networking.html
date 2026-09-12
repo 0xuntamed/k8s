@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L5 · Linux Networking: veth, Bridges, Routing & iptables · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l05" data-root="../" data-related="d03,d12,d25,d47,d58">
+<article class="lesson">
+<p class="lead">Every CNI plugin, every Service, every NetworkPolicy and every "Pod cannot reach X" ticket is built from five Linux primitives: network namespaces, veth pairs, bridges, the routing table, and netfilter (iptables/nftables, plus conntrack). This page builds a two-"Pod" network by hand with nothing but <code>ip</code> and <code>iptables</code>, then shows you the exact rules kube-proxy and Calico write.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Network namespaces and the <code>ip netns</code> / <code>nsenter</code> tools</li>
+<li>veth pairs, Linux bridges, and how a packet crosses from a namespace to the host</li>
+<li>Routing: <code>ip route</code>, forwarding, the route each CNI installs per node</li>
+<li>netfilter: tables, chains, DNAT/SNAT/MASQUERADE, conntrack — the mechanism behind <code>-p</code>, Services and NetworkPolicy</li>
+<li>Diagnostics: <code>ss</code>, <code>tcpdump</code>, <code>nc</code>, <code>ip -s link</code>, <code>conntrack</code>; IPVS and eBPF in one paragraph each</li>
+</ul></div>
+
+<h2>Build a Pod network by hand</h2>
+<figure data-anim="veth-bridge"></figure>
+<pre><code class="lang-bash"># two "pods" (network namespaces), a bridge, veth cables, IPs, routes
+$ sudo ip netns add pod1 && sudo ip netns add pod2
+$ sudo ip link add br0 type bridge && sudo ip addr add 10.244.1.1/24 dev br0 && sudo ip link set br0 up
+$ sudo ip link add veth1 type veth peer name eth0 netns pod1      # a cable: veth1 on host, eth0 inside pod1
+$ sudo ip link add veth2 type veth peer name eth0 netns pod2
+$ sudo ip link set veth1 master br0 && sudo ip link set veth1 up   # plug host ends into the bridge
+$ sudo ip link set veth2 master br0 && sudo ip link set veth2 up
+$ sudo ip -n pod1 addr add 10.244.1.10/24 dev eth0 && sudo ip -n pod1 link set eth0 up && sudo ip -n pod1 link set lo up
+$ sudo ip -n pod2 addr add 10.244.1.11/24 dev eth0 && sudo ip -n pod2 link set eth0 up && sudo ip -n pod2 link set lo up
+$ sudo ip -n pod1 route add default via 10.244.1.1               # the bridge IP is the gateway
+$ sudo ip -n pod2 route add default via 10.244.1.1
+$ sudo ip netns exec pod1 ping -c1 10.244.1.11                     # pod → pod, through the bridge (L2)
+$ sudo ip netns exec pod1 ping -c1 10.244.1.1                      # pod → host
+# to the internet: forwarding + masquerade
+$ sudo sysctl -w net.ipv4.ip_forward=1
+$ sudo iptables -t nat -A POSTROUTING -s 10.244.1.0/24 ! -o br0 -j MASQUERADE
+$ sudo ip netns exec pod1 ping -c1 1.1.1.1                          # pod → world, source-NAT'd to the host IP
+# see it
+$ ip link show type veth; bridge link; ip -n pod1 addr; ip -n pod1 route
+$ sudo ip netns exec pod1 ss -tlnp; sudo nsenter --net=/var/run/netns/pod1 ip addr   # two ways in</code></pre>
+<p>That is the reference CNI <code>bridge</code> plugin (and Docker's <code>docker0</code>, and kindnet) in ten commands. Calico and Cilium skip the bridge and use direct routes to each veth (<code>10.244.1.10 dev cali1234</code>), but the veth-into-namespace step is universal.</p>
+
+<h2>Across nodes: the routing table</h2>
+<pre><code class="lang-bash">$ ip route                                     # on a Calico/kindnet node:
+default via 192.168.56.1 dev eth0
+10.244.1.0/24 dev br0 proto kernel scope link   # my pods (or per-pod /32 routes on Calico)
+10.244.2.0/24 via 192.168.56.12 dev eth0        # worker-2's pod CIDR → send to worker-2's node IP  (BGP / static / kindnet)
+10.244.3.0/24 via 192.168.56.13 dev eth0
+# or, with an overlay (Flannel VXLAN, Calico VXLAN mode):
+10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink    # encapsulated in UDP 8472 to the other node
+$ ip route get 10.244.2.9                       # which route/interface a destination would use
+$ ip -s link show eth0                          # counters: RX/TX packets, errors, drops</code></pre>
+<p>Each node owns a Pod CIDR (<code>kubectl get node -o jsonpath='{.spec.podCIDR}'</code>). Pod-to-pod across nodes is plain IP routing: the CNI installs one route per remote node (learned via BGP for Calico, written by the kindnet/flannel DaemonSet, or via the cloud route table for VPC CNIs). No NAT between Pods — the Kubernetes network model requires that every Pod can reach every Pod by its real IP. <code>net.ipv4.ip_forward=1</code> is what lets the node pass packets between its interfaces at all.</p>
+
+<h2>netfilter: where Services and policies live</h2>
+<figure data-anim="netfilter"></figure>
+<div class="tbl-wrap"><table>
+<tr><th>Table</th><th>Chains (hooks)</th><th>Purpose</th><th>Kubernetes user</th></tr>
+<tr><td><code>nat</code></td><td>PREROUTING, OUTPUT, POSTROUTING</td><td>Rewrite addresses: DNAT (destination, on the way in) and SNAT/MASQUERADE (source, on the way out). Consulted only for the <em>first</em> packet of a connection; conntrack applies the decision to the rest.</td><td>kube-proxy (Service VIP → Pod IP), CNI (Pod → internet masquerade), Docker <code>-p</code></td></tr>
+<tr><td><code>filter</code></td><td>INPUT, FORWARD, OUTPUT</td><td>Accept/drop. FORWARD sees traffic passing <em>through</em> the node — i.e. to/from Pods.</td><td>NetworkPolicy (Calico's <code>cali-*</code> chains), firewalls</td></tr>
+<tr><td><code>mangle</code>, <code>raw</code></td><td>all</td><td>Marking packets, bypassing conntrack</td><td>kube-proxy marks (KUBE-MARK-MASQ), Calico</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ sudo iptables -t nat -L -n --line-numbers | head -40        # or: iptables-save | less
+$ sudo iptables -t nat -L KUBE-SERVICES -n | grep 10.96.0.10   # cluster DNS Service → KUBE-SVC-… chain
+$ sudo iptables -t nat -L KUBE-SVC-TCOU7JCQXEZGVUNU -n         # statistic --probability rules → KUBE-SEP-… (one per endpoint)
+$ sudo iptables -t nat -L KUBE-SEP-XXXX -n                     # DNAT --to-destination 10.244.1.5:53
+$ sudo iptables -t nat -L KUBE-NODEPORTS -n                    # NodePort entry points
+$ sudo iptables -t filter -L FORWARD -n | head                  # KUBE-FORWARD, cali-FORWARD …
+$ sudo iptables -t filter -L cali-tw-cali1a2b3c4d -n            # "to workload": a pod's ingress NetworkPolicy chain (Calico)
+$ sudo nft list ruleset | head                                  # modern kernels: iptables is a compatibility layer over nftables; kube-proxy has a native nftables mode
+$ sudo conntrack -L | grep 10.96.0.10 | head                    # live NAT state: VIP ↔ chosen endpoint per connection
+$ sudo conntrack -S; sysctl net.netfilter.nf_conntrack_max      # table pressure → "nf_conntrack: table full, dropping packet" in dmesg</code></pre>
+<dl class="kv">
+<dt>DNAT</dt><dd>Change the destination before routing. <code>-p 8080:80</code> and every ClusterIP/NodePort rule.</dd>
+<dt>SNAT / MASQUERADE</dt><dd>Change the source after routing (MASQUERADE = to the outgoing interface's IP). Pod → internet; also NodePort traffic when <code>externalTrafficPolicy: Cluster</code> forwards to another node (hence lost client IPs).</dd>
+<dt>conntrack</dt><dd>The connection-tracking table: remembers each flow and its NAT mapping so replies are un-NAT'ed and later packets skip the rule chains. Entries time out (TCP established: 5 days; UDP: 30 s) — which is why DNS over UDP through a Service can hit stale entries, and why the table has a max size.</dd>
+</dl>
+
+<h2>IPVS and eBPF in one paragraph each</h2>
+<p><strong>IPVS</strong> (kube-proxy <code>mode: ipvs</code>) replaces the linear iptables chain per Service with a kernel hash table of virtual servers → real servers (<code>ipvsadm -Ln</code>), with scheduling algorithms (rr, lc, sh). O(1) lookup at thousands of Services; still uses iptables for masquerade marks. <strong>eBPF</strong> (Cilium, Calico eBPF mode) attaches programs to the veth's TC hook and does Service translation, policy and routing without iptables at all; identity-based policy (labels → numeric identity) instead of IP sets; <code>cilium bpf lb list</code>, <code>hubble observe</code> replace the iptables commands above. The model — DNAT to a Pod IP, policy at the Pod's interface — is unchanged.</p>
+
+<h2>Diagnostics</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Answers</th></tr>
+<tr><td>ip addr / ip -br addr</td><td>Interfaces and IPs (in this namespace)</td></tr>
+<tr><td>ip route; ip route get IP</td><td>Where packets to IP go</td></tr>
+<tr><td>ip neigh</td><td>ARP table (is the next hop resolvable?)</td></tr>
+<tr><td>ss -tlnp / ss -tunap</td><td>Listening sockets with PIDs / all connections (replaces netstat)</td></tr>
+<tr><td>nc -zv host port; curl -v; timeout 2 bash -c '&lt;/dev/tcp/host/port'</td><td>Can I connect? (the last works without any tools installed)</td></tr>
+<tr><td>tcpdump -i any port 53 -nn; tcpdump -i cali1234 -nn</td><td>What is actually on the wire, on a specific veth</td></tr>
+<tr><td>nsenter -t PID -n &lt;cmd&gt;</td><td>Run any of the above inside a Pod's namespace with host tools</td></tr>
+<tr><td>iptables -t nat -S | grep IP; conntrack -L | grep IP</td><td>Which rule/flow touches this address</td></tr>
+<tr><td>ping; traceroute -n; mtr</td><td>Reachability and path (many CNIs allow ICMP; NetworkPolicies may drop it)</td></tr>
+<tr><td>ethtool -S eth0; ip -s link</td><td>NIC drops/errors; MTU issues with overlays (VXLAN adds 50 bytes → set Pod MTU 1450)</td></tr>
+</table></div>
+
+<div class="lab"><h3>Hands-on lab (25 min)</h3>
+<pre><code class="lang-bash"># build the two-pod network above, then add a "Service" by hand:
+$ sudo iptables -t nat -A OUTPUT -d 10.96.0.42 -p tcp --dport 80 -j DNAT --to-destination 10.244.1.11:8080     # VIP → pod2
+$ sudo iptables -t nat -A PREROUTING -d 10.96.0.42 -p tcp --dport 80 -j DNAT --to-destination 10.244.1.11:8080
+$ sudo ip netns exec pod2 sh -c 'while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nhello from pod2" | nc -l -p 8080 -q1; done' &amp;
+$ curl -s 10.96.0.42                                     # host → "Service" VIP → DNAT → pod2
+$ sudo ip netns exec pod1 curl -s 10.96.0.42             # pod1 → VIP: PREROUTING DNAT (its packets enter the host via veth1)
+$ sudo conntrack -L | grep 10.96.0.42                    # the mapping conntrack remembers
+$ sudo tcpdump -i veth2 -nn -c4 port 8080 &amp;              # watch the DNAT'ed packets arrive on pod2's cable
+$ sudo ip netns exec pod1 curl -s 10.96.0.42 &gt;/dev/null
+# a "NetworkPolicy": drop pod1 → pod2 on 8080
+$ sudo iptables -I FORWARD -s 10.244.1.10 -d 10.244.1.11 -p tcp --dport 8080 -j DROP
+$ sudo ip netns exec pod1 timeout 2 curl -s 10.96.0.42 || echo blocked
+# cleanup
+$ sudo iptables -D FORWARD -s 10.244.1.10 -d 10.244.1.11 -p tcp --dport 8080 -j DROP; sudo iptables -t nat -F; kill %1 %2 2&gt;/dev/null
+$ sudo ip netns del pod1; sudo ip netns del pod2; sudo ip link del br0</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Pod networking = a network namespace + a veth pair + (a bridge or direct route) + routes; the CNI automates exactly these commands.</li>
+<li>Cross-node traffic is IP routing over per-node Pod CIDRs (direct or encapsulated); <code>ip_forward</code> must be on; no NAT between Pods.</li>
+<li>Services are DNAT rules in the nat table (kube-proxy); NetworkPolicies are filter rules on Pod interfaces (CNI); conntrack makes both stateful.</li>
+<li>IPVS and eBPF change the data structure, not the model.</li>
+<li><code>ip</code>, <code>ss</code>, <code>tcpdump</code>, <code>conntrack</code>, <code>iptables -t nat -S</code> and <code>nsenter -n</code> are the debugging kit.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let s1 = S.node('host', 20, 20, 680, 300, 'host network namespace · 192.168.56.11', {})
+    + S.zone('p1', 40, 60, 200, 130, 'netns pod1', { cls: 'hl' }) + S.zone('p2', 480, 60, 200, 130, 'netns pod2', { cls: 'hl' })
+    + S.box('e1', 70, 110, 140, 40, ['eth0', '10.244.1.10/24'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('e2', 510, 110, 140, 40, ['eth0', '10.244.1.11/24'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('br', 280, 220, 160, 44, ['br0 (bridge)', '10.244.1.1/24'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('v1', 250, 130, 70, 30, 'veth1', { fs: 9, lcls: 'mono', hidden: true }) + S.box('v2', 400, 130, 70, 30, 'veth2', { fs: 9, lcls: 'mono', hidden: true })
+    + S.box('eth', 560, 250, 120, 40, ['eth0 (NIC)', '192.168.56.11'], { subfs: 9, subcls: 'mono muted' })
+    + S.arrow('c1', 210, 130, 250, 145, { d: 'M 210 130 L 250 145', cls: 'hid noarr' }) + S.arrow('c2', 510, 130, 470, 145, { d: 'M 510 130 L 470 145', cls: 'hid noarr' })
+    + S.arrow('c3', 285, 160, 320, 220, { d: 'M 285 160 L 320 220', cls: 'hid noarr' }) + S.arrow('c4', 435, 160, 400, 220, { d: 'M 435 160 L 400 220', cls: 'hid noarr' })
+    + S.arrow('c5', 440, 242, 558, 265, { d: 'M 440 242 L 558 265', cls: 'hid', label: 'route + MASQUERADE', lx: 500, ly: 290 })
+    + S.dot('pk', 140, 100, { hidden: true, label: '' })
+    + S.text('m', 360, 335, '', { cls: 'sm b' });
+  Anim.define('veth-bridge', { w: 720, h: 350, title: 'A pod network by hand', ms: 2800, svg: s1, steps: [
+    { c: '<code>ip netns add pod1/pod2</code>: two empty network namespaces. Each has only a loopback, down. No way in or out.', on(q){} },
+    { c: '<code>ip link add veth1 type veth peer name eth0 netns pod1</code>: a <b>veth pair</b> is a virtual cable; one end appears as eth0 inside pod1, the other (veth1) stays on the host.', on(q){ q('#e1,#v1,#c1').show(); q('#e2,#v2,#c2').show(); q('#m').text('a cable with one end in each namespace'); } },
+    { c: 'A <b>bridge</b> br0 is a virtual switch. Plugging veth1 and veth2 into it (<code>ip link set vethN master br0</code>) puts both pods on one L2 segment. The bridge gets 10.244.1.1 and becomes the pods\' gateway.', on(q){ q('#br,#c3,#c4').show(); q('#br rect').set('hl'); } },
+    { c: 'pod1 pings pod2: ARP on the segment, then the frame goes eth0 → veth1 → br0 → veth2 → eth0. Pure L2; the host\'s IP stack is not involved.', on(q){ q('#pk').show().to(140, 100); q('#pk').to(360, 210); q('#m').text('pod → pod on the same node: through the bridge'); } },
+    { c: 'pod1 → 1.1.1.1: no route on the segment, so it goes to the gateway (br0), the host <b>routes</b> it (ip_forward=1) out eth0, and a <b>MASQUERADE</b> rule rewrites the source to the node IP.', on(q){ q('#pk').to(620, 250); q('#c5').show().set('hl'); q('#m').text('pod → world: route + SNAT'); } },
+    { c: 'For pod2 on <i>another</i> node, the host would instead have a route <code>10.244.2.0/24 via &lt;node-2 IP&gt;</code>, and node-2 delivers into its own bridge. That is the whole CNI: this, on every node, with routes exchanged.', on(q){ q('#m').text('the CNI plugin automates exactly these commands'); } },
+  ]});
+
+  let s2 = S.box('in', 20, 120, 90, 40, 'packet in', { fs: 10 })
+    + S.box('pre', 140, 120, 110, 40, ['PREROUTING', 'nat: DNAT'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('rt', 280, 120, 90, 40, ['routing', 'decision'], { subfs: 9, subcls: 'muted' })
+    + S.box('fwd', 400, 60, 110, 40, ['FORWARD', 'filter: policy'], { subfs: 9, subcls: 'mono muted', cls: 'cy' })
+    + S.box('inp', 400, 180, 110, 40, ['INPUT', 'filter'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('post', 540, 60, 110, 40, ['POSTROUTING', 'nat: SNAT/MASQ'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('loc', 540, 180, 110, 40, ['local process', '(kubelet, sshd)'], { subfs: 9, subcls: 'muted' })
+    + S.box('out', 670, 60, 40, 40, 'out', { fs: 10 })
+    + S.arrow('a1', 110, 140, 138, 140) + S.arrow('a2', 250, 140, 278, 140) + S.arrow('a3', 370, 130, 398, 85, { d: 'M 370 132 L 398 84' }) + S.arrow('a4', 370, 150, 398, 195, { d: 'M 370 148 L 398 195' })
+    + S.arrow('a5', 510, 80, 538, 80) + S.arrow('a6', 650, 80, 668, 80) + S.arrow('a7', 510, 200, 538, 200)
+    + S.term('ct', 20, 240, 680, 60, ['conntrack:', ''], { fs: 9.5 })
+    + S.dot('pk', 65, 100, { hidden: true, label: 'dst 10.96.0.42:80' });
+  Anim.define('netfilter', { w: 720, h: 310, title: 'A Service packet through netfilter', ms: 2800, svg: s2, steps: [
+    { c: 'A packet from a Pod arrives on the node (via its veth) addressed to a Service VIP. netfilter hooks it at <b>PREROUTING</b> before any routing decision.', on(q){ q('#pk').show().to(195, 100); q('#pre rect').set('pur'); } },
+    { c: 'In the nat table\'s KUBE-SERVICES chain a rule matches the VIP; a random KUBE-SEP chain <b>DNATs</b> the destination to a Pod IP. Only the first packet of the flow consults these rules.', on(q){ q('#pk').text('dst 10.244.2.9:8080'); q('#ct-l1').text('new: 10.244.1.10:5123 → 10.96.0.42:80  ⇒  10.244.2.9:8080').style('fill', 'var(--green)'); } },
+    { c: '<b>Routing</b> now sees 10.244.2.9 — a Pod on another node — and picks the route via that node. Because it is not for a local process, the packet goes to <b>FORWARD</b>.', on(q){ q('#pk').to(325, 100); q('#rt rect').set('hl'); } },
+    { c: '<b>FORWARD</b> is where NetworkPolicy lives: Calico\'s chains check the source/destination Pod identities and ports and ACCEPT or DROP. (Cilium does the same in eBPF on the veth.)', on(q){ q('#pk').to(455, 40); q('#fwd rect').set('cy'); } },
+    { c: '<b>POSTROUTING</b>: if the source must be rewritten (Pod → internet, or NodePort with Cluster policy), MASQUERADE happens here. Pod → Pod: no SNAT. The packet leaves on eth0.', on(q){ q('#pk').to(595, 40); q('#post rect').set('pur'); q('#pk').to(690, 40); } },
+    { c: 'The reply comes back with src 10.244.2.9:8080. conntrack recognises the flow and <b>reverses</b> the NAT: the Pod sees a reply from 10.96.0.42:80 as expected. Every later packet skips the nat rules entirely.', on(q){ q('#ct-l1').text('established: reply 10.244.2.9:8080 → rewritten to src 10.96.0.42:80').style('fill', 'var(--accent)'); q('#pk').hide(); } },
+  ]});
+})();
+</script>
+</body>
+</html>

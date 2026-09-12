@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 50 · Ingress 2: Path-Based Routing on EKS with AWS ALB · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d50" data-root="../" data-related="d49,d51,d12">
+<article class="lesson">
+<p class="lead">On AWS the Ingress controller that matters is the <strong>AWS Load Balancer Controller</strong>: instead of running a proxy inside the cluster, it turns each Ingress into an <em>Application Load Balancer</em> with listener rules and target groups that point straight at Pod IPs. This lesson deploys two services behind one ALB with path-based routing, and explains the IAM plumbing (IRSA) that lets a Pod create AWS resources. The same manifests work with ingress-nginx on KIND — only the class and annotations change.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>How the AWS LB Controller maps Ingress → ALB → listener rules → target groups</li>
+<li>IRSA: giving the controller's ServiceAccount an IAM role</li>
+<li>Installing the controller with Helm and the <code>alb</code> IngressClass</li>
+<li>Path-based routing to two Services with the annotations that matter</li>
+<li>Verifying in the AWS console and with curl; the equivalent on KIND</li>
+</ul></div>
+
+<h2>Architecture</h2>
+<figure data-anim="alb-flow"></figure>
+<div class="tbl-wrap"><table>
+<tr><th>Ingress concept</th><th>Becomes on AWS</th></tr>
+<tr><td>Ingress object (class <code>alb</code>)</td><td>One ALB (or shared, with <code>group.name</code>)</td></tr>
+<tr><td><code>rules[].host</code> + <code>paths[]</code></td><td>Listener rules: host-header / path-pattern conditions, priority-ordered</td></tr>
+<tr><td><code>backend.service</code></td><td>A target group; with <code>target-type: ip</code>, targets are Pod IPs (VPC CNI gives Pods real VPC IPs); with <code>instance</code>, targets are nodes on a NodePort</td></tr>
+<tr><td><code>tls[]</code> / ACM annotation</td><td>HTTPS listener with an ACM certificate (Day 51)</td></tr>
+<tr><td>Readiness</td><td>ALB health checks + a <code>TargetGroupBinding</code> CRD the controller keeps in sync with EndpointSlices</td></tr>
+</table></div>
+
+<h2>Prerequisites: IRSA</h2>
+<p>The controller calls the AWS API (<code>elasticloadbalancing:*</code>, <code>ec2:Describe*</code>…). It needs credentials, and the right way is <strong>IAM Roles for Service Accounts</strong>: the cluster's OIDC issuer is registered with IAM, the controller's ServiceAccount is annotated with a role ARN, and AWS STS exchanges the Pod's projected token (Day 37) for temporary AWS credentials. No access keys anywhere.</p>
+<pre><code class="lang-bash">$ eksctl utils associate-iam-oidc-provider --cluster cka --approve
+$ curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+$ aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam-policy.json
+$ eksctl create iamserviceaccount --cluster cka --namespace kube-system --name aws-load-balancer-controller \
+    --attach-policy-arn arn:aws:iam::&lt;acct&gt;:policy/AWSLoadBalancerControllerIAMPolicy --approve
+$ kubectl -n kube-system get sa aws-load-balancer-controller -o yaml | grep role-arn     # eks.amazonaws.com/role-arn: …</code></pre>
+
+<h2>Install the controller</h2>
+<pre><code class="lang-bash">$ helm repo add eks https://aws.github.io/eks-charts && helm repo update
+$ helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system \
+    --set clusterName=cka --set serviceAccount.create=false --set serviceAccount.name=aws-load-balancer-controller
+$ kubectl -n kube-system rollout status deploy/aws-load-balancer-controller
+$ kubectl get ingressclass                      # alb
+# subnets must be tagged so the controller can pick them:
+#   public:  kubernetes.io/role/elb=1        private: kubernetes.io/role/internal-elb=1</code></pre>
+
+<h2>Two services, one ALB</h2>
+<pre><code class="lang-bash">$ kubectl create ns shop
+$ kubectl create deploy web --image=nginx -n shop --port=80 && kubectl expose deploy web --port=80 -n shop
+$ kubectl create deploy api --image=hashicorp/http-echo -n shop --port=5678 -- -text="hello from api" && kubectl expose deploy api --port=5678 -n shop</code></pre>
+<pre><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing       # or internal
+    alb.ingress.kubernetes.io/target-type: ip               # pods as targets (needs VPC CNI); "instance" = NodePort
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/group.name: shop              # optional: share one ALB across several Ingresses
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service: {name: api, port: {number: 5678}}
+      - path: /
+        pathType: Prefix
+        backend:
+          service: {name: web, port: {number: 80}}</code></pre>
+<pre><code class="lang-bash">$ kubectl apply -f ingress.yaml
+$ kubectl get ingress -n shop -w                # ADDRESS fills in after ~2 min: k8s-shop-shop-abc123-1234567890.eu-west-1.elb.amazonaws.com
+$ ALB=$(kubectl get ingress shop -n shop -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+$ curl -s http://$ALB/api            # hello from api
+$ curl -s http://$ALB/ | head -3     # nginx welcome page
+$ kubectl get targetgroupbindings -n shop        # one per backend service
+$ kubectl -n kube-system logs deploy/aws-load-balancer-controller --tail=20   # "created loadBalancer", "created targetGroup", "registered targets"</code></pre>
+<p>In the AWS console: EC2 → Load Balancers shows the ALB; its HTTP:80 listener has rules — priority 1: path-pattern <code>/api*</code> → target group api; priority 2: <code>/*</code> → web; default → 404. Each target group lists Pod IPs with health status. Scale the Deployment and targets appear; delete a Pod and its target drains.</p>
+
+<div class="callout warn"><div class="ct">Path ordering</div><p>ALB evaluates rules by priority; the controller orders them so that more specific paths come first — but <code>Prefix</code> on the ALB is implemented as <code>/api*</code>, which also matches <code>/apix</code>. If that matters, use <code>Exact</code> or a trailing slash. On ingress-nginx the standard Prefix semantics (path-segment boundary) apply. This kind of controller-specific behaviour is why the Gateway API (Day 52) specifies matching precisely.</p></div>
+
+<h2>The same thing on KIND / ingress-nginx</h2>
+<pre><code class="lang-bash">$ kubectl create ingress shop -n shop --class=nginx --rule="/api*=api:5678" --rule="/*=web:80"
+$ curl -s localhost/api; curl -s localhost/ | head -3          # via the Day 8 port mappings</code></pre>
+<p>Identical rules; the difference is who proxies (nginx Pods vs an ALB) and which annotations exist. Keep Ingress specs portable by putting only routing in <code>spec</code> and controller specifics in annotations that a Kustomize overlay can swap.</p>
+
+<h2>Useful annotations (AWS LB Controller)</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Annotation</th><th>Purpose</th></tr>
+<tr><td><code>alb.ingress.kubernetes.io/scheme</code></td><td><code>internet-facing</code> or <code>internal</code></td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/target-type</code></td><td><code>ip</code> (Pods) or <code>instance</code> (NodePort)</td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/group.name</code> / <code>group.order</code></td><td>Merge several Ingresses (even across namespaces) into one ALB; order their rules</td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/listen-ports</code></td><td><code>'[{"HTTP":80},{"HTTPS":443}]'</code></td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/certificate-arn</code>, <code>ssl-redirect</code></td><td>TLS (Day 51)</td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/healthcheck-path</code>, <code>success-codes</code></td><td>Target group health checks</td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/subnets</code>, <code>security-groups</code>, <code>load-balancer-attributes</code></td><td>Override auto-discovery; access logs, idle timeout, deletion protection</td></tr>
+<tr><td><code>alb.ingress.kubernetes.io/actions.&lt;name&gt;</code></td><td>Redirects, fixed responses, weighted target groups (canary)</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>The exam is cloud-agnostic — you will see ingress-nginx or similar, never an ALB. What transfers: <code>ingressClassName</code>, path rules with <code>pathType</code>, backend Service/port in the same namespace, and reading <code>kubectl describe ingress</code> to confirm backends resolve to endpoints. If ADDRESS stays empty, the controller is not processing the object (wrong class or controller down).</p></div>
+
+<div class="lab"><h3>Hands-on lab (30 min, EKS) — or 10 min on KIND</h3>
+<pre><code class="lang-bash"># EKS
+$ eksctl create cluster --name cka --region eu-west-1 --nodes 2 --node-type t3.medium   # ~15 min
+# … IRSA + helm install from above …
+$ kubectl apply -f ingress.yaml && kubectl get ingress -n shop -w
+$ ALB=$(kubectl get ingress shop -n shop -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'); curl -s http://$ALB/api
+$ kubectl scale deploy api -n shop --replicas=3; aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --query 'TargetGroups[?contains(TargetGroupName,`api`)].TargetGroupArn' --output text)
+$ kubectl delete ingress shop -n shop            # the ALB is deleted too (watch the controller log)
+$ eksctl delete cluster --name cka               # do not forget — ALBs and nodes cost money
+# KIND: see "The same thing on KIND" above</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>AWS LB Controller turns an Ingress into an ALB with listener rules and target groups of Pod IPs; nothing proxies inside the cluster.</li>
+<li>It needs an IAM role via IRSA (OIDC + annotated ServiceAccount) and tagged subnets.</li>
+<li>Path-based routing: rules in <code>spec</code>, AWS specifics in <code>alb.ingress.kubernetes.io/*</code> annotations; <code>group.name</code> shares one ALB.</li>
+<li>Same Ingress spec works on ingress-nginx with a different class — keep specs portable.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.zone('aws', 20, 20, 320, 290, 'AWS (outside the cluster)')
+    + S.box('alb', 40, 60, 280, 50, ['Application Load Balancer', 'k8s-shop-shop-….elb.amazonaws.com'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur', hidden: true })
+    + S.term('lr', 40, 125, 280, 70, ['listener HTTP:80 rules', '', '', ''], { fs: 9 })
+    + S.box('tg1', 40, 210, 130, 50, ['target group api', ''], { subfs: 8.5, subcls: 'mono muted', hidden: true }) + S.box('tg2', 190, 210, 130, 50, ['target group web', ''], { subfs: 8.5, subcls: 'mono muted', hidden: true })
+    + S.zone('cl', 380, 20, 320, 290, 'EKS cluster')
+    + S.box('ctl', 400, 50, 280, 50, ['aws-load-balancer-controller', 'SA with IAM role (IRSA)'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.term('ing', 400, 115, 280, 60, ['Ingress shop (class alb)', ' /api → api:5678', ' /    → web:80'], { fs: 9 })
+    + S.pod('a1', 440, 230, 'api', { cls: 'ok', w: 50, sub: '10.0.1.5' }) + S.pod('a2', 510, 230, 'api', { cls: 'ok', w: 50, sub: '10.0.2.8' }) + S.pod('w1', 620, 230, 'web', { cls: 'ok', w: 50, sub: '10.0.1.9' })
+    + S.arrow('c1', 400, 75, 342, 85, { d: 'M 400 78 L 342 84', cls: 'hid', label: 'AWS API calls', lx: 370, ly: 60 })
+    + S.icon('u', 60, 300, 'user', { hidden: true })
+    + S.text('m', 360, 325, '', { cls: 'sm b' });
+  Anim.define('alb-flow', { w: 720, h: 340, title: 'Ingress → ALB', ms: 2800, svg, steps: [
+    { c: 'You apply an Ingress with <code>ingressClassName: alb</code>. The controller Pod — running in the cluster with an IAM role obtained via its ServiceAccount token — sees it.', on(q){ q('#ing-l0').style('fill', 'var(--accent)'); q('#ctl rect').set('cy'); } },
+    { c: 'It calls the AWS API: <b>CreateLoadBalancer</b> in the tagged public subnets, with a security group and an HTTP:80 listener.', on(q){ q('#c1').show().set('hl'); q('#alb').show(); q('#m').text('elasticloadbalancing:CreateLoadBalancer'); } },
+    { c: 'For each backend Service it creates a <b>target group</b> (target-type ip) and a <b>TargetGroupBinding</b> object that mirrors the Service\'s EndpointSlice into the target group — Pod IPs, kept in sync as Pods come and go.', on(q){ q('#tg1,#tg2').show(); q('#tg1 text:nth-of-type(2)').text('10.0.1.5, 10.0.2.8'); q('#tg2 text:nth-of-type(2)').text('10.0.1.9'); q('#m').text('targets = pod IPs from EndpointSlices'); } },
+    { c: 'Then <b>listener rules</b> from the Ingress paths, ordered by priority: <code>/api*</code> → api group, <code>/*</code> → web group, default → 404.', on(q){ q('#lr-l1').text(' 1: path /api* → tg api').style('fill', 'var(--green)'); q('#lr-l2').text(' 2: path /*    → tg web').style('fill', 'var(--green)'); q('#lr-l3').text(' default → 404').style('fill', 'var(--muted)'); q('#ing-l1,#ing-l2').style('fill', 'var(--green)'); } },
+    { c: 'The ALB\'s DNS name is written to the Ingress <code>status</code> (the ADDRESS column). Traffic now flows internet → ALB → Pod IP directly over the VPC; no kube-proxy, no in-cluster proxy Pod.', on(q){ q('#u').show(); q('#m').text('ADDRESS: k8s-shop-shop-….elb.amazonaws.com'); q('#alb rect').set('ok'); } },
+    { c: 'Delete the Ingress and the controller deletes the ALB, target groups and rules. Scale api to 3 and a third target registers within seconds. The AWS resources are a projection of the Kubernetes objects.', on(q){ q('#tg1 text:nth-of-type(2)').text('10.0.1.5, 10.0.2.8, 10.0.3.2'); q('#m').text('AWS state reconciled from Ingress + EndpointSlices'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

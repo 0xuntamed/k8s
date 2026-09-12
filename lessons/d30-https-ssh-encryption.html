@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 30 · How HTTPS & SSH Work · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d30" data-root="../" data-linux="l09" data-related="d31,d32">
+<article class="lesson">
+<p class="lead">Every component in a Kubernetes cluster authenticates every other with TLS certificates, and every <code>kubectl</code> call is an HTTPS request. If you have only ever treated HTTPS as "the padlock", the next four lessons will feel like magic. So we start from nothing: what encryption is, why there are two kinds, what a hash is for, and how SSH and HTTPS combine them. No Kubernetes on this page at all — just the primitives.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Symmetric encryption: one shared key, fast, but how do you share the key?</li>
+<li>Asymmetric encryption: a key pair, and the two things you can do with it (encrypt to someone, sign as someone)</li>
+<li>Hashing and digital signatures — integrity and authenticity</li>
+<li>How SSH uses key pairs both to identify the server and to log you in</li>
+<li>How HTTPS uses asymmetric crypto to agree on a symmetric key, and why it still needs certificates</li>
+</ul></div>
+
+<h2>The problem</h2>
+<p>Two parties want to exchange data over a network that anyone can listen on (and tamper with). They need three guarantees: <strong>confidentiality</strong> (nobody else can read it), <strong>integrity</strong> (nobody changed it in transit), and <strong>authenticity</strong> (I am really talking to who I think I am). Encryption gives the first, hashing the second, and signatures with a trust anchor the third.</p>
+
+<h2>Symmetric encryption</h2>
+<p>One secret key encrypts and decrypts. AES-256 is the standard: extremely fast (hardware-accelerated in every CPU), used for all bulk data. The flaw is not the algorithm — it is <em>distribution</em>: both sides must have the same key, and you cannot send it over the network you are trying to protect.</p>
+<pre><code class="lang-bash">$ openssl rand -hex 32 &gt; key.txt                                        # a 256-bit key
+$ openssl enc -aes-256-cbc -pbkdf2 -in secret.txt -out secret.enc -pass file:key.txt
+$ openssl enc -d -aes-256-cbc -pbkdf2 -in secret.enc -pass file:key.txt   # same key decrypts</code></pre>
+
+<h2>Asymmetric encryption</h2>
+<p>A <strong>key pair</strong>: a <em>private</em> key you never share and a <em>public</em> key you give to everyone. They are mathematically linked (RSA, or elliptic curves like ECDSA/Ed25519) so that:</p>
+<div class="compare">
+<div><h4>Encrypt with public → decrypt with private</h4><p>Anyone can seal a message that only the key owner can open. Solves key distribution: send me your public key, I encrypt a fresh symmetric key with it, only you can read it.</p></div>
+<div><h4>Sign with private → verify with public</h4><p>Only the key owner can produce a signature that the public key verifies. Proves <em>who</em> produced a message and that it was not altered. This is how certificates and SSH logins work.</p></div>
+</div>
+<p>Asymmetric operations are thousands of times slower than AES, so they are used only for small things: exchanging a symmetric key and signing hashes.</p>
+<figure data-anim="sym-asym"></figure>
+<pre><code class="lang-bash">$ openssl genrsa -out me.key 2048                     # private key (keep secret, chmod 600)
+$ openssl rsa -in me.key -pubout -out me.pub          # derive the public key
+$ openssl pkeyutl -encrypt -pubin -inkey me.pub -in msg.txt -out msg.enc   # anyone can do this
+$ openssl pkeyutl -decrypt -inkey me.key -in msg.enc  # only the private key can</code></pre>
+
+<h2>Hashing and signatures</h2>
+<p>A <strong>hash</strong> (SHA-256) turns any input into a fixed 32-byte fingerprint: deterministic, one-way, and any change to the input changes the whole output. It is <em>integrity</em>, not secrecy — anyone can compute it. A <strong>digital signature</strong> is a hash encrypted with a private key: the verifier recomputes the hash of what they received, decrypts the signature with the signer's public key, and compares. Match → the exact bytes came from the private key's owner.</p>
+<pre><code class="lang-bash">$ sha256sum kubectl                                                   # compare with the published checksum
+$ openssl dgst -sha256 -sign me.key -out msg.sig msg.txt              # sign
+$ openssl dgst -sha256 -verify me.pub -signature msg.sig msg.txt      # Verified OK</code></pre>
+
+<h2>How SSH works</h2>
+<figure data-anim="ssh-auth"></figure>
+<ol class="steps">
+<li><strong>Key exchange.</strong> Client and server run Diffie-Hellman: each contributes a public value, both derive the <em>same</em> secret without ever sending it. That secret becomes the symmetric session key (AES/ChaCha20) for everything that follows.</li>
+<li><strong>Server authentication.</strong> The server signs the exchange with its <em>host key</em>. Your client checks the host's public key against <code>~/.ssh/known_hosts</code>. First connection: "The authenticity of host … can't be established" — you are being asked to establish trust manually. A changed key later means either a reinstalled server or a man-in-the-middle.</li>
+<li><strong>Client authentication.</strong> With password auth, you send the password inside the encrypted channel. With key auth (<code>ssh-keygen</code> → <code>~/.ssh/id_ed25519</code> + <code>.pub</code>), the server has your public key in <code>~/.ssh/authorized_keys</code>; it sends a random challenge, your client signs it with your private key, the server verifies with the public key. Your private key never leaves your machine.</li>
+</ol>
+<p>Both directions use the same primitive — sign a challenge with a private key, verify with a known public key — which is <strong>mutual authentication</strong>. The difference from TLS is how trust in the public key is established: SSH uses lists you maintain by hand; TLS uses certificates signed by an authority.</p>
+
+<h2>How HTTPS works</h2>
+<ol class="steps">
+<li><strong>Client hello.</strong> Browser says: I speak TLS 1.3, here are my cipher suites, and here is my Diffie-Hellman public value.</li>
+<li><strong>Server hello + certificate.</strong> Server picks a suite, sends its DH value (both sides now derive the session key), and sends its <strong>certificate</strong>: its public key plus its identity (<code>CN=api.example.com</code>) signed by a <strong>Certificate Authority</strong>.</li>
+<li><strong>Certificate verification.</strong> The browser checks the CA's signature using the CA public key it already trusts (shipped with the OS/browser), checks the name matches the URL, checks expiry and revocation.</li>
+<li><strong>Server proves possession.</strong> The server signs the handshake transcript with the private key matching the certificate. Without the private key, a stolen certificate is useless.</li>
+<li><strong>Encrypted application data.</strong> Everything after this is AES with the session key. One round-trip in TLS 1.3.</li>
+</ol>
+<div class="callout mental"><div class="ct">Mental model</div><p>Asymmetric crypto answers "<em>who</em> am I talking to?" (signatures, certificates) and "<em>how</em> do we agree on a secret?" (key exchange). Symmetric crypto then does the actual work fast. A certificate is just a public key with a name on it and a CA's signature vouching for the pairing. Everything on <a href="d31-tls-part1.html">Day 31</a> onward is variations of this: who signs whose public key, and who trusts which signer.</p></div>
+
+<div class="callout linux" data-ref="l09"><div class="ct">Under the hood · Linux</div><p>Your system's trusted CA public keys live in <code>/etc/ssl/certs/</code> (Debian/Ubuntu: <code>ca-certificates.crt</code> is the bundle; <code>update-ca-certificates</code> adds your own). <code>curl</code>, <code>kubectl</code>, Go and Python programs all read this bundle unless told otherwise — which is why adding an internal CA to that directory makes a whole machine trust it. <code>openssl s_client -connect host:443 -showcerts</code> shows a live handshake and certificate chain; <code>ssh -v</code> shows the SSH negotiation. The <a href="../linux/l09-openssl-certificates.html">OpenSSL page</a> has the full toolkit you will use on Days 33–34.</p></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash"># asymmetric round-trip
+$ openssl genrsa -out a.key 2048 && openssl rsa -in a.key -pubout -out a.pub
+$ echo "hello" &gt; m.txt && openssl pkeyutl -encrypt -pubin -inkey a.pub -in m.txt -out m.enc
+$ openssl pkeyutl -decrypt -inkey a.key -in m.enc
+# signature: tamper and watch it fail
+$ openssl dgst -sha256 -sign a.key -out m.sig m.txt && openssl dgst -sha256 -verify a.pub -signature m.sig m.txt
+$ echo "hellO" &gt; m.txt && openssl dgst -sha256 -verify a.pub -signature m.sig m.txt     # Verification Failure
+# a real TLS handshake
+$ openssl s_client -connect kubernetes.io:443 -servername kubernetes.io &lt; /dev/null 2&gt;/dev/null | openssl x509 -noout -subject -issuer -dates
+# ssh key auth, if you have a server: ssh-keygen -t ed25519; ssh-copy-id user@host; ssh -v user@host 2&gt;&1 | grep -E 'Offering|Authenticated'</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Symmetric (AES): one shared key, fast, key-distribution problem. Asymmetric (RSA/EC): public/private pair, slow, solves distribution and enables signatures.</li>
+<li>Encrypt to a public key; sign with a private key; a hash is a fingerprint, a signature is a signed fingerprint.</li>
+<li>SSH: DH session key + host key in known_hosts + your key pair in authorized_keys — mutual auth with hand-managed trust.</li>
+<li>HTTPS: DH session key + a certificate (public key + name + CA signature) that the client verifies against a trusted CA.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.text('tl', 180, 24, 'Symmetric (AES)', { cls: 'b' }) + S.text('tr', 540, 24, 'Asymmetric (RSA / EC)', { cls: 'b' })
+    + S.icon('a1', 60, 110, 'user', { label: 'Alice' }) + S.icon('b1', 300, 110, 'user', { label: 'Bob' })
+    + S.icon('k1', 180, 60, 'key', { label: 'shared key K', ly: -14, hidden: true })
+    + S.dot('m1', 90, 110, { label: 'message', hidden: true })
+    + S.text('q1', 180, 200, '', { cls: 'sm badc b' })
+    + S.icon('a2', 420, 110, 'user', { label: 'Alice' }) + S.icon('b2', 660, 110, 'user', { label: 'Bob' })
+    + S.icon('kp', 660, 55, 'key', { label: 'Bob: public 🔓 + private 🔒', ly: -14, hidden: true })
+    + S.icon('pub', 640, 55, 'lock', { label: 'Bob.pub (given to everyone)', ly: 26, hidden: true })
+    + S.dot('m2', 450, 110, { label: 'message', hidden: true })
+    + S.text('q2', 540, 200, '', { cls: 'sm okc b' })
+    + S.text('foot', 360, 250, '', { cls: 'sm muted' });
+  Anim.define('sym-asym', { w: 720, h: 270, title: 'Two kinds of encryption', ms: 2600, svg: s1, steps: [
+    { c: 'Alice wants to send Bob a message over a network anyone can read.', on(q){ q('#m1,#m2').show(); } },
+    { c: '<b>Symmetric</b>: if both already hold the same key K, Alice encrypts with K, Bob decrypts with K. Fast — AES does gigabytes per second.', on(q){ q('#k1').show(); q('#m1').to(300, 110).text('AES(K, msg)'); } },
+    { c: 'But how did Bob get K? Sending it over the same network defeats the purpose. This is the <b>key distribution problem</b>.', on(q){ q('#q1').text('how do they share K safely?'); } },
+    { c: '<b>Asymmetric</b>: Bob generates a key pair and publishes the public half. It cannot decrypt anything — only encrypt.', on(q){ q('#pub').show().to(480, 60); } },
+    { c: 'Alice encrypts with <b>Bob\'s public key</b>. Only Bob\'s private key can decrypt. Nothing secret ever travelled — problem solved, at the cost of speed.', on(q){ q('#m2').to(660, 110).text('RSA(Bob.pub, msg)'); q('#q2').text('only Bob\'s private key opens it'); } },
+    { c: 'So real protocols do both: use asymmetric crypto once to agree on a symmetric key, then AES for everything else. That is TLS and SSH in one sentence.', on(q){ q('#foot').text('asymmetric to exchange K  →  symmetric for the data'); q('#k1').show(); } },
+  ]});
+
+  let s2 = S.icon('cl', 80, 120, 'laptop', { label: 'client', ly: 28 }) + S.box('srv', 520, 90, 170, 60, ['server sshd', 'authorized_keys: alice.pub'], { subfs: 9, subcls: 'mono muted' })
+    + S.term('files', 20, 170, 330, 90, ['~/.ssh/id_ed25519       (private, 600)', '~/.ssh/id_ed25519.pub   (public)', '~/.ssh/known_hosts      (server host keys)', ''], { fs: 9.5 })
+    + S.dot('pk', 120, 100, { hidden: true, label: '' })
+    + S.arrow('a1', 120, 120, 518, 120, { cls: 'hid' })
+    + S.text('m', 360, 285, '', { cls: 'sm b' });
+  Anim.define('ssh-auth', { w: 720, h: 300, title: 'SSH: host key + user key', ms: 2800, svg: s2, steps: [
+    { c: '<b>1.</b> TCP connects. Client and server run a Diffie-Hellman exchange: each sends a public value, both compute the same session key. An eavesdropper sees both values but cannot derive the key.', on(q){ q('#pk').show().to(520, 100).text('DH values ⇄'); q('#a1').show().set('hl'); q('#m').text('session key agreed — channel now encrypted'); } },
+    { c: '<b>2.</b> The server signs the exchange with its <b>host key</b>. The client looks the server up in <code>known_hosts</code>: known and matching → trusted; unknown → the famous "authenticity can\'t be established" prompt; changed → warning of a possible man-in-the-middle.', on(q){ q('#pk').to(150, 100).text('signed by host key'); q('#files-l2').style('fill', 'var(--accent)'); q('#m').text('server authenticated against known_hosts'); } },
+    { c: '<b>3.</b> Client offers its public key. The server finds it in <code>authorized_keys</code> and sends a random <b>challenge</b>.', on(q){ q('#pk').to(520, 100).text('"I am alice.pub"'); q('#srv rect').set('hl'); q('#files-l1').style('fill', 'var(--accent)'); q('#m').text('server: prove it — here is a nonce'); } },
+    { c: '<b>4.</b> The client signs the challenge with its <b>private key</b> — which never leaves the laptop — and the server verifies the signature with the stored public key.', on(q){ q('#pk').to(150, 100).text('sign(nonce, id_ed25519)'); q('#files-l0').style('fill', 'var(--green)'); q('#m').text('signature verifies → logged in'); } },
+    { c: 'Both sides proved identity by signing with a private key the other side could verify. That is <b>mutual authentication</b>; SSH just keeps its trust lists (known_hosts, authorized_keys) by hand, where TLS uses certificates.', on(q){ q('#srv rect').set('ok'); q('#a1').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

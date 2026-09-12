@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 5 · Multi-Stage Builds · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d05" data-root="../" data-linux="l04,l06">
+<article class="lesson">
+<p class="lead">A 1.2 GB image and a 12 MB image can run the exact same application. The difference is everything that was needed to <em>build</em> the app but is useless at <em>run time</em>: compilers, SDKs, package caches, test tooling. Multi-stage builds let one Dockerfile use a fat image to build and a tiny image to ship — and small images are faster to pull, cheaper to store and far harder to attack.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Why image size matters on a Kubernetes cluster (scheduling latency, node disk, attack surface)</li>
+<li>Multi-stage Dockerfiles: build in one stage, copy only artifacts into the final stage</li>
+<li>Choosing a base: full → slim → alpine → distroless → scratch, and the glibc/musl trap</li>
+<li>Layer hygiene: cache order, combining <code>RUN</code>s, cleaning package caches, <code>.dockerignore</code></li>
+</ul></div>
+
+<h2>Why size matters more in Kubernetes</h2>
+<ul>
+<li><strong>Pod start-up latency.</strong> A Pod scheduled to a node that lacks the image cannot start until the pull finishes. Autoscaling, node failures and rolling updates all trigger pulls; 1 GB × 50 nodes is real time and real egress cost.</li>
+<li><strong>Node disk pressure.</strong> The kubelet garbage-collects images when disk fills, and <code>DiskPressure</code> evicts Pods. Big images make that happen sooner.</li>
+<li><strong>Attack surface.</strong> Every binary in the image is something a scanner will flag and an attacker can use. An image with no shell cannot be <code>exec</code>'d into by an intruder either.</li>
+</ul>
+
+<h2>The multi-stage pattern</h2>
+<p>Every <code>FROM</code> starts a new stage. Later stages can <code>COPY --from=</code> earlier ones. Only the <em>last</em> stage becomes the image; everything else is discarded.</p>
+<figure data-anim="multistage"></figure>
+
+<h3>Go: static binary → scratch</h3>
+<pre data-title="Dockerfile"><code class="lang-dockerfile"># ---- stage 1: build (≈ 800 MB, thrown away) ----
+FROM golang:1.23 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download                      # cached unless go.mod changes
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/api ./cmd/api
+
+# ---- stage 2: ship (≈ 8 MB) ----
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /out/api /api
+USER 65534:65534                          # "nobody" — scratch has no /etc/passwd, so use numbers
+EXPOSE 8080
+ENTRYPOINT ["/api"]</code></pre>
+<p><code>CGO_ENABLED=0</code> produces a fully static binary with no dependency on a C library, which is what makes <code>scratch</code> (a completely empty image) viable. The CA bundle is copied so the app can make HTTPS calls.</p>
+
+<h3>Node: build with dev deps, run with production deps</h3>
+<pre data-title="Dockerfile"><code class="lang-dockerfile">FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci                                # includes devDependencies for the build
+
+FROM deps AS build
+COPY . .
+RUN npm run build                         # e.g. TypeScript → dist/
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build /app/dist ./dist
+USER node
+CMD ["node", "dist/server.js"]</code></pre>
+<p>Name stages with <code>AS</code>, and build a specific one with <code>docker build --target build .</code> — useful in CI to run tests in the build stage without producing a runtime image.</p>
+
+<h2>Choosing a base image</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Base</th><th>Size (approx.)</th><th>Has</th><th>Use when</th></tr>
+<tr><td><code>python:3.12</code> (Debian, full)</td><td>~1 GB</td><td>gcc, make, every build tool</td><td>Build stages only</td></tr>
+<tr><td><code>python:3.12-slim</code></td><td>~130 MB</td><td>Debian minimal + Python, glibc</td><td>Default runtime choice for most apps</td></tr>
+<tr><td><code>python:3.12-alpine</code></td><td>~50 MB</td><td>Alpine, <strong>musl</strong> libc, busybox shell</td><td>When small matters and your deps compile on musl</td></tr>
+<tr><td><code>gcr.io/distroless/*</code></td><td>20–50 MB</td><td>Runtime libs only — no shell, no package manager</td><td>Production, security-sensitive</td></tr>
+<tr><td><code>scratch</code></td><td>0 B</td><td>Nothing</td><td>Static binaries (Go, Rust)</td></tr>
+</table></div>
+<div class="callout warn"><div class="ct">The Alpine / musl trap</div><p>Alpine uses <strong>musl</strong> instead of <strong>glibc</strong>. Pre-built binaries and Python wheels compiled against glibc may crash with "not found" errors (the dynamic loader is missing) or subtle DNS-resolution differences. Either build on Alpine in the build stage too, or prefer <code>-slim</code> / distroless, which are glibc-based. Check with <code>ldd ./binary</code>.</p></div>
+
+<div class="callout linux" data-ref="l04,l06"><div class="ct">Under the hood · Linux</div>
+<p>Why can a Go binary run on an empty filesystem? Because a statically linked ELF executable contains everything it needs; the kernel maps it into memory and jumps to <code>_start</code>. A dynamically linked binary instead asks the kernel to load <code>/lib64/ld-linux-x86-64.so.2</code> (the dynamic loader), which then opens <code>libc.so.6</code> and friends from the image's filesystem — none of which exist in <code>scratch</code>. That is also why distroless images still carry <code>libc</code>: Java, Python and Node are dynamically linked. Running as a numeric non-root <code>USER</code> works in scratch because the kernel only needs a UID, not a <code>/etc/passwd</code> entry.</p></div>
+
+<h2>Layer hygiene checklist</h2>
+<ol class="steps">
+<li><strong>Order by change frequency</strong> — base, OS packages, dependencies, then source (from <a href="d02-first-dockerfile.html">Day 2</a>).</li>
+<li><strong>Clean up in the same <code>RUN</code></strong> — deletions in a later layer do not shrink the image, they only hide files.
+<pre><code class="lang-dockerfile">RUN apt-get update && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*</code></pre></li>
+<li><strong>Use <code>.dockerignore</code></strong> — keep <code>.git</code>, <code>node_modules</code>, test data and secrets out of the build context.
+<pre data-title=".dockerignore"><code>.git
+node_modules
+*.log
+.env
+Dockerfile*</code></pre></li>
+<li><strong>Copy specific paths</strong> — <code>COPY . .</code> after dependency install is fine; <code>COPY . .</code> before it defeats the cache.</li>
+<li><strong>Pin versions</strong> — <code>FROM python:3.12.6-slim</code>, not <code>python:latest</code>. Reproducible builds and no surprise upgrades.</li>
+<li><strong>Measure</strong> — <code>docker history img</code> shows each layer's size; <a href="https://github.com/wagoodman/dive">dive</a> shows what changed per layer.</li>
+</ol>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Image building is not on the CKA (it is on the CKAD), but image <em>size</em> shows up indirectly: a Pod stuck in <code>ContainerCreating</code> with a slow pull, or a node under <code>DiskPressure</code>. Know that <code>kubectl describe pod</code> shows pull progress events and that the kubelet's image GC thresholds are <code>--image-gc-high-threshold</code>/<code>low-threshold</code> (defaults 85%/80%).</p></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3><p>Shrink a Go hello-world from 800 MB to under 10 MB.</p>
+<pre><code class="lang-bash">$ mkdir gosmall && cd gosmall && go mod init example.com/hello
+$ cat > main.go &lt;&lt;'EOF'
+package main
+import ("fmt";"net/http")
+func main(){ http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request){ fmt.Fprintln(w,"hello") }); http.ListenAndServe(":8080", nil) }
+EOF
+# single stage
+$ printf 'FROM golang:1.23\nWORKDIR /src\nCOPY . .\nRUN go build -o /hello .\nCMD ["/hello"]\n' > Dockerfile.big
+$ docker build -q -t hello:big -f Dockerfile.big .
+# multi-stage
+$ printf 'FROM golang:1.23 AS b\nWORKDIR /src\nCOPY . .\nRUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /hello .\nFROM scratch\nCOPY --from=b /hello /hello\nENTRYPOINT ["/hello"]\n' > Dockerfile.small
+$ docker build -q -t hello:small -f Dockerfile.small .
+$ docker images hello          # compare SIZE
+$ docker run --rm -d -p 8080:8080 hello:small && curl localhost:8080
+$ docker run --rm -it hello:small sh    # fails: there is no shell to exec — that is the point</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Multi-stage builds: build with the SDK, <code>COPY --from</code> only the artifacts into a minimal final stage.</li>
+<li>Prefer <code>-slim</code> or distroless for dynamically linked runtimes; <code>scratch</code> for static Go/Rust binaries.</li>
+<li>Alpine = musl; check <code>ldd</code> before assuming a glibc binary will run there.</li>
+<li>Clean up in the same layer, ignore junk with <code>.dockerignore</code>, pin base image versions, and measure with <code>docker history</code>.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const L = (id, x, y, w, label, cls, o={}) => S.box(id, x, y, w, 30, label, Object.assign({ cls, fs: 11 }, o));
+  let svg = S.zone('z1', 20, 30, 320, 270, 'Stage 1 · FROM golang:1.23 AS build') + S.zone('z2', 400, 30, 300, 270, 'Stage 2 · FROM scratch');
+  const s1 = [['Debian base', '120 MB'], ['Go toolchain', '700 MB'], ['go.mod deps', '60 MB'], ['source code', '2 MB'], ['/out/api binary', '8 MB']];
+  s1.forEach((l, i) => { svg += L(`b${i}`, 40, 258 - i * 40, 200, l[0], 'soft', { hidden: true }); svg += S.text(`bs${i}`, 300, 277 - i * 40, l[1], { cls: 'xs muted', gcls: 'hid' }); });
+  svg += L('f0', 420, 258, 260, 'ca-certificates.crt · 200 KB', '', { hidden: true }) + L('f1', 420, 218, 260, '/api · 8 MB', 'ok', { hidden: true });
+  svg += S.text('tot1', 180, 55, '', { cls: 'sm b badc' }) + S.text('tot2', 550, 55, '', { cls: 'sm b okc' });
+  svg += S.curve('cp', 240, 273, 330, 200, 418, 233, { cls: 'hid', label: 'COPY --from=build', lx: 330, ly: 150 });
+  Anim.define('multistage', { w: 720, h: 310, title: 'Multi-stage build', svg, steps: [
+    { c: 'Stage 1 starts from the full Go image: a Debian userland plus the compiler toolchain — about 800 MB before your code is even copied.', on(q){ q('#b0,#b1,#bs0,#bs1').show(); } },
+    { c: 'Dependencies and source are added and <code>go build</code> produces a single 8 MB static binary.', on(q){ q('#b2,#b3,#b4,#bs2,#bs3,#bs4').show(); q('#b4 rect').set('ok'); q('#tot1').text('≈ 890 MB if shipped as-is'); } },
+    { c: 'Stage 2 starts from <b>scratch</b> — an empty filesystem. Nothing from stage 1 is inherited.', on(q){ q('#z2 rect').set('hl'); } },
+    { c: '<code>COPY --from=build</code> reaches into stage 1 and copies just the binary (and a CA bundle for TLS). Everything else in stage 1 is left behind.', on(q){ q('#cp').show().set('hl'); q('#f0,#f1').show(); } },
+    { c: 'Only the final stage is tagged and pushed: 8 MB instead of 890 MB, no shell, no package manager, no compiler — and a pull that takes a second instead of a minute.', on(q){ q('#tot2').text('≈ 8 MB shipped'); q('#z1 rect').set('dim'); ['b0','b1','b2','b3','bs0','bs1','bs2','bs3'].forEach(i => q('#' + i).add('dim')); } },
+  ]});
+})();
+</script>
+</body>
+</html>

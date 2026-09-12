@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Beyond CKA · Argo CD, Jenkins & the Road Ahead · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d60" data-root="../" data-related="d42,d43,d40">
+<article class="lesson">
+<p class="lead">Sixty lessons in, you can build, secure, operate and repair a cluster. The playlist ends with two bonus courses — <strong>Argo CD</strong> and <strong>Jenkins</strong> — that answer the question a working cluster immediately raises: how do changes get <em>into</em> it, safely, repeatedly, from git? This page frames both in the terms you already know, then lays out the exam plan and what to learn next.</p>
+
+<div class="objectives"><h4>This page covers</h4><ul>
+<li>GitOps and Argo CD: a controller whose desired state is a git repository</li>
+<li>CI with Jenkins (or any CI): building images and updating manifests</li>
+<li>A two-week CKA exam plan and the day-of checklist</li>
+<li>Where to go next: CKAD, CKS, and the ecosystem</li>
+</ul></div>
+
+<h2>GitOps and Argo CD</h2>
+<p>You have used <code>kubectl apply</code> and Helm from a terminal. In production nobody should: the source of truth for what runs in the cluster should be a <strong>git repository</strong>, and something should continuously make the cluster match it. That is GitOps, and Argo CD is the standard implementation — and it is, once again, <em>a controller with a CRD</em> (<a href="d40-operators.html">Day 40</a>).</p>
+<figure data-anim="gitops"></figure>
+<pre><code class="lang-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/acme/platform
+    targetRevision: main
+    path: apps/shop/overlays/prod        # Kustomize overlay (Day 42) — or a Helm chart with values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop
+  syncPolicy:
+    automated:
+      prune: true                        # delete objects removed from git
+      selfHeal: true                     # revert manual kubectl changes
+    syncOptions: [CreateNamespace=true]</code></pre>
+<pre><code class="lang-bash">$ kubectl create ns argocd && kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+$ kubectl -n argocd port-forward svc/argocd-server 8080:443     # UI; password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
+$ argocd app create shop --repo … --path … --dest-namespace shop --dest-server https://kubernetes.default.svc --sync-policy automated
+$ argocd app get shop; argocd app diff shop; argocd app sync shop; argocd app history shop; argocd app rollback shop 3</code></pre>
+<ul>
+<li><strong>Reconcile loop</strong>: every 3 minutes (and on webhook) Argo renders the source (plain YAML, Kustomize, Helm, Jsonnet), compares with the live objects (a three-way diff like <code>kubectl apply</code>, <a href="d09-yaml-imperative-declarative.html">Day 9</a>), and reports <em>Synced</em>/<em>OutOfSync</em> and <em>Healthy</em>/<em>Degraded</em> per resource. With <code>automated</code> it applies; with <code>selfHeal</code> it undoes drift.</li>
+<li><strong>Rollback</strong> = point at an older git commit. Audit log = git log. Access control = who can merge.</li>
+<li>Multi-cluster: one Argo CD manages many clusters via kubeconfigs stored as Secrets; <code>ApplicationSet</code> generates Applications from templates (one per cluster, per directory, per PR).</li>
+<li>Alternatives: Flux (same idea, more Kubernetes-native CRDs, no UI by default).</li>
+</ul>
+
+<h2>CI: Jenkins (and everything like it)</h2>
+<p>Argo CD deploys what is in git; something has to <em>put it there</em>. A CI pipeline builds the image from source (<a href="d02-first-dockerfile.html">Days 2–5</a>), tests it, pushes it to a registry with an immutable tag, and then commits the new tag into the manifests repository — which Argo CD notices. Jenkins is the veteran (a controller + agents running pipeline stages, often as Kubernetes Pods via the Kubernetes plugin); GitHub Actions, GitLab CI, Tekton and Argo Workflows do the same job.</p>
+<pre data-title="Jenkinsfile (declarative pipeline, Kubernetes agents)"><code>pipeline {
+  agent { kubernetes { yaml '''
+    spec:
+      containers:
+      - name: kaniko
+        image: gcr.io/kaniko-project/executor:debug
+        command: [sleep]; args: [infinity]
+        volumeMounts: [{name: regcred, mountPath: /kaniko/.docker}]
+      volumes: [{name: regcred, secret: {secretName: regcred, items: [{key: .dockerconfigjson, path: config.json}]}}]
+  ''' } }
+  environment { TAG = "${env.GIT_COMMIT.take(7)}" }
+  stages {
+    stage('Test')  { steps { sh 'make test' } }
+    stage('Build') { steps { container('kaniko') { sh "/kaniko/executor --context . --destination ghcr.io/acme/api:${TAG}" } } }   // build without a Docker daemon
+    stage('Promote') { steps { sh """
+      git clone https://github.com/acme/platform && cd platform
+      cd apps/api/overlays/prod && kustomize edit set image ghcr.io/acme/api=ghcr.io/acme/api:${TAG}
+      git commit -am "api ${TAG}" && git push
+    """ } }
+  }
+}</code></pre>
+<p>Notice how much of the course this touches: a Pod template for the agent (<a href="d21-multi-container-pods.html">Day 21</a>), an <code>imagePullSecrets</code>-style Secret (<a href="d45-image-pull-secrets.html">Day 45</a>), building images without root (kaniko, because <code>privileged</code> is off — <a href="d41-pod-security.html">Day 41</a>), a Kustomize overlay (<a href="d42-kustomize.html">Day 42</a>), and git as the handoff to the deploy controller. <strong>CI builds and proposes; CD (Argo) applies and reconciles.</strong> Keeping them separate is the whole GitOps idea.</p>
+
+<h2>Two weeks to the exam</h2>
+<div class="grid-2">
+<div class="card"><h4>Week 1 — rebuild the muscle</h4><ul>
+<li>Days 54–58 on real VMs: init, join, break, fix, upgrade, etcd backup/restore. Twice.</li>
+<li>Re-do every lab from Modules 3, 4, 6, 8 and 11 with only the docs site open.</li>
+<li>Time yourself: a Deployment + Service + Ingress + NetworkPolicy in under 8 minutes.</li>
+</ul></div>
+<div class="card"><h4>Week 2 — simulate</h4><ul>
+<li>killer.sh (two sessions come with the exam). Score, review every mistake, redo.</li>
+<li>Killercoda CKA scenarios for troubleshooting reps.</li>
+<li>Last two days: light review of the <a href="../cheatsheet.html">cheatsheet</a>, aliases, vim settings. Sleep.</li>
+</ul></div>
+</div>
+<div class="callout exam"><div class="ct">Day-of checklist</div><ul>
+<li>First 60 seconds: <code>alias k=kubectl</code>, <code>export do="--dry-run=client -o yaml"</code>, <code>export now="--force --grace-period=0"</code>, <code>~/.vimrc</code> with <code>set ts=2 sw=2 et</code>.</li>
+<li>Every question: <code>kubectl config use-context …</code> as given, read the namespace, note the exact names.</li>
+<li>Flag and skip anything over ~8 minutes; come back. Partial credit exists; unfinished questions at the end score zero.</li>
+<li>Verify each answer with a <code>get</code>/<code>describe</code>/<code>auth can-i</code>/<code>curl</code> before moving on.</li>
+<li>Node tasks: <code>ssh node</code>, <code>sudo -i</code>, do the work, <code>exit</code> back — commands run on the wrong host are the classic silent failure.</li>
+</ul></div>
+
+<h2>After CKA</h2>
+<div class="grid-3">
+<div class="card"><h4>CKAD</h4><p>Developer-side: the same objects, more depth on Pod design, probes, config, Jobs, SecurityContext, Helm/Kustomize, observability. Modules 5, 7, 9 already cover most of it.</p></div>
+<div class="card"><h4>CKS</h4><p>Security specialist (requires CKA): cluster hardening, image scanning (Trivy), runtime security (Falco), audit logs, network policy depth, secrets management, supply chain. Modules 8 and 11 are the base.</p></div>
+<div class="card"><h4>The ecosystem</h4><p>Service mesh (Istio/Linkerd/Cilium mesh), Crossplane (cloud resources as CRDs), KEDA, Karpenter, Backstage, cluster API. Each one is a controller with CRDs — you know how to read them now.</p></div>
+</div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>GitOps: git is the desired state, a controller (Argo CD / Flux) reconciles the cluster to it, rollback is a revert.</li>
+<li>CI (Jenkins or any) builds and pushes images and updates manifests; CD applies them. Keep the roles separate.</li>
+<li>Both bonus courses are applications of what you already know: controllers, CRDs, Kustomize/Helm, Pods, Secrets.</li>
+<li>Practise troubleshooting on real nodes and take the simulators before the exam; set aliases first, verify every answer.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('dev', 50, 70, 'user', { label: 'developer', ly: 28 })
+    + S.box('ci', 140, 45, 130, 50, ['CI (Jenkins)', 'test · build · push'], { subfs: 9, subcls: 'muted' })
+    + S.box('reg', 310, 45, 130, 50, ['registry', 'api:abc1234'], { subfs: 9, subcls: 'mono muted', cls: 'warn' })
+    + S.box('git', 140, 150, 130, 50, ['git: platform repo', 'apps/api/prod'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('argo', 330, 150, 150, 50, ['Argo CD', 'Application api'], { subfs: 9, subcls: 'mono muted', cls: 'cy' })
+    + S.node('cl', 520, 30, 180, 250, 'cluster', {})
+    + S.pod('p1', 610, 120, 'api', { cls: 'ok', w: 60, sub: 'image: api:9f2e' })
+    + S.term('st', 330, 215, 180, 60, ['status:', 'Synced · Healthy'], { fs: 9 })
+    + S.arrow('a1', 85, 70, 138, 70, { cls: 'hid', label: 'git push code', ly: 60 }) + S.arrow('a2', 270, 70, 308, 70, { cls: 'hid' })
+    + S.arrow('a3', 205, 95, 205, 148, { cls: 'hid', label: 'commit: image tag abc1234', lx: 120, ly: 125 })
+    + S.arrow('a4', 270, 175, 328, 175, { cls: 'hid', label: 'poll / webhook', ly: 195 }) + S.arrow('a5', 480, 175, 578, 130, { d: 'M 480 175 L 578 132', cls: 'hid', label: 'apply', lx: 540, ly: 160 })
+    + S.arrow('a6', 640, 100, 440, 80, { d: 'M 640 100 L 442 82', cls: 'hid', label: 'pull', lx: 560, ly: 100 })
+    + S.text('m', 360, 300, '', { cls: 'sm b' });
+  Anim.define('gitops', { w: 720, h: 315, title: 'CI → git → Argo CD → cluster', ms: 2800, svg, steps: [
+    { c: 'A developer pushes code. Nobody runs kubectl.', on(q){ q('#a1').show().set('hl'); } },
+    { c: '<b>CI</b> runs tests, builds the image, and pushes it to the registry with an immutable tag (the commit SHA).', on(q){ q('#a2').show().set('hl'); q('#ci rect').set('hl'); q('#reg rect').set('warn'); } },
+    { c: 'CI then <b>commits the new tag</b> into the platform repo (<code>kustomize edit set image …</code>). That commit — reviewable, revertible — is the deployment request.', on(q){ q('#a3').show().set('hl'); q('#git rect').set('pur'); q('#m').text('git is the desired state'); } },
+    { c: '<b>Argo CD</b> notices (webhook or 3-minute poll), renders the overlay, diffs against the cluster: <code>OutOfSync</code>.', on(q){ q('#a4').show().set('hl'); q('#argo rect').set('cy'); q('#st-l1').text('OutOfSync · Healthy').style('fill', 'var(--amber)'); } },
+    { c: 'With automated sync it applies the manifests; the Deployment rolls; the kubelet pulls the new image. Status becomes <code>Synced · Healthy</code>.', on(q){ q('#a5,#a6').show().set('ok'); q('#p1 text:nth-of-type(2)').text('image: api:abc1234'); q('#st-l1').text('Synced · Healthy').style('fill', 'var(--green)'); q('#m').text('a controller reconciling cluster ← git'); } },
+    { c: 'Someone runs <code>kubectl scale</code> by hand → drift → <code>selfHeal</code> reverts it. A bad release → <code>git revert</code> → Argo rolls back. Same loop as every controller in this course.', on(q){ q('#m').text('rollback = revert; audit = git log; access = merge rights'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

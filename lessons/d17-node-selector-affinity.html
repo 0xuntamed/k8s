@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 17 · Node Selector & Node Affinity · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d17" data-root="../" data-related="d16,d18">
+<article class="lesson">
+<p class="lead">Taints keep Pods <em>away</em> from nodes. To pull Pods <em>toward</em> nodes — "run on SSD nodes", "prefer zone eu-west-1a", "never on ARM" — you label the nodes and tell the Pod what labels it wants. <code>nodeSelector</code> is the simple form (exact match, all required); <strong>node affinity</strong> is the expressive one, with operators, OR-groups, and soft preferences that influence scoring instead of filtering.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Labelling nodes and the labels every node already has</li>
+<li><code>nodeSelector</code>: exact-match, AND semantics</li>
+<li>Node affinity: <code>required…</code> (hard filter) vs <code>preferred…</code> (weighted score)</li>
+<li>Operators: In, NotIn, Exists, DoesNotExist, Gt, Lt — and how terms combine (OR of ANDs)</li>
+<li>Why "IgnoredDuringExecution" is in the name</li>
+</ul></div>
+
+<h2>Node labels</h2>
+<pre><code class="lang-bash">$ kubectl get nodes --show-labels
+$ kubectl label nodes worker-1 disktype=ssd
+$ kubectl label nodes worker-1 disktype=nvme --overwrite
+$ kubectl label nodes worker-1 disktype-                    # remove
+$ kubectl get nodes -l disktype=ssd
+$ kubectl get nodes -L disktype,topology.kubernetes.io/zone  # show as columns</code></pre>
+<p>Nodes come with useful labels already: <code>kubernetes.io/hostname</code>, <code>kubernetes.io/os</code>, <code>kubernetes.io/arch</code>, <code>node.kubernetes.io/instance-type</code>, <code>topology.kubernetes.io/zone</code> and <code>…/region</code> (set by the cloud provider), and <code>node-role.kubernetes.io/control-plane</code>. Your own labels are just conventions — <code>pool=batch</code>, <code>gpu=a100</code>, <code>env=prod</code>.</p>
+
+<h2>nodeSelector — the simple form</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+spec:
+  nodeSelector:
+    disktype: ssd
+    topology.kubernetes.io/zone: eu-west-1a   # ALL listed labels must match exactly
+  containers:
+  - name: postgres
+    image: postgres:16</code></pre>
+<p>If no node has all those labels, the Pod stays Pending with <code>FailedScheduling: … didn't match Pod's node affinity/selector</code>. There is no "prefer", no "not", no "one of". For that you need affinity.</p>
+
+<h2>Node affinity — the expressive form</h2>
+<pre><code class="lang-yaml">spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:     # HARD: filter
+        nodeSelectorTerms:                                  # terms are OR-ed
+        - matchExpressions:                                 # expressions inside a term are AND-ed
+          - key: disktype
+            operator: In
+            values: [ssd, nvme]
+          - key: kubernetes.io/arch
+            operator: NotIn
+            values: [arm64]
+        - matchExpressions:                                 # OR this whole term
+          - key: pool
+            operator: Exists
+      preferredDuringSchedulingIgnoredDuringExecution:    # SOFT: score
+      - weight: 80                                          # 1–100
+        preference:
+          matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values: [eu-west-1a]
+      - weight: 20
+        preference:
+          matchExpressions:
+          - key: cpu-generation
+            operator: Gt
+            values: ["5"]</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Operator</th><th>Matches when the node label…</th></tr>
+<tr><td><code>In</code></td><td>exists and its value is one of <code>values</code></td></tr>
+<tr><td><code>NotIn</code></td><td>does not exist, or its value is not in <code>values</code></td></tr>
+<tr><td><code>Exists</code></td><td>exists (any value; <code>values</code> must be empty)</td></tr>
+<tr><td><code>DoesNotExist</code></td><td>does not exist</td></tr>
+<tr><td><code>Gt</code> / <code>Lt</code></td><td>exists and parses as an integer greater/less than the single value</td></tr>
+</table></div>
+<figure data-anim="affinity"></figure>
+
+<h3>Reading the long names</h3>
+<dl class="kv">
+<dt>requiredDuringScheduling</dt><dd>Used as a <em>filter</em>: nodes that fail are removed. No node passes → Pending.</dd>
+<dt>preferredDuringScheduling</dt><dd>Used in <em>scoring</em>: each satisfied preference adds its weight to the node's score; the highest total wins among the nodes that passed filtering. Never causes Pending.</dd>
+<dt>IgnoredDuringExecution</dt><dd>Once the Pod is running, label changes on the node do not evict it. (A <code>RequiredDuringExecution</code> variant has been proposed for years; it does not exist. Taints with NoExecute are the way to evict.)</dd>
+</dl>
+<div class="callout mental"><div class="ct">Mental model</div><p>The scheduler runs two phases for every Pod: <strong>filter</strong> (yes/no per node: resources, taints, <em>required</em> affinity, nodeSelector, ports, volumes) and <strong>score</strong> (0–100 per surviving node: <em>preferred</em> affinity, spreading, least-allocated, image locality). <code>nodeSelector</code> and <code>required</code> are filters; <code>preferred</code> is a score. <a href="d18-taints-vs-affinity.html">Day 18</a> animates the whole pipeline.</p></div>
+
+<h2>nodeName vs nodeSelector vs affinity</h2>
+<div class="tbl-wrap"><table>
+<tr><th></th><th>Checks resources/taints?</th><th>Expressiveness</th><th>Use</th></tr>
+<tr><td><code>nodeName</code></td><td>No — bypasses the scheduler</td><td>One exact node</td><td>Debugging, static-like placement</td></tr>
+<tr><td><code>nodeSelector</code></td><td>Yes</td><td>Equality, AND</td><td>Simple "must have label" rules</td></tr>
+<tr><td><code>nodeAffinity</code></td><td>Yes</td><td>Operators, OR, soft preferences</td><td>Everything else</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Tasks usually say "schedule on nodes labelled X". <code>nodeSelector</code> is the fastest correct answer unless they say "prefer" or use NotIn/Exists.</li>
+<li>Copy the affinity block from <code>kubectl explain pod.spec.affinity.nodeAffinity --recursive</code> or the docs page "Assign Pods to Nodes" — indentation errors here are the classic time sink.</li>
+<li>For a Deployment, the affinity goes under <code>spec.template.spec</code>, not <code>spec</code>.</li>
+<li>Pending + "didn't match Pod's node affinity/selector" → compare <code>kubectl get nodes --show-labels</code> with the Pod's rule; a typo in the label key is the usual culprit.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl label nodes cka-worker disktype=ssd && kubectl label nodes cka-worker2 disktype=hdd zone=b
+$ kubectl run ssd --image=nginx $do | sed '/spec:/a\  nodeSelector:\n    disktype: ssd' | kubectl apply -f -
+$ kubectl get pod ssd -o wide                                   # cka-worker
+$ kubectl run nowhere --image=nginx $do | sed '/spec:/a\  nodeSelector:\n    disktype: nvme' | kubectl apply -f -
+$ kubectl describe pod nowhere | tail -3                        # FailedScheduling: didn't match
+$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: prefer-b}
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions: [{key: zone, operator: In, values: [b]}]
+  containers: [{name: n, image: nginx}]
+EOF
+$ kubectl get pod prefer-b -o wide                              # cka-worker2 (preferred, but would run anywhere)
+$ kubectl label nodes cka-worker2 zone-                         # IgnoredDuringExecution: pod stays
+$ kubectl delete pod ssd nowhere prefer-b $now</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Label nodes; select with <code>nodeSelector</code> (exact, AND) or <code>nodeAffinity</code> (operators, OR-ed terms, soft weights).</li>
+<li><code>required…</code> filters (can cause Pending); <code>preferred…</code> scores (never blocks).</li>
+<li>Both are <em>IgnoredDuringExecution</em>: label changes never evict running Pods.</li>
+<li><code>nodeName</code> skips the scheduler entirely; the other two go through filter + score.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const nodes = [['worker-1', 'disktype=ssd · zone=a · arch=amd64'], ['worker-2', 'disktype=hdd · zone=a · arch=amd64'], ['worker-3', 'disktype=nvme · zone=b · arch=amd64'], ['worker-4', 'disktype=ssd · zone=b · arch=arm64']];
+  let svg = S.term('rule', 20, 20, 300, 130, ['required:', '  disktype In [ssd, nvme]', '  arch NotIn [arm64]', 'preferred:', '  w=80  zone In [a]', '  w=20  disktype In [nvme]'], { fs: 10 });
+  nodes.forEach((n, i) => { const x = 350 + (i % 2) * 180, y = 20 + Math.floor(i / 2) * 75; svg += S.box(`n${i}`, x, y, 165, 60, [n[0], n[1]], { subfs: 8, subcls: 'mono muted', fs: 12 }) + S.text(`s${i}`, x + 82, y + 52, '', { cls: 'xs b acc' }); });
+  svg += S.pod('pod', 170, 210, 'db pod', { cls: 'ok', w: 70 }) + S.text('m', 360, 290, '', { cls: 'sm b' });
+  Anim.define('affinity', { w: 720, h: 305, title: 'Node affinity: filter then score', ms: 3000, svg, steps: [
+    { c: 'One Pod, four nodes. The Pod has a <b>required</b> rule (disktype ssd or nvme, not arm64) and two <b>preferred</b> rules with weights 80 and 20.', on(q){} },
+    { c: '<b>Filter</b> phase, required rule 1: <code>disktype In [ssd, nvme]</code>. worker-2 (hdd) is out.', on(q){ q('#rule-l1').style('fill', 'var(--accent)'); q('#n1 rect').set('bad'); } },
+    { c: 'Required rule 2: <code>arch NotIn [arm64]</code>. worker-4 is out. Two candidates survive: worker-1 and worker-3.', on(q){ q('#rule-l2').style('fill', 'var(--accent)'); q('#n3 rect').set('bad'); q('#n0 rect,#n2 rect').set('hl'); } },
+    { c: '<b>Score</b> phase, preference 1 (weight 80): <code>zone In [a]</code>. worker-1 gets +80; worker-3 gets 0.', on(q){ q('#rule-l4').style('fill', 'var(--green)'); q('#s0').text('score 80'); q('#s2').text('score 0'); } },
+    { c: 'Preference 2 (weight 20): <code>disktype In [nvme]</code>. worker-3 gets +20. Totals: worker-1 = 80, worker-3 = 20 (plus the scheduler\'s other scores, e.g. free resources).', on(q){ q('#rule-l5').style('fill', 'var(--green)'); q('#s2').text('score 20'); } },
+    { c: 'worker-1 wins. Had it been full, worker-3 would have been chosen — preferences bend the decision, they never block it. Had <i>no</i> node passed the required rules, the Pod would stay Pending.', on(q){ q('#n0 rect').set('ok'); q('#n2 rect').set(); q('#pod').to(432, 50); q('#m').text('bound to worker-1'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

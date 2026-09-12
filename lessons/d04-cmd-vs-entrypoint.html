@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 4 · CMD vs ENTRYPOINT · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d04" data-root="../" data-linux="l01">
+<article class="lesson">
+<p class="lead"><code>CMD</code> and <code>ENTRYPOINT</code> both say "what should run when this container starts", which is why people confuse them. The difference is simple once you see it as <em>executable</em> versus <em>default arguments</em>. Along the way we meet the single most important process in any container — PID 1 — and why the "shell form" of these instructions silently breaks graceful shutdown.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li><code>ENTRYPOINT</code> = the program, <code>CMD</code> = its default arguments, and how they combine</li>
+<li>Exec form vs shell form, and why it decides whether your app receives <code>SIGTERM</code></li>
+<li>How this maps to Kubernetes <code>command</code> and <code>args</code></li>
+<li>The everyday Docker commands: exec, logs, inspect, cp, stats, prune</li>
+</ul></div>
+
+<h2>The rule</h2>
+<p>When a container starts, Docker builds one command line: <strong>ENTRYPOINT followed by CMD</strong>. Whatever you type after the image name in <code>docker run</code> <em>replaces CMD</em>. <code>--entrypoint</code> replaces ENTRYPOINT.</p>
+<div class="tbl-wrap"><table>
+<tr><th>ENTRYPOINT</th><th>CMD</th><th><code>docker run img</code> runs</th><th><code>docker run img -v</code> runs</th></tr>
+<tr><td>—</td><td><code>["python","app.py"]</code></td><td><code>python app.py</code></td><td><code>-v</code> ✗ (CMD replaced; nothing to run)</td></tr>
+<tr><td><code>["python"]</code></td><td><code>["app.py"]</code></td><td><code>python app.py</code></td><td><code>python -v</code></td></tr>
+<tr><td><code>["python","app.py"]</code></td><td>—</td><td><code>python app.py</code></td><td><code>python app.py -v</code></td></tr>
+<tr><td><code>["curl"]</code></td><td><code>["--help"]</code></td><td><code>curl --help</code></td><td><code>curl -v</code></td></tr>
+</table></div>
+<div class="callout mental"><div class="ct">Mental model</div><p>Make the image behave like a <strong>command-line tool</strong>. <code>ENTRYPOINT</code> is the binary; <code>CMD</code> is what you would type if you gave no arguments. <code>docker run myimage --help</code> then reads naturally. Images that are "a service", like nginx or postgres, use the same pattern with a small <code>docker-entrypoint.sh</code> that does setup and then <code>exec "$@"</code>.</p></div>
+
+<h2>Exec form vs shell form</h2>
+<div class="compare bad-good">
+<div><h4>Shell form</h4><pre><code class="lang-dockerfile">CMD python app.py</code></pre><p>Docker runs <code>/bin/sh -c "python app.py"</code>. PID 1 is <strong>sh</strong>; python is its child. Variable expansion works (<code>$PORT</code>), but signals sent to the container go to <code>sh</code>, which does not forward them.</p></div>
+<div><h4>Exec form</h4><pre><code class="lang-dockerfile">CMD ["python", "app.py"]</code></pre><p>Docker <code>exec</code>s python directly. PID 1 is <strong>python</strong>. No shell, no variable expansion (use <code>["sh","-c","python $APP"]</code> if you need it), and signals reach your app.</p></div>
+</div>
+<figure data-anim="pid1-signals"></figure>
+
+<div class="callout linux" data-ref="l01"><div class="ct">Under the hood · Linux</div>
+<p>PID 1 is special in a PID namespace. The kernel gives it <strong>default signal handlers of "ignore"</strong> for any signal it has not explicitly handled — so a PID 1 that does not install a <code>SIGTERM</code> handler cannot be terminated by <code>SIGTERM</code> at all, only by <code>SIGKILL</code>. PID 1 is also responsible for <em>reaping</em> orphaned children; a naive PID 1 leaks zombies. <code>docker run --init</code> (or <code>tini</code>) inserts a minimal init that handles both. In Kubernetes the same rules apply to the first process of every container, and the grace period defaults to 30 s before <code>SIGKILL</code> (<a href="d22-pod-lifecycle.html">Day 22</a>).</p></div>
+
+<h2>The Kubernetes mapping</h2>
+<p>A Pod spec has <code>command</code> and <code>args</code>. They override the image's <code>ENTRYPOINT</code> and <code>CMD</code> respectively, with the same combination rules:</p>
+<div class="grid-2">
+<div><pre data-title="Dockerfile"><code class="lang-dockerfile">ENTRYPOINT ["sleep"]
+CMD ["5"]</code></pre></div>
+<div><pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: sleeper
+spec:
+  containers:
+  - name: sleeper
+    image: ubuntu-sleeper
+    command: ["sleep"]   # overrides ENTRYPOINT
+    args: ["10"]         # overrides CMD</code></pre></div>
+</div>
+<div class="tbl-wrap"><table>
+<tr><th>Pod field</th><th>Docker equivalent</th><th>Note</th></tr>
+<tr><td><code>command</code></td><td><code>ENTRYPOINT</code></td><td>Always exec form (a list). Replaces the image's entrypoint entirely.</td></tr>
+<tr><td><code>args</code></td><td><code>CMD</code></td><td>If only <code>args</code> is set, the image's <code>ENTRYPOINT</code> is kept and <code>args</code> replaces <code>CMD</code>.</td></tr>
+</table></div>
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Classic task: "Create a pod that runs <code>sleep 3600</code> in busybox". Fast answer: <code>kubectl run sleeper --image=busybox --command -- sleep 3600</code>. Without <code>--command</code>, everything after <code>--</code> becomes <code>args</code>, which only works if the image's entrypoint accepts them. Check with <code>kubectl get pod sleeper -o yaml | grep -A3 command</code>.</p></div>
+
+<h2>Everyday Docker commands</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Use</th></tr>
+<tr><td>docker exec -it web sh</td><td>Shell inside a running container (a new process in the same namespaces). <code>bash</code> may not exist in slim images.</td></tr>
+<tr><td>docker logs -f --tail 100 web</td><td>Follow stdout/stderr. Containers should log to stdout, never to files — Kubernetes collects logs the same way.</td></tr>
+<tr><td>docker inspect web</td><td>Everything: PID, IPs, mounts, env, restart count, exit code, OOMKilled flag.</td></tr>
+<tr><td>docker cp web:/etc/nginx/nginx.conf .</td><td>Copy files in/out of a container (works on stopped ones too).</td></tr>
+<tr><td>docker stats</td><td>Live CPU/memory/network per container (reads the cgroups).</td></tr>
+<tr><td>docker top web</td><td>Processes inside the container, with host PIDs.</td></tr>
+<tr><td>docker stop / kill / restart</td><td><code>stop</code> = SIGTERM then SIGKILL after <code>-t</code> seconds (default 10). <code>kill</code> = SIGKILL immediately (or <code>-s SIGHUP</code> etc.).</td></tr>
+<tr><td>docker commit web myimg:debug</td><td>Snapshot a container's writable layer as an image. Handy for debugging; never for building real images.</td></tr>
+<tr><td>docker system prune -a</td><td>Delete stopped containers, unused networks, dangling <em>and unused</em> images, build cache. Reclaims gigabytes.</td></tr>
+<tr><td>docker system df</td><td>What is using disk: images, containers, volumes, cache.</td></tr>
+</table></div>
+
+<h2>A custom Dockerfile with a real entrypoint script</h2>
+<pre data-title="docker-entrypoint.sh"><code class="lang-bash">#!/bin/sh
+set -e
+# one-time setup: render config from env, wait for a dependency, etc.
+envsubst &lt; /etc/app/config.tmpl &gt; /etc/app/config.yaml
+# hand PID 1 to the real process so it receives signals
+exec "$@"</code></pre>
+<pre data-title="Dockerfile"><code class="lang-dockerfile">FROM alpine:3.20
+RUN apk add --no-cache gettext          # provides envsubst
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["myserver", "--config", "/etc/app/config.yaml"]</code></pre>
+<p>The <code>exec "$@"</code> line is the whole point: the shell <em>replaces itself</em> with the server, so the server becomes PID 1 and <code>docker stop</code> works. Every official database and web-server image uses exactly this pattern.</p>
+
+<div class="lab"><h3>Hands-on lab (10 min)</h3><p>Watch shell form ignore SIGTERM.</p>
+<pre><code class="lang-bash">$ printf 'FROM alpine\nCMD sleep 300\n' > Dockerfile.shell
+$ printf 'FROM alpine\nCMD ["sleep","300"]\n' > Dockerfile.exec
+$ docker build -q -t s-shell -f Dockerfile.shell . && docker build -q -t s-exec -f Dockerfile.exec .
+$ docker run -d --name a s-shell && docker run -d --name b s-exec
+$ docker exec a ps            # PID 1 = /bin/sh -c sleep 300, PID 7 = sleep
+$ docker exec b ps            # PID 1 = sleep 300
+$ time docker stop a          # ~10 s: sh ignores SIGTERM, Docker escalates to SIGKILL
+$ time docker stop b          # instant? no — sleep also has no handler. Try with nginx:
+$ docker run -d --name n nginx && time docker stop n   # &lt; 1 s, nginx handles SIGTERM
+$ docker rm -f a b n</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Final command = <code>ENTRYPOINT + CMD</code>; run-time arguments replace <code>CMD</code>; <code>--entrypoint</code> replaces <code>ENTRYPOINT</code>.</li>
+<li>Always use exec (JSON array) form so your process is PID 1 and receives <code>SIGTERM</code>. In entrypoint scripts, finish with <code>exec "$@"</code>.</li>
+<li>Kubernetes <code>command</code> ⇢ <code>ENTRYPOINT</code>, <code>args</code> ⇢ <code>CMD</code>.</li>
+<li>Log to stdout; use <code>docker logs</code>, <code>exec</code>, <code>inspect</code> and <code>stats</code> for day-to-day debugging.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.text('tl', 180, 26, 'Shell form: CMD python app.py', { cls: 'b mono', fs: 12 })
+    + S.text('tr', 540, 26, 'Exec form: CMD ["python","app.py"]', { cls: 'b mono', fs: 12 })
+    + S.zone('zl', 20, 40, 320, 200, 'container') + S.zone('zr', 380, 40, 320, 200, 'container')
+    + S.box('sh', 60, 70, 240, 40, ['PID 1 · /bin/sh -c "python app.py"'], { fs: 11, lcls: 'mono' })
+    + S.box('py', 100, 150, 200, 40, ['PID 7 · python app.py'], { fs: 11, lcls: 'mono', cls: 'ok' })
+    + S.arrow('al', 180, 110, 180, 148, { label: 'child' })
+    + S.box('py2', 420, 70, 240, 40, ['PID 1 · python app.py'], { fs: 11, lcls: 'mono', cls: 'ok' })
+    + S.dot('sigL', 180, 260, { cls: 'bad', label: 'SIGTERM', hidden: true, ly: 20 })
+    + S.dot('sigR', 540, 260, { cls: 'bad', label: 'SIGTERM', hidden: true, ly: 20 })
+    + S.text('cl', 180, 290, '', { cls: 'sm badc b' }) + S.text('cr', 540, 290, '', { cls: 'sm okc b' })
+    + S.icon('clk', 350, 275, 'clock', { hidden: true, label: '10 s', ly: 24 });
+  Anim.define('pid1-signals', { w: 720, h: 320, title: 'Why exec form matters', svg, steps: [
+    { c: 'Same app, two Dockerfiles. On the left, shell form: Docker starts <code>/bin/sh -c</code> as PID 1 and python is its child. On the right, exec form: python <b>is</b> PID 1.', on(q){} },
+    { c: 'You run <code>docker stop</code> (or Kubernetes deletes the Pod). The runtime sends <b>SIGTERM to PID 1</b> — only to PID 1.', on(q){ q('#sigL,#sigR').show(); q('#sigL').to(180, 118); q('#sigR').to(540, 118); } },
+    { c: 'Left: <code>sh</code> receives it. A non-interactive shell does not forward signals to its children, and as PID 1 it ignores the default action. <b>python never hears about it.</b>', on(q){ q('#sh rect').set('bad'); q('#cl').text('sh swallows the signal; python keeps running'); } },
+    { c: 'Right: python receives SIGTERM directly, runs its shutdown handler — finishes in-flight requests, closes connections — and exits cleanly within a second.', on(q){ q('#py2 rect').set('hl'); q('#cr').text('graceful shutdown, exit 0'); } },
+    { c: 'Left, 10 seconds later (30 s in Kubernetes): the grace period expires and the runtime sends <b>SIGKILL</b>. Requests are dropped, files may be half-written, and every deploy takes 10–30 s longer than it should.', on(q){ q('#clk').show(); q('#sigL').text('SIGKILL').to(180, 118); q('#py rect').set('bad'); q('#cl').text('killed after the grace period — no cleanup'); } },
+    { c: 'Rule: use exec form, and if you need a wrapper script, end it with <code>exec "$@"</code> so the real process takes over PID 1.', on(q){ q('#zr rect').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

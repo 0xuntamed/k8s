@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 43 · Helm Charts · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d43" data-root="../" data-related="d42,d28,d40">
+<article class="lesson">
+<p class="lead"><strong>Helm</strong> is the package manager for Kubernetes. A <em>chart</em> is a directory of templated manifests plus a <code>values.yaml</code> of parameters; <code>helm install</code> renders the templates with your values and applies the result as a named, versioned <em>release</em> that can be upgraded and rolled back as a unit. Almost every piece of third-party software you will run — ingress controllers, Prometheus, cert-manager, databases — ships as a chart. This lesson installs charts, reads them, writes a small one, and shows exactly where Helm keeps its state.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Charts, repositories, releases, revisions — the vocabulary</li>
+<li>Installing and customising a public chart: <code>--set</code>, <code>-f values.yaml</code>, <code>show values</code></li>
+<li>Upgrade, rollback, history, uninstall; where release state lives</li>
+<li>Chart anatomy: Chart.yaml, values.yaml, templates/, _helpers.tpl, and Go templating basics</li>
+<li><code>helm template</code> / <code>--dry-run</code> / <code>lint</code>, and when Helm vs Kustomize</li>
+</ul></div>
+
+<h2>Vocabulary</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><strong>Chart</strong></td><td>A package: <code>Chart.yaml</code> metadata + <code>values.yaml</code> defaults + <code>templates/</code>. Distributed as a <code>.tgz</code>.</td></tr>
+<tr><td><strong>Repository</strong></td><td>An HTTP index of charts (<code>index.yaml</code> + tgz files), or an OCI registry (<code>oci://ghcr.io/org/charts/x</code>). Add with <code>helm repo add</code>.</td></tr>
+<tr><td><strong>Values</strong></td><td>The parameters. Chart defaults ← your values file ← <code>--set</code> flags, later wins.</td></tr>
+<tr><td><strong>Release</strong></td><td>One installation of a chart in one namespace under a name. Two releases of the same chart are independent.</td></tr>
+<tr><td><strong>Revision</strong></td><td>Each install/upgrade/rollback increments it; Helm keeps the history so it can roll back.</td></tr>
+</table></div>
+
+<h2>Installing a chart</h2>
+<pre><code class="lang-bash">$ helm repo add bitnami https://charts.bitnami.com/bitnami
+$ helm repo update
+$ helm search repo nginx                                   # charts in added repos
+$ helm search hub prometheus | head                        # Artifact Hub (public index)
+$ helm show values bitnami/nginx | less                    # every parameter and its default — read this first
+$ helm show chart bitnami/nginx                            # Chart.yaml: version, appVersion, dependencies
+
+$ helm install web bitnami/nginx --namespace demo --create-namespace \
+    --set replicaCount=2 --set service.type=ClusterIP
+$ helm install web bitnami/nginx -n demo -f my-values.yaml --version 18.1.0   # pin the CHART version
+$ helm install web oci://registry-1.docker.io/bitnamicharts/nginx -n demo    # OCI form
+
+$ helm list -n demo                                        # NAME REVISION STATUS CHART APP VERSION
+$ helm status web -n demo                                  # NOTES.txt output: how to reach the app
+$ helm get values web -n demo                              # what you overrode (--all for effective values)
+$ helm get manifest web -n demo                            # the rendered YAML that was applied</code></pre>
+<pre data-title="my-values.yaml"><code class="lang-yaml">replicaCount: 3
+image:
+  tag: 1.27.0
+service:
+  type: NodePort
+  nodePorts:
+    http: "30080"
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 256Mi}</code></pre>
+
+<h2>Upgrade, rollback, history</h2>
+<figure data-anim="helm-release"></figure>
+<pre><code class="lang-bash">$ helm upgrade web bitnami/nginx -n demo -f my-values.yaml --set replicaCount=5      # revision 2
+$ helm upgrade --install web bitnami/nginx -n demo -f my-values.yaml                 # idempotent: install if missing (CI's favourite)
+$ helm history web -n demo
+REVISION  UPDATED   STATUS      CHART         APP VERSION  DESCRIPTION
+1         …         superseded  nginx-18.1.0  1.27.0       Install complete
+2         …         deployed    nginx-18.1.0  1.27.0       Upgrade complete
+$ helm rollback web 1 -n demo                                                        # revision 3 = contents of 1
+$ helm upgrade web … --atomic --timeout 5m     # roll back automatically if the upgrade fails / pods never become ready
+$ helm uninstall web -n demo                   # deletes everything the release created (keep history with --keep-history)</code></pre>
+<div class="callout info"><div class="ct">Where the state lives</div><p>Helm 3 has no server component. Each revision is stored as a <strong>Secret</strong> in the release's namespace, type <code>helm.sh/release.v1</code>, named <code>sh.helm.release.v1.web.v2</code>, containing the gzipped, base64 chart + values + rendered manifest. <code>helm rollback</code> just re-applies an older Secret's manifest. That is why <code>kubectl get secrets -n demo</code> shows them, why RBAC on Secrets is enough to use Helm, and why deleting those Secrets makes Helm forget a release (the objects stay). Helm applies manifests with a three-way merge like <code>kubectl apply</code>, tracking ownership with the labels <code>app.kubernetes.io/managed-by: Helm</code> and annotations <code>meta.helm.sh/release-name/-namespace</code>.</p></div>
+
+<h2>Inside a chart</h2>
+<pre><code class="lang-bash">$ helm create mychart                     # scaffold
+$ tree mychart
+mychart/
+├── Chart.yaml            # name, version (chart), appVersion (software), dependencies
+├── values.yaml           # defaults; the chart's public API
+├── charts/               # dependency charts (helm dependency update)
+├── templates/
+│   ├── _helpers.tpl      # named template snippets (labels, names)
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   ├── serviceaccount.yaml
+│   ├── hpa.yaml
+│   ├── NOTES.txt         # printed after install
+│   └── tests/test-connection.yaml
+└── .helmignore</code></pre>
+<pre data-title="Chart.yaml"><code class="lang-yaml">apiVersion: v2
+name: mychart
+description: A web service
+type: application
+version: 0.3.1            # chart version — bump on any chart change (SemVer)
+appVersion: "2.4.0"       # version of the software inside
+dependencies:
+- name: redis
+  version: "20.x.x"
+  repository: https://charts.bitnami.com/bitnami
+  condition: redis.enabled</code></pre>
+<pre data-title="templates/deployment.yaml (trimmed)"><code class="lang-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mychart.fullname" . }}          # release-name-chart-name, from _helpers.tpl
+  labels:
+    {{- include "mychart.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mychart.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}   # config change → rollout
+      labels:
+        {{- include "mychart.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        ports:
+        - containerPort: {{ .Values.service.port }}
+        {{- with .Values.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        env:
+        {{- range $k, $v := .Values.env }}
+        - name: {{ $k }}
+          value: {{ $v | quote }}
+        {{- end }}</code></pre>
+<dl class="kv">
+<dt>.Values</dt><dd>values.yaml merged with user overrides. <code>.Values.image.tag</code>.</dd>
+<dt>.Release</dt><dd><code>.Release.Name</code>, <code>.Release.Namespace</code>, <code>.Release.Revision</code>.</dd>
+<dt>.Chart</dt><dd>Fields of Chart.yaml: <code>.Chart.Name</code>, <code>.Chart.AppVersion</code>.</dd>
+<dt>{{- and -}}</dt><dd>Trim whitespace/newlines on that side — essential for clean YAML.</dd>
+<dt>if / with / range</dt><dd>Conditionals, scoped blocks, loops.</dd>
+<dt>include, toYaml, nindent, default, quote, required, tpl</dt><dd>The functions you will use constantly. <code>required "msg" .Values.x</code> fails the render if unset.</dd>
+</dl>
+
+<h2>Render before you apply</h2>
+<pre><code class="lang-bash">$ helm lint mychart                                          # structural checks
+$ helm template web mychart -f my-values.yaml                # render locally, no cluster needed
+$ helm template web mychart --show-only templates/deployment.yaml
+$ helm install web mychart --dry-run --debug                 # render + server-side validation, print everything
+$ helm install web mychart -n demo --wait --timeout 3m       # block until pods are Ready
+$ helm package mychart && helm push mychart-0.3.1.tgz oci://ghcr.io/acme/charts
+$ helm test web -n demo                                      # run templates/tests/</code></pre>
+
+<h2>Hooks and CRDs</h2>
+<ul>
+<li><strong>Hooks</strong> (<code>helm.sh/hook: pre-install, post-upgrade, pre-delete…</code> annotations on a Job/Pod) run at lifecycle points — database migrations before an upgrade, cleanup before delete. They are not part of the release's normal manifest and need <code>helm.sh/hook-delete-policy</code> to be cleaned up.</li>
+<li><strong>CRDs</strong> in a chart's <code>crds/</code> directory are installed on first install and <em>never upgraded or deleted</em> by Helm (too dangerous). Operators' charts document how to update CRDs by hand.</li>
+</ul>
+
+<div class="callout mental"><div class="ct">Helm vs Kustomize, settled</div><p>Use Helm to <em>consume</em> software written by others (it is how they ship it, with parameters and upgrade paths) and to <em>distribute</em> your own when others will install it with different settings. Use Kustomize (Day 42) for your own services across your own environments, where you want plain YAML in git and no templating logic. Combining them — <code>helm template … | kubectl kustomize</code>, or Kustomize's <code>helmCharts</code> — is normal.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Expect: <code>helm repo add/update</code>, <code>helm install</code> with <code>--set</code> or <code>-f</code>, <code>helm upgrade</code> to a new <code>--version</code>, <code>helm rollback</code>, <code>helm list -A</code>, <code>helm uninstall</code>. Practise each once.</li>
+<li>"Find which chart version deploys app version X": <code>helm search repo chart --versions | grep X</code>.</li>
+<li>Always <code>-n</code>: releases are per namespace; <code>helm list</code> without <code>-A</code> shows only the current namespace.</li>
+<li><code>helm show values</code> beats guessing key names; the docs site is allowed too.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+$ helm repo add bitnami https://charts.bitnami.com/bitnami && helm repo update
+$ helm show values bitnami/nginx | grep -E '^replicaCount|^  type:'
+$ helm install web bitnami/nginx -n demo --create-namespace --set replicaCount=2 --set service.type=ClusterIP
+$ helm list -n demo; kubectl get all -n demo
+$ kubectl get secret -n demo -l owner=helm                  # sh.helm.release.v1.web.v1
+$ helm upgrade web bitnami/nginx -n demo --set replicaCount=3 --set service.type=ClusterIP
+$ helm history web -n demo; kubectl get deploy -n demo      # 3 replicas, revision 2
+$ helm rollback web 1 -n demo && kubectl get deploy -n demo # back to 2, revision 3
+$ helm get manifest web -n demo | grep -c '^kind:'
+# your own chart
+$ helm create hello && helm template hello ./hello --set replicaCount=2 | grep -A2 'replicas'
+$ helm install hello ./hello -n demo --set image.tag=1.27 && helm list -n demo
+$ helm uninstall web hello -n demo; kubectl delete ns demo</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Chart = templates + values; release = a named install; revisions enable rollback. State is Secrets in the namespace; no server.</li>
+<li>Workflow: <code>repo add/update</code> → <code>show values</code> → <code>install -f values</code> → <code>upgrade</code> / <code>rollback</code> / <code>uninstall</code>; <code>upgrade --install</code> for CI.</li>
+<li>Templates are Go templates over <code>.Values</code>, <code>.Release</code>, <code>.Chart</code>; <code>helm template</code> and <code>--dry-run</code> show the YAML first.</li>
+<li>Hooks run Jobs at lifecycle points; CRDs in <code>crds/</code> are install-only.</li>
+<li>Helm for consuming/distributing packaged software; Kustomize for your own environments.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.term('chart', 20, 20, 200, 110, ['chart nginx-18.1.0', 'templates/*.yaml', 'values.yaml (defaults)'], { fs: 9.5 })
+    + S.term('vals', 20, 150, 200, 80, ['my-values.yaml', 'replicaCount: 2', 'service.type: ClusterIP'], { fs: 9.5 })
+    + S.box('helm', 280, 90, 120, 60, ['helm', 'render + apply'], { subfs: 9, subcls: 'muted', cls: 'pur' })
+    + S.arrow('a1', 220, 75, 278, 110, { d: 'M 220 75 L 278 110' }) + S.arrow('a2', 220, 190, 278, 130, { d: 'M 220 190 L 278 130' }) + S.arrow('a3', 400, 120, 458, 120)
+    + S.zone('ns', 460, 20, 240, 280, 'namespace demo')
+    + S.pod('d', 530, 80, 'Deployment', { w: 90, cls: 'ok', hidden: true }) + S.pod('s', 640, 80, 'Service', { w: 70, cls: 'cy', hidden: true })
+    + S.term('rel', 475, 120, 210, 160, ['release "web" state (Secrets):', '', '', '', '', ''], { fs: 9 })
+    + S.text('m', 360, 290, '', { cls: 'sm b' });
+  Anim.define('helm-release', { w: 720, h: 305, title: 'Install → upgrade → rollback', ms: 2800, svg, steps: [
+    { c: '<code>helm install web bitnami/nginx -f my-values.yaml</code>: Helm merges values (chart defaults ← file ← --set), renders the templates to YAML, and applies the objects.', on(q){ q('#helm rect').set('pur'); q('#d,#s').show(); q('#rel-l1').text('sh.helm.release.v1.web.v1  deployed').style('fill', 'var(--green)'); q('#m').text('revision 1: manifest + values stored in a Secret'); } },
+    { c: '<code>helm upgrade web … --set replicaCount=5</code>: render again with new values, three-way-merge against the live objects, store <b>revision 2</b>. Revision 1 is kept as "superseded".', on(q){ q('#vals-l1').text('replicaCount: 5').style('fill', 'var(--accent)'); q('#d').text('Deployment ×5'); q('#rel-l1').text('sh.helm.release.v1.web.v1  superseded').style('fill', 'var(--muted)'); q('#rel-l2').text('sh.helm.release.v1.web.v2  deployed').style('fill', 'var(--green)'); q('#m').text('revision 2'); } },
+    { c: 'The upgrade turns out to be bad. <code>helm rollback web 1</code> re-applies revision 1\'s stored manifest — as a new <b>revision 3</b>, so history stays linear.', on(q){ q('#d').text('Deployment ×2'); q('#rel-l2').text('sh.helm.release.v1.web.v2  superseded').style('fill', 'var(--muted)'); q('#rel-l3').text('sh.helm.release.v1.web.v3  deployed (rollback to 1)').style('fill', 'var(--green)'); q('#m').text('rollback = re-apply an old Secret\'s manifest'); } },
+    { c: '<code>helm uninstall web</code> deletes every object the release owns and (by default) its history Secrets. The chart in the repo and your values file are untouched — <code>helm install</code> again recreates it.', on(q){ q('#d,#s').add('hid'); q('#rel-l1,#rel-l2,#rel-l3').text('').style('fill', 'var(--faint)'); q('#rel-l0').text('(no release)'); q('#m').text('no server, no daemon: Helm is a client + Secrets'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

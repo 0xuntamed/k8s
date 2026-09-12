@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L3 · Control Groups (cgroups) · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l03" data-root="../" data-related="d19,d20,d54,d58">
+<article class="lesson">
+<p class="lead">Namespaces decide what a process can <em>see</em>; control groups decide how much it can <em>use</em>. Every CPU request, memory limit, OOMKilled event, throttled latency spike, <code>kubectl top</code> number and node-pressure eviction is a cgroup file being written or read. cgroups are a filesystem, so you can watch all of it happen with <code>cat</code>.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The cgroup v2 unified hierarchy under <code>/sys/fs/cgroup</code> and how processes are placed in it</li>
+<li>The controllers that matter: cpu (weight, max), memory (max, min, events), pids, io</li>
+<li>How systemd, containerd and the kubelet lay out the tree (<code>kubepods.slice</code>) and the cgroup driver</li>
+<li>Reading a container's usage and limits directly; reproducing throttling and OOM</li>
+<li>v1 vs v2 and why the driver mismatch breaks nodes</li>
+</ul></div>
+
+<h2>A filesystem of limits</h2>
+<pre><code class="lang-bash">$ mount | grep cgroup                          # cgroup2 on /sys/fs/cgroup type cgroup2   (v2, "unified")
+$ ls /sys/fs/cgroup/                            # controllers + top-level groups: system.slice, user.slice, kubepods.slice …
+$ cat /sys/fs/cgroup/cgroup.controllers         # cpuset cpu io memory hugetlb pids rdma misc
+$ cat /proc/$$/cgroup                           # 0::/user.slice/user-1000.slice/session-3.scope  ← where THIS process lives
+$ sudo mkdir /sys/fs/cgroup/demo                # creating a directory creates a group…
+$ ls /sys/fs/cgroup/demo                        # …and the kernel populates it with control files
+$ echo $$ | sudo tee /sys/fs/cgroup/demo/cgroup.procs    # move this shell into it (children inherit)
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max    # 50 ms per 100 ms = 0.5 CPU
+$ echo 200M | sudo tee /sys/fs/cgroup/demo/memory.max</code></pre>
+<p>Groups form a <strong>tree</strong>; a child cannot exceed its parent; limits are enforced on the sum of all processes in the group and its descendants. Every process is in exactly one cgroup (v2). Controllers must be enabled for children via <code>cgroup.subtree_control</code> in the parent.</p>
+
+<h2>The controllers you will meet</h2>
+<div class="tbl-wrap"><table>
+<tr><th>File</th><th>Meaning</th><th>Kubernetes source</th></tr>
+<tr><td><code>cpu.weight</code></td><td>Relative share (1–10000, default 100) when CPU is contended. Only matters under saturation.</td><td>CPU <strong>request</strong> (1000m ≈ weight 39; scaled from the v1 "shares" value 1024)</td></tr>
+<tr><td><code>cpu.max</code></td><td><code>$QUOTA $PERIOD</code> in µs: hard ceiling per period. <code>max 100000</code> = unlimited.</td><td>CPU <strong>limit</strong> (500m → <code>50000 100000</code>)</td></tr>
+<tr><td><code>cpu.stat</code></td><td><code>usage_usec</code>, <code>nr_periods</code>, <code>nr_throttled</code>, <code>throttled_usec</code></td><td>metrics-server CPU; throttling metrics</td></tr>
+<tr><td><code>memory.max</code></td><td>Hard limit; exceeding → reclaim, then OOM kill inside the group.</td><td>Memory <strong>limit</strong></td></tr>
+<tr><td><code>memory.min</code> / <code>memory.low</code></td><td>Guaranteed / soft-protected amounts during reclaim.</td><td>Memory request (with <code>MemoryQoS</code> feature)</td></tr>
+<tr><td><code>memory.current</code>, <code>memory.stat</code></td><td>Usage now; breakdown (anon, file cache, …). Working set = current − inactive_file.</td><td><code>kubectl top</code> memory</td></tr>
+<tr><td><code>memory.events</code></td><td><code>low high max oom oom_kill</code> counters</td><td>OOMKilled detection</td></tr>
+<tr><td><code>pids.max</code>, <code>pids.current</code></td><td>Cap on process/thread count.</td><td>kubelet <code>podPidsLimit</code>; PIDPressure</td></tr>
+<tr><td><code>io.max</code>, <code>io.weight</code></td><td>Disk bandwidth/IOPS limits and shares.</td><td>Not exposed by Kubernetes (some CSI/runtime classes use it)</td></tr>
+<tr><td><code>cpuset.cpus</code>, <code>cpuset.mems</code></td><td>Pin to specific CPUs/NUMA nodes.</td><td>kubelet static CPU manager policy (Guaranteed Pods with integer CPUs)</td></tr>
+</table></div>
+<figure data-anim="cgroup-tree"></figure>
+
+<h2>The tree on a Kubernetes node</h2>
+<pre><code class="lang-bash">$ systemd-cgls --no-pager | head -40             # the whole hierarchy with process names
+/sys/fs/cgroup
+├── system.slice               ← systemd services: containerd.service, kubelet.service, sshd…
+├── user.slice
+└── kubepods.slice             ← the kubelet's root for pods (allocatable = capacity − reserved)
+    ├── kubepods-burstable.slice
+    │   └── kubepods-burstable-pod6b1e…slice        ← one pod (QoS class in the parent name)
+    │       ├── cri-containerd-3f9c….scope           ← pause container
+    │       └── cri-containerd-a12b….scope           ← app container ← limits live HERE
+    ├── kubepods-besteffort.slice
+    └── kubepods-pod9d2f….slice                      ← Guaranteed pods sit directly under kubepods
+$ CID=$(crictl ps -q --name api); CG=$(crictl inspect $CID | jq -r '.info.runtimeSpec.linux.cgroupsPath'); echo $CG
+# kubepods-burstable-pod6b1e….slice:cri-containerd:a12b…   → systemd driver naming; the path is:
+$ CGP=/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod6b1e….slice/cri-containerd-a12b….scope
+$ cat $CGP/cpu.max $CGP/cpu.weight $CGP/memory.max $CGP/memory.current $CGP/pids.current
+$ cat $CGP/cpu.stat | grep throttled; cat $CGP/memory.events
+$ cat $CGP/cgroup.procs                          # host PIDs of the container's processes</code></pre>
+<p>The QoS layout is visible in the names: Guaranteed Pods get their own slice directly under <code>kubepods</code>; Burstable and BestEffort Pods sit under sub-slices whose <code>cpu.weight</code> and memory protection the kubelet tunes so that BestEffort loses first. Node-level reservations (<code>--kube-reserved</code>, <code>--system-reserved</code>) are limits on <code>system.slice</code> siblings, which is why allocatable is less than capacity.</p>
+
+<h2>The cgroup driver</h2>
+<p>Someone has to create these directories. Two conventions exist: <strong>cgroupfs</strong> (the runtime writes directly under <code>/sys/fs/cgroup</code>) and <strong>systemd</strong> (the runtime asks systemd to create transient <em>scopes</em>/<em>slices</em>, which is why the names above end in <code>.slice</code>/<code>.scope</code>). On a systemd host there must be exactly one manager of the tree, so the kubelet (<code>cgroupDriver</code> in its config) and the runtime (<code>SystemdCgroup = true</code> in containerd's <code>config.toml</code>) must agree. Mismatch → containers created in one part of the tree while the kubelet accounts in another → phantom resource usage, nodes flapping NotReady, "failed to create cgroup" errors (<a href="../lessons/d54-kubeadm-cluster.html">Day 54</a>).</p>
+<pre><code class="lang-bash">$ grep cgroupDriver /var/lib/kubelet/config.yaml             # cgroupDriver: systemd
+$ grep SystemdCgroup /etc/containerd/config.toml              # SystemdCgroup = true
+$ stat -fc %T /sys/fs/cgroup                                   # cgroup2fs (v2) or tmpfs (v1)</code></pre>
+
+<h2>Seeing throttling and OOM happen</h2>
+<figure data-anim="cgroup-enforce"></figure>
+<pre><code class="lang-bash"># with systemd-run: a transient scope with limits (no Docker needed)
+$ systemd-run --scope -p CPUQuota=50% -p MemoryMax=100M --user bash
+# inside: cat /proc/self/cgroup; CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+# yes &gt; /dev/null &amp;                                  # burn CPU
+# sleep 5; cat $CG/cpu.stat | grep -E 'throttled'     # nr_throttled climbing; usage ~50% in top
+# kill %1
+# python3 -c 'x=bytearray(200*1024*1024)'            # try to allocate 200 MiB with a 100 MiB max
+# Killed                                              ← the OOM killer; exit 137
+# cat $CG/memory.events                               # oom_kill 1
+# dmesg | tail -3                                     # "Memory cgroup out of memory: Killed process … (python3)"
+# with Docker (same files underneath):
+$ docker run --rm --cpus 0.5 --memory 100m alpine sh -c 'cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max'</code></pre>
+<p>Two behaviours to internalise: CPU over the quota is <em>paused</em> until the next period (latency, not death); memory over the max is <em>reclaimed</em> (page cache dropped) and then a process is <em>killed</em> — memory cannot be paused.</p>
+
+<h2>v1 vs v2</h2>
+<p>cgroup v1 had a separate hierarchy per controller (<code>/sys/fs/cgroup/cpu/…</code>, <code>/sys/fs/cgroup/memory/…</code>) with files like <code>cpu.cfs_quota_us</code>, <code>cpu.shares</code>, <code>memory.limit_in_bytes</code>. v2 (default on Ubuntu 22.04+, RHEL 9+, Debian 11+, Fedora 31+; Kubernetes GA since 1.25) unifies them into one tree with the files above, adds <code>memory.min/low</code> protection and pressure-stall information (<code>cpu.pressure</code>, <code>memory.pressure</code>, <code>io.pressure</code> — PSI), and has no "shares" — hence the weight conversion. If you see <code>memory.limit_in_bytes</code> on a node, it is v1; the concepts map one-to-one.</p>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ stat -fc %T /sys/fs/cgroup; cat /proc/self/cgroup
+$ systemd-run --scope -p CPUQuota=30% -p MemoryMax=64M --user sh -c '
+  CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "cgroup: $CG"; cat $CG/cpu.max $CG/memory.max;
+  yes &gt; /dev/null &amp; sleep 3; grep throttled $CG/cpu.stat; kill %1;
+  head -c 100M /dev/zero | tail 2&gt;/dev/null; echo "exit=$?"; cat $CG/memory.events'
+# on a Kubernetes node with a pod that has limits:
+$ CID=$(crictl ps -q | head -1); P=$(crictl inspect $CID | jq -r '.info.runtimeSpec.linux.cgroupsPath' | sed 's/:/\//g; s#^#/sys/fs/cgroup/#'); # path shape varies by driver — or:
+$ PID=$(crictl inspect $CID | jq .info.pid); CG=/sys/fs/cgroup$(cut -d: -f3 /proc/$PID/cgroup); cat $CG/cpu.max $CG/memory.max $CG/memory.current</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>cgroups = a tree of directories under <code>/sys/fs/cgroup</code>; processes are placed with <code>cgroup.procs</code>; limits are files.</li>
+<li><code>cpu.weight</code> ← request (share under contention), <code>cpu.max</code> ← limit (throttle), <code>memory.max</code> ← limit (OOM kill), <code>pids.max</code>.</li>
+<li>The kubelet lays out <code>kubepods.slice</code> by QoS; each container is a scope; read its files for ground truth.</li>
+<li>kubelet and runtime must use the same cgroup driver (systemd on modern nodes).</li>
+<li>CPU throttles, memory kills — <code>cpu.stat</code> and <code>memory.events</code> record both.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const B = (id, x, y, w, t, cls) => S.box(id, x, y, w, 30, t, { fs: 9.5, lcls: 'mono', cls });
+  let s1 = B('root', 250, 15, 220, '/sys/fs/cgroup (root)', 'soft')
+    + B('sys', 40, 70, 200, 'system.slice', '') + B('kp', 260, 70, 200, 'kubepods.slice', 'hl') + B('usr', 480, 70, 200, 'user.slice', '')
+    + B('kl', 40, 120, 200, 'kubelet.service', '') + B('cd', 40, 160, 200, 'containerd.service', '')
+    + B('bu', 260, 120, 200, 'kubepods-burstable.slice', '') + B('be', 260, 160, 200, 'kubepods-besteffort.slice', '') + B('g', 260, 200, 200, 'kubepods-pod9d2f.slice (Guaranteed)', '')
+    + B('pod', 480, 120, 220, 'kubepods-burstable-pod6b1e.slice', '') + B('c1', 480, 160, 220, 'cri-containerd-3f9c.scope (pause)', '') + B('c2', 480, 200, 220, 'cri-containerd-a12b.scope (app)', 'ok')
+    + S.term('f', 40, 245, 660, 60, ['app scope files:', ''], { fs: 9 })
+    + S.arrow('e1', 300, 45, 140, 68, { d: 'M 300 45 L 140 68', cls: 'noarr' }) + S.arrow('e2', 360, 45, 360, 68, { cls: 'noarr' }) + S.arrow('e3', 420, 45, 580, 68, { d: 'M 420 45 L 580 68', cls: 'noarr' })
+    + S.arrow('e4', 460, 135, 478, 135, { cls: 'noarr' });
+  Anim.define('cgroup-tree', { w: 720, h: 315, title: 'The cgroup tree on a node', ms: 2800, svg: s1, steps: [
+    { c: 'One tree. systemd owns the top: <code>system.slice</code> for daemons (kubelet, containerd themselves), <code>user.slice</code> for logins, and <code>kubepods.slice</code> for everything the kubelet runs.', on(q){} },
+    { c: '<code>kubepods.slice</code> gets <code>cpu.weight</code>/<code>memory.max</code> = allocatable; whatever is reserved for the system stays outside it. That is why <code>Allocatable</code> &lt; <code>Capacity</code>.', on(q){ q('#kp rect').set('hl'); q('#f-l1').text('kubepods.slice: memory.max = capacity − kube-reserved − system-reserved − eviction threshold').style('fill', 'var(--accent)'); } },
+    { c: 'Below it, one slice per <b>QoS class</b>. Guaranteed Pods hang directly off kubepods; Burstable and BestEffort under their own slices, whose weights are set so BestEffort yields first under contention.', on(q){ q('#bu rect,#be rect,#g rect').set('pur'); q('#f-l1').text('burstable/besteffort slices: lower cpu.weight, memory.low = 0 → reclaimed first').style('fill', 'var(--purple)'); } },
+    { c: 'Each Pod is a slice; each container a <b>scope</b> inside it. Requests and limits from the Pod spec are written into the container scope\'s files by the runtime.', on(q){ q('#pod rect').set('hl'); q('#c2 rect').set('ok'); q('#f-l1').text('cpu.weight 10 · cpu.max 100000 100000 · memory.max 536870912 · pids.max 4096').style('fill', 'var(--green)'); } },
+    { c: 'The Pod slice\'s limit is the sum of its containers; the kubelet reads <code>memory.current</code>/<code>cpu.stat</code> from these scopes for <code>kubectl top</code>, and watches <code>memory.events</code> for OOM kills.', on(q){ q('#f-l1').text('read: memory.current, cpu.stat usage_usec → metrics-server; memory.events oom_kill → OOMKilled'); } },
+  ]});
+
+  let s2 = S.term('cg', 20, 20, 320, 120, ['/sys/fs/cgroup/…/app.scope', 'cpu.max:      50000 100000', 'memory.max:   104857600', 'cpu.stat nr_throttled: 0', 'memory.events oom_kill: 0'], { fs: 9.5 })
+    + S.bar('cpu', 470, 40, 200, 18, { label: 'CPU used / period', v: 60 }) + S.text('cpuv', 680, 54, '30 ms', { cls: 'xs mono left' })
+    + S.bar('mem', 470, 90, 200, 18, { label: 'memory', v: 80, cls: 'pur' }) + S.text('memv', 680, 104, '40 MiB', { cls: 'xs mono left' })
+    + S.pod('p', 570, 190, 'app process', { w: 110, cls: 'ok' })
+    + S.text('m', 360, 260, '', { cls: 'sm b' }) + S.text('m2', 360, 282, '', { cls: 'xs muted' });
+  Anim.define('cgroup-enforce', { w: 720, h: 295, title: 'What the kernel does at the limit', ms: 2600, svg: s2, steps: [
+    { c: 'A container scope with 0.5 CPU and 100 MiB. The process uses 30 ms per 100 ms period and 40 MiB. Nothing happens.', on(q){} },
+    { c: 'Load rises: the process wants 90 ms per period. At 50 ms the scheduler <b>dequeues</b> its threads until the period ends. <code>nr_throttled</code> increments every period this happens.', on(q){ q('#cpu-fill').attr('width', 100).set('bad'); q('#cpuv').text('50 ms (wants 90)'); q('#cg-l3').text('cpu.stat nr_throttled: 312').style('fill', 'var(--amber)'); q('#m').text('CPU: throttled, not killed'); q('#m2').text('symptom: latency; visible only in cpu.stat / metrics'); } },
+    { c: 'Memory climbs to the max. First the kernel <b>reclaims</b> reclaimable pages in the group (file cache) to stay under.', on(q){ q('#mem-fill').attr('width', 196).set('warn'); q('#memv').text('99 MiB'); q('#m').text('memory: reclaim page cache first'); q('#m2').text(''); } },
+    { c: 'Nothing left to reclaim and the process still allocates → the cgroup OOM killer picks the largest process in the group and sends <b>SIGKILL</b>. <code>oom_kill</code> increments; dmesg logs it.', on(q){ q('#mem-fill').attr('width', 200).set('bad'); q('#memv').text('100 MiB'); q('#cg-l4').text('memory.events oom_kill: 1').style('fill', 'var(--red)'); q('#p rect').set('bad'); q('#p').text('killed (137)'); q('#m').text('memory: OOM kill inside the cgroup'); q('#m2').text('the kubelet reports Reason: OOMKilled and restarts the container'); } },
+    { c: 'Note the asymmetry the Pod spec inherits: CPU limits cost latency, memory limits cost the process. Set memory request = limit; consider leaving CPU limits off for latency-sensitive services.', on(q){ q('#m').text('throttle vs kill'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

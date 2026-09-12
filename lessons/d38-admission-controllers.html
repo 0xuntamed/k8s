@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 38 · Admission Controllers · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d38" data-root="../" data-related="d35,d19,d41">
+<article class="lesson">
+<p class="lead">Authentication says who you are; authorization says what you may do. Neither looks at the <em>content</em> of what you are creating. That is the job of <strong>admission controllers</strong>: code that runs inside the API server after authorization and before persistence, which can <em>mutate</em> the object (fill in defaults, inject sidecars) or <em>validate</em> it (reject a privileged container, enforce a quota). Half of "why did Kubernetes change my YAML?" and all of "why was my Pod rejected even though I'm cluster-admin?" is answered here.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Where admission sits in the pipeline and the mutating → validating order</li>
+<li>The built-in plugins you rely on without knowing: NamespaceLifecycle, LimitRanger, ServiceAccount, DefaultStorageClass, ResourceQuota, PodSecurity, NodeRestriction…</li>
+<li>Enabling/disabling plugins on the API server and reading the current set</li>
+<li>Dynamic admission: MutatingWebhookConfiguration and ValidatingWebhookConfiguration</li>
+<li>ValidatingAdmissionPolicy (CEL) and where Kyverno/Gatekeeper fit</li>
+</ul></div>
+
+<h2>The admission phase</h2>
+<figure data-anim="admission-chain"></figure>
+<p>Admission only runs for requests that <em>change</em> state (create, update, patch, delete, connect) — never for reads. Two sub-phases, in a fixed order:</p>
+<ol>
+<li><strong>Mutating</strong> — built-in mutating plugins, then mutating webhooks (in name order, and re-run if one changes the object after another). They may alter the object.</li>
+<li><strong>Schema validation</strong> of the (now mutated) object against its OpenAPI type.</li>
+<li><strong>Validating</strong> — built-in validating plugins, then validating webhooks, then ValidatingAdmissionPolicies, all <em>in parallel</em>. Any single rejection fails the request with the plugin's message.</li>
+</ol>
+<p>Mutation first, validation last, so validators always see the final object — a webhook that injects a sidecar cannot sneak a privileged container past PodSecurity.</p>
+
+<h2>Built-in plugins</h2>
+<pre><code class="lang-bash">$ kube-apiserver -h | grep enable-admission-plugins        # lists the default set for this version
+$ grep admission /etc/kubernetes/manifests/kube-apiserver.yaml
+    - --enable-admission-plugins=NodeRestriction           # added to the defaults
+    # - --disable-admission-plugins=…                      # removed from the defaults</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Plugin</th><th>Type</th><th>What it does</th></tr>
+<tr><td><strong>NamespaceLifecycle</strong></td><td>V</td><td>Rejects objects in non-existent or Terminating namespaces; protects <code>default</code>, <code>kube-system</code>, <code>kube-public</code> from deletion.</td></tr>
+<tr><td><strong>LimitRanger</strong></td><td>M+V</td><td>Injects default requests/limits from LimitRange; rejects violations of min/max (<a href="d19-requests-limits.html">Day 19</a>).</td></tr>
+<tr><td><strong>ServiceAccount</strong></td><td>M+V</td><td>Sets <code>serviceAccountName: default</code> if unset, injects the projected token volume, rejects Pods referencing a missing SA (<a href="d37-service-accounts.html">Day 37</a>).</td></tr>
+<tr><td><strong>DefaultStorageClass</strong></td><td>M</td><td>Fills <code>storageClassName</code> on PVCs that omit it.</td></tr>
+<tr><td><strong>DefaultTolerationSeconds</strong></td><td>M</td><td>Adds the 300 s not-ready/unreachable tolerations (<a href="d16-taints-tolerations.html">Day 16</a>).</td></tr>
+<tr><td><strong>ResourceQuota</strong></td><td>V</td><td>Rejects creates that would exceed a namespace quota; updates the quota's <code>used</code>.</td></tr>
+<tr><td><strong>PodSecurity</strong></td><td>V</td><td>Enforces Pod Security Standards per namespace labels (<a href="d41-pod-security.html">Day 41</a>).</td></tr>
+<tr><td><strong>NodeRestriction</strong></td><td>V</td><td>A kubelet may only modify its own Node and Pods bound to it, and may not set certain labels. Paired with the Node authorizer.</td></tr>
+<tr><td><strong>TaintNodesByCondition</strong>, <strong>Priority</strong>, <strong>PersistentVolumeClaimResize</strong>, <strong>RuntimeClass</strong>, <strong>CertificateApproval/Signing</strong>, <strong>StorageObjectInUseProtection</strong>…</td><td>various</td><td>Small behaviours you have already met as "Kubernetes does X automatically".</td></tr>
+<tr><td><strong>MutatingAdmissionWebhook</strong>, <strong>ValidatingAdmissionWebhook</strong>, <strong>ValidatingAdmissionPolicy</strong></td><td>M / V</td><td>The plugins that call <em>your</em> webhooks and policies — always enabled by default.</td></tr>
+<tr><td><em>AlwaysPullImages</em></td><td>M</td><td>Not default. Forces <code>imagePullPolicy: Always</code> so Pods cannot use cached private images they lack credentials for — multi-tenant clusters.</td></tr>
+<tr><td><em>EventRateLimit</em>, <em>ImagePolicyWebhook</em>, <em>DenyServiceExternalIPs</em></td><td>V</td><td>Not default; enable explicitly.</td></tr>
+</table></div>
+<p>Enabling a non-default plugin means editing the static Pod manifest (<code>--enable-admission-plugins=NodeRestriction,AlwaysPullImages</code>); the kubelet restarts the API server. Some plugins need a config file via <code>--admission-control-config-file</code>.</p>
+
+<h2>Dynamic admission: webhooks</h2>
+<p>Built-in plugins are compiled into the API server. Webhooks let you add policy at runtime: the API server POSTs an <code>AdmissionReview</code> (the object, the user, the operation) to an HTTPS endpoint — usually a Service in the cluster — and acts on the JSON response.</p>
+<pre><code class="lang-yaml">apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+- name: inject.example.com
+  clientConfig:
+    service: {name: injector, namespace: infra, path: /mutate, port: 443}
+    caBundle: LS0tLS1CRUdJTi…              # CA that signed the webhook server's cert
+  rules:
+  - apiGroups: [""]
+    apiVersions: [v1]
+    operations: [CREATE]
+    resources: [pods]
+  namespaceSelector:                        # only namespaces labelled injection=enabled
+    matchLabels: {injection: enabled}
+  objectSelector: {}                        # optionally, only objects with certain labels
+  failurePolicy: Fail                       # Fail (reject if webhook unreachable) or Ignore
+  sideEffects: None
+  timeoutSeconds: 5
+  admissionReviewVersions: [v1]
+  reinvocationPolicy: IfNeeded</code></pre>
+<p>A mutating webhook responds with a JSON patch (<code>{"op":"add","path":"/spec/containers/-","value":{…}}</code>); a validating one with <code>allowed: true/false</code> and a message. Istio's sidecar injection, cert-manager's CA injector, and Kyverno's mutations are all mutating webhooks; OPA Gatekeeper and Kyverno's validations are validating webhooks.</p>
+<div class="callout danger"><div class="ct">A webhook can take the cluster down</div><p><code>failurePolicy: Fail</code> plus a webhook that matches everything (<code>resources: ["*"]</code>, no namespaceSelector) and whose Pods are down = <em>no object can be created or updated anywhere</em>, including the webhook's own Pods and kube-system. Always exclude <code>kube-system</code> via <code>namespaceSelector</code>, set a short <code>timeoutSeconds</code>, and understand that <code>Ignore</code> trades safety for availability. When the API server logs <code>failed calling webhook</code>, this is what happened; the fix is <code>kubectl delete mutatingwebhookconfiguration &lt;name&gt;</code> (RBAC permitting) — the API server does not call webhooks for the webhook configuration objects themselves.</p></div>
+
+<h2>ValidatingAdmissionPolicy: in-process rules with CEL</h2>
+<p>GA since 1.30, this lets you write validation rules in <strong>CEL</strong> that the API server evaluates itself — no webhook server, no TLS, no availability risk:</p>
+<pre><code class="lang-yaml">apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: require-team-label
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: [CREATE, UPDATE]
+      resources: ["deployments"]
+  validations:
+  - expression: "has(object.metadata.labels) && 'team' in object.metadata.labels"
+    message: "every Deployment must carry a team label"
+  - expression: "object.spec.replicas <= 20"
+    messageExpression: "'replicas must be ≤ 20, got ' + string(object.spec.replicas)"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: require-team-label-prod
+spec:
+  policyName: require-team-label
+  validationActions: [Deny]          # or Warn, Audit
+  matchResources:
+    namespaceSelector:
+      matchLabels: {env: prod}</code></pre>
+<p>Use it for anything expressible as "look at the object and decide". Webhooks remain for mutation, for decisions that need external data, and for policy engines' richer UX (Kyverno, Gatekeeper, which increasingly compile to CEL themselves).</p>
+
+<h2>Seeing admission at work</h2>
+<pre><code class="lang-bash">$ kubectl run t --image=nginx $do | kubectl apply -f - && kubectl get pod t -o yaml | grep -E 'serviceAccount|tolerationSeconds|kube-api-access' -B1
+# ServiceAccount + DefaultTolerationSeconds mutated it; LimitRanger too if a LimitRange exists
+$ kubectl run bad --image=nginx -n does-not-exist         # NamespaceLifecycle: namespaces "does-not-exist" not found
+$ kubectl apply -f - --dry-run=server &lt;&lt;EOF                # server dry-run runs admission (with side effects skipped)
+…
+EOF
+$ kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations
+$ kubectl get validatingadmissionpolicies,validatingadmissionpolicybindings
+$ kubectl -n kube-system logs kube-apiserver-cka-control-plane | grep -i 'admission\|webhook' | tail</code></pre>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Enable the X admission plugin" → edit <code>/etc/kubernetes/manifests/kube-apiserver.yaml</code>, add to <code>--enable-admission-plugins</code> (comma-separated), wait for the API server to come back (<code>watch crictl ps</code>). A typo keeps the API server down — check <code>crictl logs</code> of the failed container.</li>
+<li>"Pod created but has fields I never set" → an admission plugin (ServiceAccount, LimitRanger, DefaultTolerationSeconds) or a mutating webhook.</li>
+<li>"Everything fails with 'failed calling webhook'" → find and fix/delete the webhook configuration.</li>
+<li>Rejections from admission are HTTP 4xx with the plugin's message in the kubectl error — read it; it usually says exactly what to change.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ docker exec cka-control-plane grep -E 'admission' /etc/kubernetes/manifests/kube-apiserver.yaml
+$ kubectl run plain --image=nginx && kubectl get pod plain -o yaml | grep -A6 -E '^  tolerations:|serviceAccountName'
+$ kubectl create ns lr && kubectl create -n lr -f - &lt;&lt;EOF
+apiVersion: v1
+kind: LimitRange
+metadata: {name: lr}
+spec: {limits: [{type: Container, max: {cpu: "1"}, default: {cpu: 200m}, defaultRequest: {cpu: 100m}}]}
+EOF
+$ kubectl run big --image=nginx -n lr --limits=cpu=2          # rejected by LimitRanger: maximum cpu usage per Container is 1
+$ kubectl run ok --image=nginx -n lr && kubectl get pod ok -n lr -o jsonpath='{.spec.containers[0].resources}{"\n"}'   # defaults injected
+# a CEL policy
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata: {name: no-latest}
+spec:
+  failurePolicy: Fail
+  matchConstraints: {resourceRules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}]}
+  validations:
+  - expression: "object.spec.containers.all(c, !c.image.endsWith(':latest') && c.image.contains(':'))"
+    message: "images must be tagged and must not use :latest"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata: {name: no-latest}
+spec: {policyName: no-latest, validationActions: [Deny]}
+EOF
+$ kubectl run l --image=nginx:latest                         # denied with your message
+$ kubectl run l --image=nginx:1.27 && kubectl delete pod l plain $now
+$ kubectl delete validatingadmissionpolicybinding no-latest; kubectl delete validatingadmissionpolicy no-latest; kubectl delete ns lr</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Admission runs after authz on writes: mutating (built-ins, then webhooks) → schema validation → validating (built-ins, webhooks, CEL policies). Any validator can reject.</li>
+<li>Built-ins explain the "magic": ServiceAccount, LimitRanger, DefaultStorageClass, DefaultTolerationSeconds mutate; NamespaceLifecycle, ResourceQuota, PodSecurity, NodeRestriction validate.</li>
+<li>Enable/disable via the API server manifest flags. NodeRestriction should always be on.</li>
+<li>Webhooks add runtime policy but can block the whole cluster — scope them, exclude kube-system, set timeouts.</li>
+<li>ValidatingAdmissionPolicy (CEL) validates in-process with no webhook risk; use it first.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.term('obj', 20, 20, 300, 130, ['Pod (as submitted)', 'containers:', '- name: app', '  image: myapp:2.1', '', '', ''], { fs: 9.5 })
+    + S.box('m1', 380, 20, 150, 40, ['ServiceAccount (M)'], { fs: 10 }) + S.box('m2', 550, 20, 150, 40, ['LimitRanger (M)'], { fs: 10 })
+    + S.box('m3', 380, 70, 320, 40, ['MutatingWebhook: sidecar-injector'], { fs: 10, cls: 'pur' })
+    + S.box('sv', 380, 120, 320, 30, ['schema validation'], { fs: 10, cls: 'soft' })
+    + S.box('v1', 380, 165, 100, 40, ['PodSecurity (V)'], { fs: 9 }) + S.box('v2', 490, 165, 100, 40, ['ResourceQuota (V)'], { fs: 9 }) + S.box('v3', 600, 165, 100, 40, ['CEL policy (V)'], { fs: 9, cls: 'pur' })
+    + S.box('etcd', 500, 225, 100, 40, ['etcd'], { fs: 11 })
+    + S.text('m', 360, 295, '', { cls: 'sm b' });
+  Anim.define('admission-chain', { w: 720, h: 310, title: 'Admission: mutate, then validate', ms: 2800, svg, steps: [
+    { c: 'A minimal Pod arrives: one container, no SA, no resources, no tolerations. It has passed authentication and RBAC.', on(q){} },
+    { c: '<b>Mutating built-ins</b>: ServiceAccount sets <code>serviceAccountName: default</code> and adds the token volume; LimitRanger injects default requests/limits from the namespace\'s LimitRange.', on(q){ q('#m1 rect,#m2 rect').set('hl'); q('#obj-l4').text('  resources: {requests: {cpu: 100m}}   ← LimitRanger').style('fill', 'var(--amber)'); q('#obj-l5').text('serviceAccountName: default          ← ServiceAccount').style('fill', 'var(--amber)'); } },
+    { c: '<b>Mutating webhook</b>: the namespace is labelled for injection, so the sidecar injector returns a JSON patch adding a second container. The object has changed shape.', on(q){ q('#m1 rect,#m2 rect').set(); q('#m3 rect').set('pur'); q('#obj-l6').text('- name: proxy  image: envoy:1.30     ← webhook').style('fill', 'var(--purple)'); } },
+    { c: '<b>Schema validation</b> of the mutated object: are all fields valid for <code>v1/Pod</code>? A webhook that produced a malformed patch fails here.', on(q){ q('#m3 rect').set(); q('#sv rect').set('hl'); } },
+    { c: '<b>Validating</b> plugins and policies run in parallel on the <i>final</i> object: PodSecurity checks the injected proxy too; ResourceQuota checks the summed requests; a CEL policy checks image tags. Any "no" = 4xx with that message.', on(q){ q('#sv rect').set(); q('#v1 rect,#v2 rect,#v3 rect').set('hl'); q('#m').text('validators see the object after all mutation'); } },
+    { c: 'All allowed → written to etcd. The Pod you <code>get</code> back has fields you never wrote; the ones you can\'t create despite being admin were rejected here, not by RBAC.', on(q){ q('#v1 rect,#v2 rect,#v3 rect').set('ok'); q('#etcd rect').set('ok'); q('#m').text('admission explains both "added fields" and "rejected as admin"'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

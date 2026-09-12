@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 34 · TLS Masterclass 4: CSRs & External User Access · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d34" data-root="../" data-linux="l09" data-related="d32,d33,d36">
+<article class="lesson">
+<p class="lead">A new engineer, Jane, needs access to the cluster. Kubernetes has no user database, so "creating a user" means: Jane generates a key pair, sends a <strong>Certificate Signing Request</strong> containing her public key and desired name, the cluster CA signs it, and the resulting certificate goes into her kubeconfig. Kubernetes has a first-class API object for the middle step so you never have to hand the CA private key to anyone. This is also the lesson on renewing the cluster's own certificates before they expire.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>What a CSR contains and why it is safe to send</li>
+<li>The <code>CertificateSigningRequest</code> API: signers, usages, approval, retrieval</li>
+<li>Building a working kubeconfig for the new user and binding RBAC</li>
+<li>Manual signing with the CA key (the openssl equivalent)</li>
+<li>Renewing and rotating cluster certificates with <code>kubeadm certs</code></li>
+</ul></div>
+
+<h2>Step 1 — Jane generates a key and a CSR</h2>
+<pre><code class="lang-bash">$ openssl genrsa -out jane.key 2048
+$ openssl req -new -key jane.key -subj "/CN=jane/O=developers/O=payments" -out jane.csr
+$ openssl req -in jane.csr -noout -subject     # subject=CN = jane, O = developers, O = payments</code></pre>
+<p>The CSR holds Jane's <strong>public key</strong>, the requested <strong>Subject</strong> (CN → username, each O → a group), and a signature made with her private key proving she holds it. The private key never leaves her machine; the CSR can be emailed in the clear. Whoever signs it decides whether to honour the requested subject — approval is where the security lives.</p>
+
+<h2>Step 2 — Submit a CertificateSigningRequest object</h2>
+<figure data-anim="csr-flow"></figure>
+<pre><code class="lang-bash">$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: jane
+spec:
+  request: $(base64 -w0 jane.csr)               # the PEM CSR, base64-encoded
+  signerName: kubernetes.io/kube-apiserver-client   # "sign with the cluster CA, for client auth"
+  expirationSeconds: 7776000                    # 90 days (optional; default 1 year, signer may cap)
+  usages:
+  - client auth
+EOF
+$ kubectl get csr
+NAME   AGE   SIGNERNAME                            REQUESTOR          REQUESTEDDURATION   CONDITION
+jane   5s    kubernetes.io/kube-apiserver-client   kubernetes-admin   90d                 Pending</code></pre>
+<dl class="kv">
+<dt>signerName</dt><dd>Which built-in signer handles it. <code>kubernetes.io/kube-apiserver-client</code> — client certs for users (needs manual approval). <code>kubernetes.io/kube-apiserver-client-kubelet</code> — kubelet client certs (auto-approved for bootstrap tokens and node identities). <code>kubernetes.io/kubelet-serving</code> — kubelet serving certs. <code>kubernetes.io/legacy-unknown</code> — no signer; for external CAs.</dd>
+<dt>usages</dt><dd>Must include <code>client auth</code> for a client cert (<code>server auth</code> for serving). The signer rejects mismatches.</dd>
+<dt>request</dt><dd>Base64 of the PEM. <code>base64 -w0</code> (GNU) or <code>base64 | tr -d '\n'</code> — newlines break it.</dd>
+</dl>
+
+<h2>Step 3 — An admin approves; the CA signs</h2>
+<pre><code class="lang-bash">$ kubectl describe csr jane            # review Subject: CN=jane O=developers O=payments — is that what she should get?
+$ kubectl certificate approve jane     # or: kubectl certificate deny jane
+$ kubectl get csr jane                 # CONDITION: Approved,Issued</code></pre>
+<p>Approval is an RBAC-protected action (<code>certificatesigningrequests/approval</code>, held by cluster-admin). Once approved, the <strong>csrsigning</strong> controller in kube-controller-manager — which holds <code>ca.key</code> via <code>--cluster-signing-cert-file/--cluster-signing-key-file</code> — signs the certificate and writes it into <code>status.certificate</code>. Nobody had to touch the CA key by hand.</p>
+
+<h2>Step 4 — Retrieve the certificate and build the kubeconfig</h2>
+<pre><code class="lang-bash">$ kubectl get csr jane -o jsonpath='{.status.certificate}' | base64 -d &gt; jane.crt
+$ openssl x509 -in jane.crt -noout -subject -issuer -dates      # issuer=CN=kubernetes; 90 days
+
+# give Jane a kubeconfig (do this on her machine with her key, or hand her the file securely)
+$ kubectl config set-cluster prod --server=https://10.0.0.10:6443 --certificate-authority=ca.crt --embed-certs=true --kubeconfig=jane.kubeconfig
+$ kubectl config set-credentials jane --client-certificate=jane.crt --client-key=jane.key --embed-certs=true --kubeconfig=jane.kubeconfig
+$ kubectl config set-context jane@prod --cluster=prod --user=jane --namespace=payments --kubeconfig=jane.kubeconfig
+$ kubectl config use-context jane@prod --kubeconfig=jane.kubeconfig
+$ kubectl --kubeconfig=jane.kubeconfig auth whoami          # jane [developers payments system:authenticated]
+$ kubectl --kubeconfig=jane.kubeconfig get pods              # Forbidden — authenticated but not authorized</code></pre>
+
+<h2>Step 5 — Authorize</h2>
+<p>A valid certificate only gets Jane through <em>authentication</em>. Every request is still <code>403 Forbidden</code> until RBAC grants something to user <code>jane</code> or group <code>developers</code>:</p>
+<pre><code class="lang-bash">$ kubectl create rolebinding dev-edit --clusterrole=edit --group=developers -n payments
+$ kubectl --kubeconfig=jane.kubeconfig get pods              # works, in payments only</code></pre>
+<p>Groups in the certificate are the scalable way to do this — bind roles to <code>developers</code> once; every cert with <code>O=developers</code> inherits them. <a href="d36-rbac.html">Day 36</a> is all about that.</p>
+
+<h2>The manual alternative: sign with openssl</h2>
+<p>If you hold <code>ca.key</code> (you are on the control-plane node), you can skip the API:</p>
+<pre><code class="lang-bash">$ sudo openssl x509 -req -in jane.csr -CA /etc/kubernetes/pki/ca.crt -CAkey /etc/kubernetes/pki/ca.key -CAcreateserial -days 90 -out jane.crt
+$ openssl verify -CAfile /etc/kubernetes/pki/ca.crt jane.crt    # OK — identical result</code></pre>
+<p>Same certificate, same trust. The CSR API exists so that approval can be delegated, audited (<code>kubectl get csr</code> is a log of every issued identity) and automated (kubelets, cert-manager) without copying the CA key around.</p>
+
+<h2>Renewing the cluster's own certificates</h2>
+<pre><code class="lang-bash">$ sudo kubeadm certs check-expiration                   # anything under a few weeks? renew
+$ sudo kubeadm certs renew all                           # rewrites every leaf under /etc/kubernetes/pki and the *.conf kubeconfigs
+$ sudo kubeadm certs renew apiserver                     # or one at a time
+# the static pods must be restarted to load the new files:
+$ sudo mv /etc/kubernetes/manifests/*.yaml /tmp/ && sleep 20 && sudo mv /tmp/*.yaml /etc/kubernetes/manifests/
+# (or just restart the kubelet: systemctl restart kubelet — it re-reads the manifests)
+$ sudo cp /etc/kubernetes/admin.conf ~/.kube/config     # admin.conf was renewed too
+$ kubectl get nodes</code></pre>
+<ul>
+<li><code>kubeadm upgrade</code> (Day 55) renews all certs implicitly, so a cluster upgraded yearly never expires.</li>
+<li>Kubelet client certs rotate themselves (<code>rotateCertificates: true</code>); the API server auto-approves those CSRs.</li>
+<li>The CAs (10 years) are not renewed by <code>renew all</code>; rotating a CA is a documented multi-step procedure — plan it before year 9.</li>
+<li>Expired cert symptoms: every kubectl call fails with <code>x509: certificate has expired or is not yet valid</code>; kubelets go NotReady; the API server may refuse to start. Fix from the node with the commands above; if <code>kubectl</code> is dead, <code>kubeadm certs renew</code> still works because it only needs files.</li>
+</ul>
+
+<div class="callout linux" data-ref="l09"><div class="ct">Under the hood · Linux</div><p>Inspect a CSR before approving: <code>kubectl get csr jane -o jsonpath='{.spec.request}' | base64 -d | openssl req -noout -text</code> shows the subject, public key and any requested extensions. The signer ignores requested SANs and key usages beyond what the signerName allows — you cannot smuggle <code>CA:TRUE</code> or a server-auth cert through the client signer. Certificates have no revocation in Kubernetes: to "remove" Jane you remove her RBAC bindings (instant) and let the cert expire — which is why short <code>expirationSeconds</code> matter for humans and why OIDC (Day 37) is preferred for user identity at scale.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Full flow to memorise: <code>openssl genrsa</code> → <code>openssl req -new -subj "/CN=name"</code> → CSR object with <code>signerName: kubernetes.io/kube-apiserver-client</code>, <code>usages: [client auth]</code>, <code>request: $(base64 -w0)</code> → <code>kubectl certificate approve</code> → <code>get csr -o jsonpath='{.status.certificate}' | base64 -d</code> → <code>set-credentials</code> → RBAC.</li>
+<li>Forgetting <code>-w0</code> (or leaving newlines in the base64) is the #1 reason the CSR is rejected on create.</li>
+<li>"Renew certificates" → <code>kubeadm certs renew all</code> + restart static Pods + refresh admin kubeconfig.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ openssl genrsa -out jane.key 2048 && openssl req -new -key jane.key -subj "/CN=jane/O=developers" -out jane.csr
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata: {name: jane}
+spec:
+  request: $(base64 -w0 jane.csr)
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 86400
+  usages: [client auth]
+EOF
+$ kubectl get csr jane; kubectl certificate approve jane; kubectl get csr jane
+$ kubectl get csr jane -o jsonpath='{.status.certificate}' | base64 -d &gt; jane.crt
+$ openssl x509 -in jane.crt -noout -subject -issuer -enddate
+$ kubectl config set-credentials jane --client-certificate=jane.crt --client-key=jane.key --embed-certs=true
+$ kubectl config set-context jane --cluster=$(kubectl config view --minify -o jsonpath='{.contexts[0].context.cluster}') --user=jane
+$ kubectl --context=jane auth whoami
+$ kubectl --context=jane get pods                        # Forbidden
+$ kubectl create rolebinding jane-view --clusterrole=view --user=jane
+$ kubectl --context=jane get pods                        # works (default namespace)
+$ kubectl --context=jane auth can-i delete pods          # no
+$ kubectl config delete-context jane; kubectl config delete-user jane; kubectl delete csr jane rolebinding jane-view; rm jane.*</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>"Creating a user" = key pair + CSR (CN = user, O = groups) + signature by the cluster CA + kubeconfig + RBAC.</li>
+<li>The CSR API (<code>certificates.k8s.io/v1</code>) lets admins approve requests without touching <code>ca.key</code>; the controller-manager signs.</li>
+<li><code>signerName</code> and <code>usages</code> must match the purpose; the certificate lands in <code>status.certificate</code>.</li>
+<li>Authentication ≠ authorization: a valid cert still gets 403 until bound.</li>
+<li>Cluster leaf certs expire after 1 year; <code>kubeadm certs check-expiration</code> / <code>renew all</code> + restart static Pods.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.icon('jane', 60, 80, 'user', { label: 'Jane', ly: 28 })
+    + S.term('jf', 20, 130, 200, 80, ['jane.key  (private, stays)', 'jane.csr  (pubkey + CN/O)', '', ''], { fs: 9.5 })
+    + S.box('api', 290, 60, 160, 50, ['kube-apiserver', 'CSR object'], { subfs: 9, subcls: 'mono muted' })
+    + S.icon('adm', 370, 200, 'user', { label: 'admin: kubectl certificate approve', ly: 28, cls: 'pur' })
+    + S.box('cm', 530, 60, 170, 50, ['controller-manager', 'csrsigning · holds ca.key'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.term('csr', 290, 130, 410, 60, ['CSR jane:  Pending', 'status.certificate: —'], { fs: 9.5 })
+    + S.arrow('a1', 110, 85, 288, 85, { cls: 'hid', label: 'submit CSR (base64)', ly: 76 })
+    + S.arrow('a2', 370, 190, 370, 112, { cls: 'hid' })
+    + S.arrow('a3', 450, 85, 528, 85, { cls: 'hid', label: 'Approved → sign', ly: 76 })
+    + S.arrow('a4', 288, 100, 110, 100, { d: 'M 288 100 L 112 100', cls: 'hid', label: 'download jane.crt', ly: 118 })
+    + S.text('m', 360, 275, '', { cls: 'sm b' });
+  Anim.define('csr-flow', { w: 720, h: 290, title: 'CertificateSigningRequest lifecycle', ms: 2800, svg, steps: [
+    { c: 'Jane generates <code>jane.key</code> and a CSR asking for <code>CN=jane, O=developers</code>. The key never leaves her laptop; the CSR contains only the public key and the request.', on(q){ q('#jf-l0').style('fill', 'var(--green)'); q('#jf-l1').style('fill', 'var(--accent)'); } },
+    { c: 'She (or an admin on her behalf) creates a <b>CertificateSigningRequest</b> object with the base64 CSR, <code>signerName: kubernetes.io/kube-apiserver-client</code>, <code>usages: [client auth]</code>. Condition: Pending.', on(q){ q('#a1').show().set('hl'); q('#api rect').set('hl'); } },
+    { c: 'An admin reviews the requested subject — is "jane in developers" what she should get? — and runs <code>kubectl certificate approve jane</code>. This is an RBAC-guarded write to the <code>approval</code> subresource.', on(q){ q('#a2').show().set('hl'); q('#csr-l0').text('CSR jane:  Approved').style('fill', 'var(--amber)'); q('#m').text('approval = policy decision, audited in the API'); } },
+    { c: 'The <b>csrsigning</b> controller sees Approved, signs the CSR with <code>ca.key</code> for the requested duration, and stores the certificate in <code>status.certificate</code>. No human touched the CA key.', on(q){ q('#a3').show().set('ok'); q('#cm rect').set('pur'); q('#csr-l0').text('CSR jane:  Approved,Issued').style('fill', 'var(--green)'); q('#csr-l1').text('status.certificate: LS0tLS1CRUdJTi… (CN=jane, issuer CN=kubernetes)').style('fill', 'var(--green)'); } },
+    { c: 'Jane downloads the cert (<code>get csr -o jsonpath</code> | base64 -d) and pairs it with her key in a kubeconfig. She can now authenticate — and gets 403 on everything until RBAC binds her user or group.', on(q){ q('#a4').show().set('ok'); q('#jf-l2').text('jane.crt  (signed by cluster CA)').style('fill', 'var(--green)'); q('#jf-l3').text('→ kubeconfig; then RBAC').style('fill', 'var(--muted)'); q('#m').text('authenticated ≠ authorized'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 56 · Monitoring & Logging · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d56" data-root="../" data-linux="l07,l10" data-related="d20,d57,d58">
+<article class="lesson">
+<p class="lead">Kubernetes ships with the <em>plumbing</em> for observability — every container's stdout is captured, every kubelet exposes resource metrics, every control-plane component serves Prometheus metrics — and none of the storage. This lesson covers what you get out of the box (<code>kubectl logs</code>, <code>top</code>, events, the metrics endpoints), where those bytes physically live on a node, and how the standard stack (metrics-server, Prometheus, Grafana, a log shipper) plugs into it.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Container logs: where the kubelet writes them, rotation, <code>kubectl logs</code> options, and why apps must log to stdout</li>
+<li>Node-level logs: kubelet, containerd and control-plane components via journald and <code>/var/log</code></li>
+<li>Metrics: metrics-server for <code>top</code>/HPA vs Prometheus for everything else; the <code>/metrics</code> endpoints</li>
+<li>Events as a signal and their 1-hour retention</li>
+<li>The cluster-level stack: Prometheus Operator, node-exporter, kube-state-metrics, Grafana, Fluent Bit/Loki</li>
+</ul></div>
+
+<h2>Container logs</h2>
+<figure data-anim="log-path"></figure>
+<pre><code class="lang-bash">$ kubectl logs api-7f9c                              # current container's stdout+stderr
+$ kubectl logs api-7f9c -c sidecar --since=10m --timestamps --tail=200
+$ kubectl logs api-7f9c --previous                    # the crashed instance's output — CrashLoopBackOff's best friend
+$ kubectl logs -l app=api --all-containers --prefix -f   # every pod of a label, streamed, prefixed with pod/container
+$ kubectl logs deploy/api                             # a random pod of the deployment
+$ kubectl logs job/import; kubectl logs ds/fluent-bit -n logging</code></pre>
+<p>Under the hood: the container runtime writes each container's stdout/stderr to a file on the node — <code>/var/log/pods/&lt;ns&gt;_&lt;pod&gt;_&lt;uid&gt;/&lt;container&gt;/0.log</code> (symlinked from <code>/var/log/containers/&lt;pod&gt;_&lt;ns&gt;_&lt;container&gt;-&lt;id&gt;.log</code>) in a JSON/CRI line format with timestamps. The kubelet rotates them (<code>containerLogMaxSize</code> 10Mi, <code>containerLogMaxFiles</code> 5 by default) and serves them over its API when <code>kubectl logs</code> asks. Consequences:</p>
+<ul>
+<li>Logs live only on that node and only while the Pod exists there. A deleted or rescheduled Pod's logs are gone unless something shipped them.</li>
+<li>Logs written to files <em>inside</em> the container are invisible to all of this. Log to stdout/stderr, or run a sidecar that tails the file to its own stdout (<a href="d21-multi-container-pods.html">Day 21</a>).</li>
+<li><code>--previous</code> works because the rotated file of the last instance is kept until the next restart.</li>
+</ul>
+
+<h2>Node and control-plane logs</h2>
+<pre><code class="lang-bash"># systemd services (the only two on a kubeadm node)
+$ sudo journalctl -u kubelet -f                       # follow
+$ sudo journalctl -u kubelet --since "10 min ago" -p warning
+$ sudo journalctl -u containerd -n 100 --no-pager
+# control-plane components are pods → kubectl logs, or on the node:
+$ kubectl -n kube-system logs kube-apiserver-cp-1 --tail=50
+$ sudo crictl ps -a | grep apiserver; sudo crictl logs &lt;id&gt;       # when the API server itself is down
+$ sudo ls /var/log/pods/kube-system_kube-apiserver-cp-1-*/kube-apiserver/   # the raw files
+# audit log, if enabled (API server flag --audit-log-path)
+$ sudo tail -f /var/log/kubernetes/audit.log | jq -c 'select(.verb=="delete") | {user: .user.username, obj: .objectRef}'</code></pre>
+
+<h2>Metrics</h2>
+<div class="compare">
+<div><h4>metrics-server (resource metrics)</h4><p>Scrapes every kubelet's <code>/metrics/resource</code> every 15 s; serves current CPU/memory per Pod and node via <code>metrics.k8s.io</code>. In-memory, no history. Feeds <code>kubectl top</code>, HPA and VPA (<a href="d20-autoscaling.html">Day 20</a>).</p><pre><code class="lang-bash">$ kubectl top nodes
+$ kubectl top pods -A --sort-by=cpu | head
+$ kubectl top pod api-7f9c --containers</code></pre></div>
+<div><h4>Prometheus (everything, with history)</h4><p>Pull-based time series database. Scrapes <code>/metrics</code> endpoints: kubelet + cAdvisor (container CPU/memory/network/disk), API server, scheduler, controller-manager, etcd, kube-proxy, CoreDNS, <strong>node-exporter</strong> (host OS), <strong>kube-state-metrics</strong> (object state: replicas available, Pod phase, restarts), and your apps. Queried with PromQL; alerts via Alertmanager; dashboards in Grafana.</p></div>
+</div>
+<pre><code class="lang-bash">$ kubectl get --raw /metrics | grep -E '^apiserver_request_total' | head -3         # API server's own metrics
+$ kubectl get --raw /api/v1/nodes/worker-1/proxy/metrics/cadvisor | grep container_memory_working_set_bytes | head -3
+$ kubectl get --raw /api/v1/nodes/worker-1/proxy/metrics/resource | head              # what metrics-server reads
+# kube-prometheus-stack: Prometheus Operator + Grafana + node-exporter + kube-state-metrics + dashboards + alert rules
+$ helm install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+$ kubectl -n monitoring port-forward svc/kps-grafana 3000:80        # admin / prom-operator
+$ kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9090</code></pre>
+<p>Useful PromQL to know exists: <code>rate(container_cpu_usage_seconds_total{container!=""}[5m])</code>, <code>container_memory_working_set_bytes</code>, <code>kube_pod_container_status_restarts_total</code>, <code>kube_deployment_status_replicas_unavailable</code>, <code>up{job="kubelet"}</code>, <code>etcd_server_has_leader</code>, <code>apiserver_request_duration_seconds</code>. The Prometheus Operator's <code>ServiceMonitor</code>/<code>PodMonitor</code> CRDs (<a href="d40-operators.html">Day 40</a>) tell it what to scrape.</p>
+
+<h2>Events</h2>
+<pre><code class="lang-bash">$ kubectl get events --sort-by=.lastTimestamp -A | tail -20
+$ kubectl get events --field-selector type=Warning -A
+$ kubectl get events --field-selector involvedObject.name=api-7f9c
+$ kubectl events --for deploy/api --watch                    # newer subcommand
+$ kubectl describe pod api-7f9c | tail -15                   # events are the last section</code></pre>
+<p>Events are objects in etcd with a default TTL of <strong>1 hour</strong> (<code>--event-ttl</code>) — the reason "it was fine this morning" cannot be investigated from events alone. Ship them (kube-state-metrics exposes counts; the event-exporter / Loki shippers store them) if you need history. Scheduler decisions, image pulls, probe failures, OOM kills, evictions and controller actions all appear here first.</p>
+
+<h2>Log shipping</h2>
+<p>To keep logs beyond a Pod's life, run a <strong>DaemonSet</strong> agent (Fluent Bit, Vector, Promtail/Alloy, Filebeat) that mounts <code>/var/log/pods</code> and <code>/var/lib/docker/containers</code> (hostPath), tails every file, enriches lines with Pod metadata from the API (namespace, labels, container), and forwards to a store: <strong>Loki</strong> (queried from Grafana with LogQL), Elasticsearch/OpenSearch (Kibana), or a cloud service (CloudWatch, Cloud Logging). One agent per node covers every Pod — no app changes, no sidecars.</p>
+<pre><code class="lang-yaml"># the shape of every log agent DaemonSet
+spec:
+  template:
+    spec:
+      serviceAccountName: fluent-bit          # RBAC: get/list/watch pods, namespaces (for metadata)
+      tolerations: [{operator: Exists}]        # every node, including control plane
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit
+        volumeMounts:
+        - {name: varlog, mountPath: /var/log, readOnly: true}
+      volumes:
+      - {name: varlog, hostPath: {path: /var/log}}</code></pre>
+
+<div class="callout linux" data-ref="l07,l10"><div class="ct">Under the hood · Linux</div><p>All of this is files and sockets: container logs are plain files under <code>/var/log/pods</code> written by containerd's shim (which holds the container's stdout pipe); kubelet/containerd logs go to journald (<code>journalctl</code> reads the binary journal in <code>/var/log/journal</code>); metrics are HTTP text on <code>:10250/metrics</code>, <code>:9100</code> (node-exporter), <code>:2381</code> (etcd). When kubectl cannot help — API server down, node unreachable — <code>tail -f /var/log/pods/…</code>, <code>journalctl -u kubelet</code>, <code>crictl logs</code> and <code>curl -sk https://localhost:10250/metrics --cert …</code> on the node still work. <code>du -sh /var/log/pods/*</code> and <code>df -h /var/log</code> find the Pod that filled the disk (DiskPressure).</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Classic: "find the Pod whose log contains ERROR and save the line to a file" → <code>kubectl logs POD | grep ERROR &gt; /path</code>. Know <code>-c</code>, <code>--previous</code>, <code>--all-containers</code>, <code>-l</code>.</li>
+<li>"Which node/pod uses the most CPU?" → <code>kubectl top nodes / pods --sort-by=cpu</code> (metrics-server is installed in the exam environment).</li>
+<li>Control plane down → <code>crictl logs</code> and <code>journalctl -u kubelet</code> on the node, not kubectl.</li>
+<li>Events sorted by time are the fastest way to see what just happened cluster-wide.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl run talker --image=busybox --command -- sh -c 'i=0; while true; do echo "line $i $(date)"; i=$((i+1)); sleep 1; done'
+$ kubectl logs talker --tail=3 --timestamps
+$ docker exec cka-worker sh -c 'ls /var/log/pods/ | grep talker; tail -2 /var/log/pods/default_talker_*/talker/0.log'   # or the node the pod is on
+$ kubectl exec talker -- kill 1; sleep 5; kubectl logs talker --previous --tail=2      # the old instance's log survives one restart
+$ kubectl top pod talker 2&gt;/dev/null || echo "install metrics-server (Day 20)"
+$ kubectl get --raw /metrics | grep -c '^apiserver_'
+$ kubectl get events --sort-by=.lastTimestamp | tail -5
+$ docker exec cka-control-plane journalctl -u kubelet -n 5 --no-pager
+$ kubectl delete pod talker $now</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Container stdout/stderr → files in <code>/var/log/pods</code> on the node → <code>kubectl logs</code> via the kubelet. Node-local, rotated, lost with the Pod unless shipped.</li>
+<li>kubelet and containerd log to journald; control-plane components are Pods (<code>kubectl logs</code> or <code>crictl logs</code>).</li>
+<li>metrics-server = now (top, HPA); Prometheus = history and alerting, scraping kubelet/cAdvisor, components, node-exporter, kube-state-metrics.</li>
+<li>Events explain scheduling, pulls, probes and evictions but expire after 1 hour.</li>
+<li>Ship logs with a DaemonSet agent to Loki/Elasticsearch; deploy kube-prometheus-stack for metrics and dashboards.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.node('nd', 20, 20, 440, 290, 'worker-1', {})
+    + S.box('app', 40, 60, 130, 44, ['container api', 'stdout / stderr'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('shim', 200, 60, 110, 44, ['containerd-shim', 'pipe → file'], { subfs: 9, subcls: 'mono muted' })
+    + S.term('file', 40, 125, 400, 70, ['/var/log/pods/shop_api-7f9c_6b1e/api/0.log', '2025-01-01T10:00:00Z stdout F GET /orders 200 12ms', '2025-01-01T10:00:01Z stderr F WARN cache miss'], { fs: 8.5 })
+    + S.box('kl', 40, 215, 130, 44, ['kubelet :10250', '/containerLogs'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('ds', 300, 215, 140, 44, ['log agent (DaemonSet)', 'tails /var/log/pods'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.box('api', 500, 60, 200, 44, ['kube-apiserver', 'proxies to kubelet'], { subfs: 9, subcls: 'muted' })
+    + S.icon('u', 600, 150, 'laptop', { label: 'kubectl logs api-7f9c', ly: 28, lcls: 'mono' })
+    + S.box('loki', 500, 240, 200, 44, ['Loki / Elasticsearch', 'searchable, long-term'], { subfs: 9, subcls: 'muted', cls: 'pur' })
+    + S.arrow('a1', 170, 82, 198, 82) + S.arrow('a2', 255, 104, 240, 123, { d: 'M 255 104 L 245 123' })
+    + S.arrow('a3', 100, 195, 100, 213, { cls: 'hid' }) + S.arrow('a4', 370, 195, 370, 213, { cls: 'hid' })
+    + S.arrow('a5', 600, 130, 600, 106, { cls: 'hid' }) + S.arrow('a6', 500, 82, 172, 225, { d: 'M 500 90 L 172 228', cls: 'hid', label: 'GET /containerLogs/shop/api-7f9c/api', lx: 330, ly: 150 })
+    + S.arrow('a7', 440, 237, 498, 255, { d: 'M 440 237 L 498 258', cls: 'hid' })
+    + S.text('m', 360, 328, '', { cls: 'sm b' });
+  Anim.define('log-path', { w: 720, h: 340, title: 'Where a log line goes', ms: 2800, svg, steps: [
+    { c: 'The app writes to stdout. containerd\'s shim holds the other end of that pipe and appends each line — with a timestamp and stream tag — to a file under <code>/var/log/pods</code>.', on(q){ q('#app rect').set('ok'); q('#file-l1,#file-l2').style('fill', 'var(--green)'); } },
+    { c: 'The kubelet knows the file for every container it runs and rotates it at 10 MiB (keeping 5). No agent, no network — just a file on this node.', on(q){ q('#a3').show().set('hl'); q('#kl rect').set('hl'); } },
+    { c: '<code>kubectl logs</code> goes to the API server, which proxies the request to the kubelet\'s <code>:10250/containerLogs</code> endpoint; the kubelet streams the file back. This path fails if the API server cannot reach the node.', on(q){ q('#a5,#a6').show().set('hl'); q('#api rect').set('hl'); q('#m').text('kubectl → apiserver → kubelet → file'); } },
+    { c: 'Delete the Pod and the file is removed. For history, a <b>DaemonSet agent</b> tails the same directory on every node, tags lines with Pod metadata, and ships them out.', on(q){ q('#a4').show().set('ok'); q('#ds rect').set('cy'); q('#a7').show().set('ok'); q('#loki rect').set('pur'); q('#m').text('same file, second reader'); } },
+    { c: 'A log written to <code>/app/logs/app.log</code> <i>inside</i> the container never reaches this pipeline. Log to stdout — or tail that file with a sidecar so it does.', on(q){ q('#m').text('files inside the container are invisible'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

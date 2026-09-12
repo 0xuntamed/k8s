@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L10 · The Troubleshooter's Shell Toolkit · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l10" data-root="../" data-related="d13,d56,d57,d58,d59">
+<article class="lesson">
+<p class="lead">kubectl prints text; nodes speak files, sockets and processes. The gap is closed by two dozen Unix commands that have not changed in decades. This is the working set — organised by the question you are asking, with the exact flags that matter during an incident or an exam — plus the shell habits that make you fast: pipes, substitution, loops, and knowing which tool is installed where.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Text: grep, awk, sed, cut, sort, uniq, tr, head/tail, wc, column, diff</li>
+<li>Structured data: jq, yq, base64</li>
+<li>Files and disk: find, du, df, lsof, tar, stat</li>
+<li>Processes and resources: ps, top, free, vmstat, strace, dmesg</li>
+<li>Network: ss, curl, nc, dig, tcpdump, ip</li>
+<li>Shell glue: pipes, <code>$(…)</code>, <code>&lt;(…)</code>, loops, xargs, tee, watch, timeout, heredocs</li>
+</ul></div>
+
+<h2>Text processing</h2>
+<figure data-anim="pipeline"></figure>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Flags that matter</th><th>Example</th></tr>
+<tr><td>grep</td><td><code>-i</code> case-insens, <code>-E</code> extended regex, <code>-v</code> invert, <code>-n</code> line numbers, <code>-r</code> recursive, <code>-A/-B/-C N</code> context, <code>-o</code> only match, <code>-c</code> count, <code>-l</code> file names</td><td><code>kubectl describe pod x | grep -A10 Events</code> · <code>journalctl -u kubelet | grep -iE 'error|fail' | tail</code> · <code>grep -rn staticPodPath /var/lib/kubelet/</code></td></tr>
+<tr><td>awk</td><td><code>'{print $2}'</code> field N, <code>-F:</code> delimiter, <code>'$3 &gt; 5'</code> conditions, <code>NR</code>, <code>NF</code>, sums</td><td><code>kubectl get pods | awk '$3 != "Running" {print $1}'</code> · <code>ps aux | awk '{s+=$6} END {print s/1024 " MB"}'</code> · <code>awk -F: '$3 &gt;= 1000 {print $1}' /etc/passwd</code></td></tr>
+<tr><td>sed</td><td><code>s/a/b/</code> (<code>g</code> all), <code>-i</code> in place, <code>-n '5,10p'</code> range, <code>/x/d</code> delete, <code>/x/a\text</code> append after</td><td><code>sed -i 's/replicas: 1/replicas: 3/' deploy.yaml</code> · <code>sed -n '/Events/,$p' out.txt</code> · <code>kubectl run x $do | sed '/spec:/a\  nodeName: w1'</code></td></tr>
+<tr><td>cut / tr</td><td><code>-d: -f1</code> · <code>tr ' ' '\n'</code>, <code>tr -d '\r'</code>, <code>tr a-z A-Z</code></td><td><code>kubectl get pods -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u</code></td></tr>
+<tr><td>sort / uniq</td><td><code>-n</code> numeric, <code>-r</code> reverse, <code>-k2</code> key, <code>-h</code> human sizes, <code>-u</code> unique; <code>uniq -c</code> counts (input must be sorted)</td><td><code>… | sort | uniq -c | sort -rn | head</code> (histogram) · <code>du -sh * | sort -h</code></td></tr>
+<tr><td>head / tail / wc</td><td><code>-n</code>, <code>tail -f</code> follow, <code>tail -n +5</code> from line 5; <code>wc -l</code></td><td><code>kubectl get events --sort-by=.lastTimestamp | tail -20</code></td></tr>
+<tr><td>column / diff / comm</td><td><code>column -t</code> align; <code>diff -u a b</code>; <code>diff &lt;(cmd1) &lt;(cmd2)</code>; <code>comm -23 a b</code></td><td><code>diff &lt;(kubectl get deploy web -o yaml) web.yaml</code> · <code>diff -u /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/backup.yaml</code></td></tr>
+</table></div>
+
+<h2>Structured data</h2>
+<pre><code class="lang-bash"># jq — JSON
+$ kubectl get pods -o json | jq '.items[] | {name: .metadata.name, node: .spec.nodeName, phase: .status.phase}'
+$ kubectl get pods -o json | jq -r '.items[] | select(.status.phase != "Running") | .metadata.name'      # -r: raw strings, no quotes
+$ kubectl get nodes -o json | jq -r '.items[] | "\(.metadata.name)\t\(.status.allocatable.cpu)\t\(.status.allocatable.memory)"'
+$ kubectl get pods -A -o json | jq '[.items[].status.containerStatuses[]?.restartCount] | add'         # total restarts
+$ kubectl get pods -o json | jq -r '.items[] | select(.spec.containers[].resources.limits == null) | .metadata.name' | sort -u
+$ cat /etc/containerd/config.toml | grep -A2 runc.options   # (TOML: no jq; grep)
+$ echo '{"a":{"b":[1,2]}}' | jq '.a.b[1]'; jq -c . file.json    # -c compact; jq keys; jq 'to_entries'; jq -s 'add' (slurp files)
+# yq (mikefarah) — YAML, same syntax
+$ yq '.spec.template.spec.containers[0].image' deploy.yaml
+$ yq -i '.spec.replicas = 3' deploy.yaml                          # edit in place
+$ kubectl get cm coredns -n kube-system -o yaml | yq '.data.Corefile'
+$ yq eval-all 'select(.kind == "Deployment")' all.yaml           # filter multi-doc
+$ yq -o json deploy.yaml | jq .                                  # YAML → JSON
+# base64
+$ echo -n 'p@ss' | base64; echo cEBzcw== | base64 -d; base64 -w0 file   # -w0: no line wraps (needed for CSR requests)</code></pre>
+
+<h2>Files and disk</h2>
+<pre><code class="lang-bash">$ df -h; df -h /var/lib/containerd /var/log                  # filesystem usage — what DiskPressure looks at
+$ du -xsh /var/log/pods/* | sort -h | tail -5                 # who is big (-x: one filesystem)
+$ find /var/log -name '*.log' -size +100M -mtime -1           # big, recent
+$ find /var/lib/kubelet/pods -maxdepth 1 -type d -mmin -10    # pod dirs changed in the last 10 min
+$ find / -xdev -type f -size +500M 2&gt;/dev/null
+$ lsof +L1                                                    # deleted-but-open files (df vs du mismatch)
+$ lsof -p $(pidof kubelet) | head; lsof -i :6443              # what a process has open; who listens on a port
+$ stat -c '%a %U:%G %y %n' /etc/kubernetes/pki/*.key          # perms, owner, mtime
+$ tar czf backup.tgz /etc/kubernetes/pki; tar tzf backup.tgz | head; tar xzf backup.tgz -C /tmp
+$ ls -la --time-style=full-iso /etc/kubernetes/manifests/     # when was the manifest last touched?
+$ cat &lt;&lt;'EOF' &gt; /tmp/pod.yaml                                  # heredoc; quoted 'EOF' = no $ expansion
+…
+EOF</code></pre>
+
+<h2>Processes and resources</h2>
+<pre><code class="lang-bash">$ ps -eo pid,ppid,user,stat,etime,rss,cmd --sort=-rss | head        # by memory
+$ ps -eo pid,stat,cmd | awk '$2 ~ /Z/'                              # zombies
+$ pgrep -a kubelet; pidof containerd; pkill -f 'sleep 3600'
+$ top -o %MEM -n1 -b | head -15; htop
+$ free -m; cat /proc/meminfo | head -5; vmstat 1 5                  # memory, swap, run queue, iowait
+$ uptime; nproc; cat /proc/loadavg
+$ dmesg -T | tail -30; dmesg -T | grep -iE 'oom|killed|error|nf_conntrack'
+$ strace -p $(pidof kubelet) -f -e trace=openat -o /tmp/kl.trace &amp; sleep 5; kill %1; grep -c ENOENT /tmp/kl.trace   # what files is it failing to open?
+$ strace -f -e trace=network curl -s http://api:8080 2&gt;&1 | grep -E 'connect|sendto' | head
+$ cat /proc/$(pidof kubelet)/limits | grep files; ulimit -n
+$ iostat -xz 1 3 2&gt;/dev/null || cat /proc/diskstats | head    # disk latency (etcd cares)</code></pre>
+
+<h2>Network</h2>
+<pre><code class="lang-bash">$ ss -tlnp                                   # listening TCP + process; -u UDP; -a all; -4/-6
+$ ss -tnp state established '( dport = :6443 )'   # who is connected to the API server
+$ ss -s                                      # socket summary; conntrack pressure hints
+$ ip -br addr; ip route; ip route get 10.244.2.9; ip neigh; ip -s link show eth0
+$ curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' http://api:8080/health     # status + timing
+$ curl -sk https://10.0.0.10:6443/healthz; curl -v --cacert ca.crt https://host:6443/version
+$ curl -H 'Host: shop.local' http://localhost/; curl --resolve shop.local:443:127.0.0.1 -k https://shop.local/
+$ nc -zv db 5432; nc -zvu 10.96.0.10 53; timeout 2 bash -c '&lt;/dev/tcp/db/5432' &amp;&amp; echo open    # the last needs no tools
+$ dig +short svc.ns.svc.cluster.local; dig @10.96.0.10 x; nslookup x; getent hosts x
+$ sudo tcpdump -i any -nn port 53 -c 20; sudo tcpdump -i eth0 -nn 'tcp port 6443 and tcp[tcpflags] &amp; tcp-syn != 0'
+$ sudo tcpdump -i any -nn host 10.244.2.9 -w /tmp/cap.pcap        # capture for Wireshark
+$ traceroute -n 8.8.8.8; mtr -n -r -c 5 8.8.8.8
+$ sudo iptables -t nat -S | grep 10.96.0.42; sudo conntrack -L | grep 10.96.0.42
+$ sudo nsenter -t $(crictl inspect $CID | jq .info.pid) -n ss -tlnp   # inside a pod's netns with host tools</code></pre>
+
+<h2>Shell glue</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Construct</th><th>Meaning</th><th>Example</th></tr>
+<tr><td><code>a | b</code></td><td>stdout of a → stdin of b</td><td><code>kubectl get pods | grep -v Running</code></td></tr>
+<tr><td><code>$(cmd)</code></td><td>Substitute output</td><td><code>kubectl delete pod $(kubectl get pod -l app=web -o name)</code></td></tr>
+<tr><td><code>&lt;(cmd)</code></td><td>Output as a file</td><td><code>diff &lt;(kubectl get cm a -o yaml) &lt;(kubectl get cm b -o yaml)</code></td></tr>
+<tr><td><code>2&gt;&amp;1</code>, <code>2&gt;/dev/null</code>, <code>&amp;&amp;</code>, <code>||</code></td><td>Redirect stderr; run if success / if failure</td><td><code>kubectl get pod x 2&gt;/dev/null || echo missing</code></td></tr>
+<tr><td><code>for x in …; do …; done</code></td><td>Loop</td><td><code>for n in $(kubectl get nodes -o name); do kubectl describe $n | grep -A5 Conditions; done</code></td></tr>
+<tr><td><code>while read l; do …; done &lt; file</code></td><td>Line loop</td><td><code>kubectl get ns -o name | while read n; do kubectl get quota -n ${n#namespace/}; done</code></td></tr>
+<tr><td><code>xargs</code></td><td>Args from stdin; <code>-n1</code> one at a time, <code>-I{}</code> placeholder, <code>-P4</code> parallel</td><td><code>kubectl get pods -o name | xargs -n1 -I{} kubectl logs {} --tail=1</code></td></tr>
+<tr><td><code>tee</code></td><td>Write and pass through</td><td><code>kubectl kustomize . | tee rendered.yaml | kubectl apply -f -</code></td></tr>
+<tr><td><code>watch -n2 cmd</code></td><td>Re-run every 2 s</td><td><code>watch -n1 kubectl get pods -o wide</code> · <code>watch -d crictl ps</code> (<code>-d</code> highlights changes)</td></tr>
+<tr><td><code>timeout 5 cmd</code></td><td>Kill after 5 s</td><td><code>timeout 3 curl -s http://api/</code></td></tr>
+<tr><td><code>cmd &amp;</code>, <code>jobs</code>, <code>kill %1</code>, <code>wait</code></td><td>Background jobs</td><td><code>kubectl port-forward svc/web 8080:80 &amp; curl localhost:8080; kill %1</code></td></tr>
+<tr><td><code>set -euo pipefail</code></td><td>Strict mode in scripts</td><td>Fail on error, unset var, or pipe failure</td></tr>
+<tr><td><code>${var#prefix}</code>, <code>${var%suffix}</code>, <code>${var:-default}</code></td><td>Parameter expansion</td><td><code>pod=${1:-web}; n=${node#node/}</code></td></tr>
+<tr><td><code>history | grep</code>, <code>Ctrl-R</code>, <code>!!</code>, <code>sudo !!</code></td><td>Reuse commands</td><td>Exam speed</td></tr>
+</table></div>
+
+<h2>What is installed where</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Environment</th><th>Has</th><th>Lacks</th></tr>
+<tr><td>Exam node / typical Ubuntu node</td><td>bash, grep/awk/sed, curl, jq (usually), ss, ip, iptables, openssl, journalctl, crictl, etcdctl (on control planes), vim/nano</td><td>yq (maybe), dig (install dnsutils), tcpdump (maybe), conntrack (install)</td></tr>
+<tr><td><code>busybox</code> Pod</td><td>sh, wget, nslookup, nc, ps, top, vi, awk/sed (busybox versions)</td><td>curl, dig, bash, jq</td></tr>
+<tr><td><code>nicolaka/netshoot</code> Pod</td><td>Everything network: curl, dig, tcpdump, ss, iperf, nmap, jq, tshark, ipvsadm, ctop…</td><td>—</td></tr>
+<tr><td><code>bitnami/kubectl</code> Pod</td><td>kubectl (for in-cluster SA tests)</td><td></td></tr>
+<tr><td>distroless app image</td><td>Nothing — no shell</td><td>Use <code>kubectl debug --target</code> or <code>nsenter</code> from the node</td></tr>
+</table></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx --replicas=3 &amp;&amp; kubectl create deploy bad --image=nginx:nope
+$ kubectl get pods | awk 'NR&gt;1 &amp;&amp; $3 != "Running" {print $1, $3}'
+$ kubectl get pods -o json | jq -r '.items[] | select(.status.phase != "Running") | .metadata.name'
+$ kubectl get pods -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort | uniq -c | sort -rn
+$ for p in $(kubectl get pods -l app=web -o name); do echo "$p: $(kubectl get $p -o jsonpath='{.spec.nodeName}')"; done
+$ kubectl get pods -l app=web -o name | xargs -n1 -I{} sh -c 'kubectl exec {} -- hostname'
+$ kubectl get events --sort-by=.lastTimestamp | grep -i pull | tail -3
+$ diff &lt;(kubectl get deploy web -o yaml | yq '.spec.template.spec.containers[0]') &lt;(kubectl get deploy bad -o yaml | yq '.spec.template.spec.containers[0]')
+$ watch -n1 -d 'kubectl get pods; echo; kubectl top pods 2&gt;/dev/null' &amp;   # Ctrl-C after a look
+$ kubectl run t --rm -it --image=nicolaka/netshoot -- sh -c 'ss -tlnp; dig +short kubernetes.default.svc.cluster.local; curl -sS -o /dev/null -w "%{http_code}\n" http://web'
+$ kubectl delete deploy web bad</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Text: grep to find, awk to pick columns and filter, sed to edit, sort|uniq -c for histograms, diff with process substitution to compare.</li>
+<li>jq for JSON (<code>-r</code>, <code>select</code>, string interpolation), yq for YAML (same syntax, <code>-i</code> to edit).</li>
+<li>Disk: df (filesystem) vs du (files) vs lsof +L1 (deleted-open). Processes: ps --sort, dmesg for OOM, strace for "what file/socket is it failing on".</li>
+<li>Network: ss for sockets, ip for interfaces/routes, curl -w for status+timing, nc/bash /dev/tcp for reachability, dig for DNS, tcpdump for truth, nsenter -n to do all of it inside a Pod.</li>
+<li>Glue: pipes, <code>$( )</code>, <code>&lt;( )</code>, loops, xargs, tee, watch, timeout — and know which tools each image actually has.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const stages = [['kubectl get pods -A', 'all pods, one per line'], ["awk '$4 != \"Running\"'", 'keep non-Running rows'], ["awk '{print $1\"/\"$2}'", 'namespace/name'], ['sort | uniq -c', 'count duplicates'], ['sort -rn | head -5', 'top 5']];
+  let svg = '';
+  stages.forEach((s, i) => { const x = 20 + i * 138; svg += S.box(`s${i}`, x, 40, 128, 54, [s[0], s[1]], { subfs: 8, subcls: 'muted', fs: 9.5, lcls: 'mono', cls: 'soft' }); if (i) svg += S.arrow(`a${i}`, x - 10, 67, x - 2, 67, { cls: 'hid' }); });
+  svg += S.term('out', 20, 120, 680, 130, ['data at this stage:', '', '', '', '', ''], { fs: 9 });
+  svg += S.text('m', 360, 275, '', { cls: 'sm b' });
+  const show = (q, lines) => { for (let i = 1; i <= 5; i++) q('#out-l' + i).text(lines[i - 1] || '').style('fill', 'var(--code-text)'); };
+  Anim.define('pipeline', { w: 720, h: 290, title: 'A pipeline, stage by stage', ms: 2800, svg, steps: [
+    { c: 'Each command reads stdin and writes stdout; <code>|</code> connects them. Watch the data shrink and change shape at every stage.', on(q){ q('#s0 rect').set('hl'); show(q, ['NAMESPACE  NAME              READY  STATUS             RESTARTS', 'shop       api-7f9c-abc      1/1    Running            0', 'shop       api-7f9c-def      0/1    CrashLoopBackOff   12', 'shop       web-5c4-xyz       0/1    ImagePullBackOff   0', 'infra      agent-q2w         0/1    CrashLoopBackOff   3   … (200 more lines)']); q('#m').text('stage 1: 200 lines'); } },
+    { c: '<b>awk</b> filters rows by a column: <code>$4</code> is STATUS. Only non-Running rows survive (the header too, unless you add <code>NR&gt;1</code>).', on(q){ q('#s0 rect').set(); q('#s1 rect').set('hl'); q('#a1').show().set('hl'); show(q, ['shop       api-7f9c-def      0/1    CrashLoopBackOff   12', 'shop       web-5c4-xyz       0/1    ImagePullBackOff   0', 'infra      agent-q2w         0/1    CrashLoopBackOff   3', 'infra      agent-p9o         0/1    CrashLoopBackOff   3', '… (14 lines)']); q('#m').text('stage 2: 14 lines'); } },
+    { c: '<b>awk</b> again, this time reshaping: print namespace/name. Same tool, different job — awk is both a filter and a formatter.', on(q){ q('#s1 rect').set(); q('#s2 rect').set('hl'); q('#a2').show().set('hl'); show(q, ['shop/api-7f9c-def', 'shop/web-5c4-xyz', 'infra/agent-q2w', 'infra/agent-p9o', '…']); q('#m').text('stage 3: one token per line'); } },
+    { c: 'Change the key to the STATUS column instead and the classic histogram appears: <code>sort | uniq -c</code> counts identical adjacent lines (sort first!).', on(q){ q('#s2 rect').set(); q('#s3 rect').set('hl'); q('#a3').show().set('hl'); q('#s2').text("awk '{print $4}'"); show(q, ['      9 CrashLoopBackOff', '      3 ImagePullBackOff', '      1 Pending', '      1 Error', '']); q('#m').text('stage 4: counts per status'); } },
+    { c: '<code>sort -rn | head</code>: numeric, descending, top N. Four small tools, one question answered: "what is broken, mostly?" Every command in this toolkit composes this way.', on(q){ q('#s3 rect').set(); q('#s4 rect').set('ok'); q('#a4').show().set('ok'); show(q, ['      9 CrashLoopBackOff', '      3 ImagePullBackOff', '', '', '']); q('#m').text('compose, do not memorise'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 54 · Build a Multi-Node Cluster with kubeadm & Calico · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d54" data-root="../" data-linux="l07,l05,l03,l02" data-related="d07,d25,d33,d55">
+<article class="lesson">
+<p class="lead">Everything so far ran on KIND. Now you build the real thing: three Linux VMs, the kernel prepared, containerd installed, and <strong>kubeadm</strong> bootstrapping a control plane and joining workers, with Calico as the CNI. Every step is something a managed service hides from you and something the CKA expects you to do or fix. By the end you will know exactly which files, services and sysctls a "node" consists of.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Node prerequisites: swap, kernel modules, sysctls, container runtime, cgroup driver</li>
+<li>Installing kubeadm, kubelet, kubectl with held versions</li>
+<li><code>kubeadm init</code>: what it generates (certs, kubeconfigs, static Pods, bootstrap tokens) and the flags that matter</li>
+<li>Installing Calico and why nodes are NotReady until you do</li>
+<li><code>kubeadm join</code> and the token/CA-hash handshake; verifying the cluster</li>
+</ul></div>
+
+<h2>Topology</h2>
+<div class="tbl-wrap"><table>
+<tr><th>VM</th><th>Role</th><th>Minimum</th><th>IP (example)</th></tr>
+<tr><td>cp-1</td><td>control plane</td><td>2 vCPU, 2 GiB (4 recommended), Ubuntu 22.04/24.04</td><td>192.168.56.10</td></tr>
+<tr><td>worker-1, worker-2</td><td>workers</td><td>2 vCPU, 2 GiB</td><td>192.168.56.11, .12</td></tr>
+</table></div>
+<p>Any hypervisor works (VirtualBox, Multipass, Proxmox, cloud VMs). Unique hostnames and MAC addresses, mutual network reachability, and open ports: 6443 (API), 2379–2380 (etcd), 10250 (kubelet), 10257/10259 (controllers), 30000–32767 (NodePorts) — plus Calico's BGP 179 / VXLAN 4789.</p>
+
+<h2>Step 1 — Prepare every node</h2>
+<figure data-anim="node-prep"></figure>
+<pre><code class="lang-bash"># hostnames (each node its own)
+$ sudo hostnamectl set-hostname cp-1
+# swap off — the kubelet refuses to start with swap enabled (memory accounting)
+$ sudo swapoff -a && sudo sed -i '/ swap / s/^/#/' /etc/fstab
+# kernel modules for containers and bridged networking
+$ cat &lt;&lt;EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+$ sudo modprobe overlay && sudo modprobe br_netfilter
+# sysctls: let iptables see bridged traffic (Service/NetworkPolicy rules) and forward packets between pods
+$ cat &lt;&lt;EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+$ sudo sysctl --system
+$ lsmod | grep -E 'overlay|br_netfilter'; sysctl net.ipv4.ip_forward</code></pre>
+
+<h2>Step 2 — Container runtime (containerd)</h2>
+<pre><code class="lang-bash">$ sudo apt-get update && sudo apt-get install -y containerd      # or Docker's repo for a newer version
+$ sudo mkdir -p /etc/containerd && containerd config default | sudo tee /etc/containerd/config.toml &gt; /dev/null
+# cgroup driver MUST match the kubelet's (systemd on modern kubeadm)
+$ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+$ sudo systemctl restart containerd && sudo systemctl enable containerd
+$ sudo ctr version; ls -l /run/containerd/containerd.sock</code></pre>
+<div class="callout warn"><div class="ct">The cgroup driver mismatch</div><p>If containerd uses <code>cgroupfs</code> while the kubelet uses <code>systemd</code> (the default since 1.22), the node will look fine for minutes and then flap NotReady with kubelet errors about cgroups. <code>SystemdCgroup = true</code> in the <code>runc.options</code> section of config.toml is the single most common thing to check on a hand-built node. See <a href="../linux/l03-cgroups.html">cgroups</a>.</p></div>
+
+<h2>Step 3 — kubeadm, kubelet, kubectl</h2>
+<pre><code class="lang-bash">$ sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+$ curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+$ echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+$ sudo apt-get update && sudo apt-get install -y kubelet kubeadm kubectl
+$ sudo apt-mark hold kubelet kubeadm kubectl                     # upgrades are deliberate (Day 55)
+$ sudo systemctl enable --now kubelet                            # it will crash-loop until kubeadm configures it — expected
+$ kubeadm version -o short</code></pre>
+<p>The repo path pins a <em>minor</em> version (<code>v1.31</code>); patch versions come from <code>apt-get install kubeadm=1.31.2-1.1</code>. All nodes should run the same versions; the kubelet may be up to three minors behind the API server, never ahead.</p>
+
+<h2>Step 4 — <code>kubeadm init</code> on the control plane</h2>
+<pre><code class="lang-bash">$ sudo kubeadm init \
+    --apiserver-advertise-address=192.168.56.10 \    # the IP other nodes will use (first NIC is often NAT on VirtualBox — be explicit)
+    --pod-network-cidr=192.168.0.0/16 \              # must match the CNI's expectation (Calico default)
+    --control-plane-endpoint=cp-1 \                  # a stable name; lets you add control planes / an LB later
+    --kubernetes-version=v1.31.2
+…
+Your Kubernetes control-plane has initialized successfully!
+  mkdir -p $HOME/.kube && sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config && sudo chown $(id -u):$(id -g) $HOME/.kube/config
+You should now deploy a pod network to the cluster…
+Then you can join any number of worker nodes by running the following on each as root:
+kubeadm join cp-1:6443 --token abcdef.0123456789abcdef --discovery-token-ca-cert-hash sha256:1234…</code></pre>
+<p>What just happened, in order (<code>kubeadm init --dry-run</code> or <code>-v=5</code> shows it):</p>
+<ol class="steps">
+<li><strong>preflight</strong> — checks swap, ports, modules, runtime, versions. Fix warnings; errors abort.</li>
+<li><strong>certs</strong> — generates the three CAs and every certificate from <a href="d33-tls-part3-mtls.html">Day 33</a> in <code>/etc/kubernetes/pki</code>, with SANs including the advertise address and the control-plane endpoint.</li>
+<li><strong>kubeconfig</strong> — <code>admin.conf</code>, <code>super-admin.conf</code>, <code>kubelet.conf</code>, <code>controller-manager.conf</code>, <code>scheduler.conf</code>.</li>
+<li><strong>kubelet-start</strong> — writes <code>/var/lib/kubelet/config.yaml</code> and restarts the kubelet, which now has something to do.</li>
+<li><strong>control-plane + etcd</strong> — static Pod manifests into <code>/etc/kubernetes/manifests</code>; the kubelet starts them (<a href="d15-manual-scheduling-static-pods.html">Day 15</a>).</li>
+<li><strong>wait-control-plane</strong> — polls <code>/healthz</code> until the API server answers.</li>
+<li><strong>upload-config / upload-certs</strong> — stores the kubeadm and kubelet config as ConfigMaps in kube-system so <code>join</code> and <code>upgrade</code> can read them.</li>
+<li><strong>mark-control-plane</strong> — labels the node and adds the <code>node-role.kubernetes.io/control-plane:NoSchedule</code> taint.</li>
+<li><strong>bootstrap-token</strong> — creates a 24-hour token and RBAC so joining nodes can fetch the CA and request kubelet certificates.</li>
+<li><strong>addons</strong> — deploys CoreDNS and the kube-proxy DaemonSet.</li>
+</ol>
+<pre><code class="lang-bash">$ mkdir -p $HOME/.kube && sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config && sudo chown $(id -u):$(id -g) $HOME/.kube/config
+$ kubectl get nodes                       # cp-1 NotReady — no CNI yet
+$ kubectl get pods -n kube-system         # coredns Pending; everything else Running
+$ ls /etc/kubernetes /etc/kubernetes/manifests /etc/kubernetes/pki</code></pre>
+
+<h2>Step 5 — Install Calico</h2>
+<pre><code class="lang-bash">$ kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+$ curl -O https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+$ grep cidr custom-resources.yaml            # 192.168.0.0/16 — must equal --pod-network-cidr; edit if different
+$ kubectl create -f custom-resources.yaml
+$ watch kubectl get pods -n calico-system    # calico-node, calico-kube-controllers, csi… all Running
+$ kubectl get nodes                          # cp-1 Ready
+$ kubectl get pods -n kube-system            # coredns now Running</code></pre>
+<p>The Calico operator installs a DaemonSet that drops the CNI binaries into <code>/opt/cni/bin</code> and the config into <code>/etc/cni/net.d</code> on every node, then runs the <code>calico-node</code> agent that programs routes (BGP or VXLAN) and NetworkPolicies. The kubelet notices the CNI config and flips the node to Ready (<a href="d25-cni-csi-cri.html">Day 25</a>).</p>
+
+<h2>Step 6 — Join the workers</h2>
+<figure data-anim="join"></figure>
+<pre><code class="lang-bash"># on cp-1, if you lost the join command or the token expired (24 h):
+$ kubeadm token create --print-join-command
+# on each worker, as root:
+$ sudo kubeadm join cp-1:6443 --token abcdef.0123456789abcdef --discovery-token-ca-cert-hash sha256:1234…
+# back on cp-1:
+$ kubectl get nodes -o wide                  # all Ready within a minute
+$ kubectl label node worker-1 node-role.kubernetes.io/worker=   # cosmetic ROLES column</code></pre>
+<p>The join handshake: the worker connects to the API server with the <strong>bootstrap token</strong>, downloads the <code>cluster-info</code> ConfigMap from <code>kube-public</code>, verifies the CA against the <code>--discovery-token-ca-cert-hash</code> (so a MITM cannot hand it a fake CA), then submits a CSR for its kubelet client certificate, which the controller-manager auto-approves for bootstrap tokens. The kubelet writes <code>/etc/kubernetes/kubelet.conf</code> pointing at its new cert and starts reporting (<a href="d34-tls-part4-csr.html">Day 34</a>). If the hash is omitted (<code>--discovery-token-unsafe-skip-ca-verification</code>), the CA is trusted blindly.</p>
+
+<h2>Verify</h2>
+<pre><code class="lang-bash">$ kubectl get nodes,pods -A -o wide
+$ kubectl create deploy web --image=nginx --replicas=3 && kubectl expose deploy web --port=80 --type=NodePort
+$ kubectl get pods -o wide                   # spread across workers, pod IPs from 192.168.x.x
+$ curl http://192.168.56.11:$(kubectl get svc web -o jsonpath='{.spec.ports[0].nodePort}')
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup web      # DNS works
+$ sudo kubeadm certs check-expiration        # one year from today</code></pre>
+
+<div class="callout linux" data-ref="l07,l05,l03,l02"><div class="ct">Under the hood · Linux</div><p>After this lesson you can list what a Kubernetes node <em>is</em>: a kernel with <code>overlay</code> and <code>br_netfilter</code> loaded and <code>ip_forward</code> on; <code>containerd.service</code> owning <code>/run/containerd/containerd.sock</code> and <code>/var/lib/containerd</code> (image layers, OverlayFS snapshots); <code>kubelet.service</code> reading <code>/var/lib/kubelet/config.yaml</code> and <code>/etc/kubernetes/kubelet.conf</code>, with a drop-in at <code>/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf</code> that passes <code>/var/lib/kubelet/kubeadm-flags.env</code>; CNI binaries in <code>/opt/cni/bin</code> and config in <code>/etc/cni/net.d</code>; certificates in <code>/etc/kubernetes/pki</code> (control plane) and <code>/var/lib/kubelet/pki</code> (every node); Pod directories under <code>/var/lib/kubelet/pods</code>; logs in <code>/var/log/pods</code> and the journal. Every troubleshooting command on Days 57–58 targets one of these.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>The exam rarely asks for a full <code>init</code>, but often for a <code>join</code>: <code>kubeadm token create --print-join-command</code> on the control plane, run it on the worker.</li>
+<li>Know the preflight items by heart — swap, ip_forward, br_netfilter, containerd running, cgroup driver — because "make this node join / become Ready" questions are one of them broken.</li>
+<li>Know the file locations: manifests, pki, kubelet config, CNI dirs, kubeconfigs in <code>/etc/kubernetes</code>.</li>
+<li>Version skew: kubelet ≤ API server; kubectl within ±1 minor.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (60–90 min)</h3><p>Build the three-node cluster above. Then break and observe:</p>
+<pre><code class="lang-bash">$ sudo swapon -a && sudo systemctl restart kubelet && journalctl -u kubelet -n 5     # "running with swap on is not supported"
+$ sudo swapoff -a && sudo systemctl restart kubelet
+$ sudo sysctl -w net.ipv4.ip_forward=0                          # pod-to-pod traffic across nodes stops; kubelet warns in preflight-style checks
+$ sudo sysctl -w net.ipv4.ip_forward=1
+$ sudo mv /etc/cni/net.d/10-calico.conflist /tmp/ && sleep 60 && kubectl get nodes   # node NotReady: "cni plugin not initialized"
+$ sudo mv /tmp/10-calico.conflist /etc/cni/net.d/
+$ kubeadm token list; kubeadm token create --ttl 1h --print-join-command
+$ sudo kubeadm reset -f    # on a worker: undo the join (then rejoin) — do this last</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Node prep: hostname, swap off, <code>overlay</code> + <code>br_netfilter</code>, <code>ip_forward</code> + bridge-nf sysctls, containerd with <code>SystemdCgroup = true</code>, held kube* packages.</li>
+<li><code>kubeadm init</code> generates PKI, kubeconfigs, kubelet config, static Pods, bootstrap token and add-ons; the node stays NotReady until a CNI is installed.</li>
+<li>Calico's Pod CIDR must match <code>--pod-network-cidr</code>.</li>
+<li><code>kubeadm join</code> uses a bootstrap token + CA hash to fetch the CA and get a kubelet certificate via CSR.</li>
+<li>A node is: kernel settings + containerd + kubelet (systemd) + CNI files + certificates + <code>/var/lib/kubelet</code>.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const layers = [['kernel: overlay, br_netfilter, ip_forward=1, swap off', 'soft'], ['containerd.service (SystemdCgroup = true) · /run/containerd/containerd.sock', ''], ['kubelet.service · /var/lib/kubelet/config.yaml · crash-looping until configured', ''], ['kubeadm init / join → /etc/kubernetes/{pki,manifests,*.conf}', 'pur'], ['CNI: /opt/cni/bin + /etc/cni/net.d (Calico DaemonSet)', 'cy'], ['Node Ready → pods scheduled', 'ok']];
+  let s1 = '';
+  layers.forEach((l, i) => s1 += S.box(`l${i}`, 40, 250 - i * 42, 640, 34, l[0], { fs: 10.5, lcls: 'mono', cls: l[1], hidden: true }));
+  s1 += S.text('m', 360, 305, '', { cls: 'sm b' });
+  Anim.define('node-prep', { w: 720, h: 320, title: 'Anatomy of a node, bottom up', ms: 2300, svg: s1, steps: [
+    { c: '<b>Kernel</b>: load <code>overlay</code> (image layers) and <code>br_netfilter</code> (so iptables sees bridged Pod traffic), enable IP forwarding, disable swap.', on(q){ q('#l0').show(); q('#m').text('sysctl + modprobe + swapoff'); } },
+    { c: '<b>containerd</b>: the CRI runtime, listening on a Unix socket, using the systemd cgroup driver to match the kubelet.', on(q){ q('#l1').show(); q('#m').text('the runtime is a plain systemd service'); } },
+    { c: '<b>kubelet</b>: installed and enabled, but it crash-loops — it has no config yet. That is normal before kubeadm runs.', on(q){ q('#l2').show(); q('#m').text('journalctl -u kubelet shows it restarting'); } },
+    { c: '<b>kubeadm</b> writes the kubelet config, certificates and (on control planes) the static Pod manifests, then restarts the kubelet, which starts etcd and the API server.', on(q){ q('#l3').show(); q('#m').text('kubeadm = files + a kubelet restart'); } },
+    { c: '<b>CNI</b>: the node reports NotReady until a config appears in <code>/etc/cni/net.d</code>. Calico\'s DaemonSet installs it — it needs the API server to exist first, hence the order.', on(q){ q('#l4').show(); q('#m').text('"cni plugin not initialized" until now'); } },
+    { c: '<b>Ready</b>. Every later troubleshooting step is: which of these layers is broken?', on(q){ q('#l5').show(); q('#m').text('six layers, six places to look'); } },
+  ]});
+
+  let s2 = S.box('cp', 20, 30, 220, 70, ['cp-1 · kube-apiserver :6443', 'bootstrap token abcdef.0123…', 'CA hash sha256:1234…'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.box('w', 480, 30, 220, 70, ['worker-1 · kubeadm join', 'has: token + CA hash', 'wants: kubelet cert'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.term('log', 20, 120, 680, 130, ['join steps:', '', '', '', '', ''], { fs: 9.5 })
+    + S.arrow('a1', 480, 55, 242, 55, { cls: 'hid', label: 'GET cluster-info (kube-public), token auth', ly: 45 })
+    + S.arrow('a2', 242, 75, 478, 75, { cls: 'hid', label: 'cluster-info: CA cert + server', ly: 92 })
+    + S.text('m', 360, 285, '', { cls: 'sm b' });
+  Anim.define('join', { w: 720, h: 300, title: 'kubeadm join handshake', ms: 2800, svg: s2, steps: [
+    { c: 'The worker has only two things: a short-lived <b>bootstrap token</b> and the <b>hash of the cluster CA</b>. It knows the control-plane address.', on(q){} },
+    { c: '<b>Discovery</b>: it requests the <code>cluster-info</code> ConfigMap from <code>kube-public</code> (readable anonymously), authenticating the <i>response signature</i> with the token.', on(q){ q('#a1').show().set('hl'); q('#log-l1').text('1. discovery: fetch cluster-info, verify token-signed JWS').style('fill', 'var(--accent)'); } },
+    { c: 'It receives the CA certificate and checks its SHA-256 against <code>--discovery-token-ca-cert-hash</code>. Match → this is the real cluster, not an impostor. Now it can verify the API server\'s TLS.', on(q){ q('#a2').show().set('ok'); q('#log-l2').text('2. CA hash matches → trust established both ways').style('fill', 'var(--green)'); } },
+    { c: '<b>TLS bootstrap</b>: using the token as a bearer credential (group <code>system:bootstrappers</code>), the kubelet submits a <b>CSR</b> for <code>CN=system:node:worker-1, O=system:nodes</code>.', on(q){ q('#log-l3').text('3. kubelet CSR (client cert) via bootstrap token').style('fill', 'var(--accent)'); } },
+    { c: 'The controller-manager\'s CSR approver auto-approves bootstrap-token CSRs for node identities and signs it. The kubelet writes <code>kubelet.conf</code> pointing at the new cert.', on(q){ q('#log-l4').text('4. CSR auto-approved → /var/lib/kubelet/pki/kubelet-client-current.pem').style('fill', 'var(--green)'); } },
+    { c: 'The kubelet registers the Node object, starts kube-proxy and calico-node from their DaemonSets, gets a CNI config, and reports Ready. The token can now be deleted; the node has its own identity.', on(q){ q('#log-l5').text('5. Node registered → DaemonSets land → Ready').style('fill', 'var(--green)'); q('#w rect').set('ok'); q('#m').text('token bootstraps; certificate persists (and rotates)'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

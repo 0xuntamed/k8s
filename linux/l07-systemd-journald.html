@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L7 · systemd, Units & journald · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l07" data-root="../" data-related="d07,d15,d54,d55,d57,d58">
+<article class="lesson">
+<p class="lead">On every node there are exactly two Kubernetes processes that are <em>not</em> containers: the kubelet and the container runtime. Both are <strong>systemd services</strong>. Starting, stopping, configuring and reading the logs of those two is half of node troubleshooting, and the other half (static Pods, upgrades, cgroup drivers) touches systemd too. This page is the working subset of systemd and journald an operator needs.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Units, unit files, drop-ins, and the <code>daemon-reload</code> rule</li>
+<li><code>systemctl</code>: status, start/stop/restart, enable/disable, is-active, list-units, cat, show</li>
+<li>The kubelet's unit, its drop-in and its environment files, dissected</li>
+<li><code>journalctl</code>: by unit, time, priority, boot; following; vacuuming</li>
+<li>systemd and cgroups: slices, scopes, <code>systemd-run</code>, the cgroup driver</li>
+</ul></div>
+
+<h2>Units</h2>
+<p>systemd is PID 1. It manages <strong>units</strong>: services (<code>.service</code>), mount points, timers, sockets, and grouping constructs — <strong>slices</strong> (cgroup subtrees) and <strong>scopes</strong> (externally started processes it should track). Unit files live in <code>/usr/lib/systemd/system</code> (packages) and <code>/etc/systemd/system</code> (yours; wins). Small overrides go in <strong>drop-in</strong> directories: <code>&lt;unit&gt;.d/*.conf</code>, merged over the base file.</p>
+<pre><code class="lang-bash">$ systemctl status kubelet                     # loaded? enabled? active (running) since…? recent log lines, main PID, cgroup, memory
+$ systemctl cat kubelet                        # the unit file AND every drop-in, in order
+$ systemctl show kubelet -p ExecStart -p Environment -p Restart   # resolved properties
+$ systemctl list-units --type=service --state=running | head
+$ systemctl list-unit-files | grep -E 'kubelet|containerd'        # enabled/disabled
+$ systemctl is-active kubelet; systemctl is-enabled containerd     # scriptable yes/no
+$ systemctl start|stop|restart|reload kubelet   # reload = SIGHUP if the unit supports it
+$ systemctl enable --now containerd            # start now and at boot
+$ systemctl disable kubelet                     # stay off at boot (does not stop it now)
+$ systemctl edit kubelet                        # create a drop-in interactively
+$ systemctl daemon-reload                       # REQUIRED after editing any unit file or drop-in, before restart</code></pre>
+<div class="callout warn"><div class="ct">The daemon-reload rule</div><p>systemd caches unit definitions. Editing a unit file or drop-in changes nothing until <code>systemctl daemon-reload</code>; a following <code>restart</code> then uses the new definition. Forgetting it is the most common "I changed the config and nothing happened" in kubelet troubleshooting — and <code>systemctl status</code> warns: <em>"Warning: The unit file … changed on disk. Run 'systemctl daemon-reload'"</em>. (Changing <code>/var/lib/kubelet/config.yaml</code> only needs a restart; it is the kubelet's own file, not systemd's.)</p></div>
+
+<h2>The kubelet unit, dissected</h2>
+<pre data-title="/usr/lib/systemd/system/kubelet.service (package)"><code>[Unit]
+Description=kubelet: The Kubernetes Node Agent
+Documentation=https://kubernetes.io/docs/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/kubelet
+Restart=always                 # restart on any exit
+StartLimitInterval=0           # never give up
+RestartSec=10                  # 10 s between attempts (why a broken kubelet "flaps")
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre data-title="/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf (drop-in written by kubeadm)"><code># Note: This dropin only works with kubeadm and kubelet v1.11+
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env      # per-node flags kubeadm generated (container runtime endpoint, node IP…)
+EnvironmentFile=-/etc/default/kubelet                    # your extra flags (Debian) / /etc/sysconfig/kubelet (RHEL)
+ExecStart=                                               # empty line CLEARS the package ExecStart…
+ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS   # …then redefines it</code></pre>
+<pre><code class="lang-bash">$ cat /var/lib/kubelet/kubeadm-flags.env     # KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=…"
+$ cat /etc/default/kubelet                    # KUBELET_EXTRA_ARGS=--node-ip=192.168.56.11   (typical VirtualBox fix)
+$ ps -o args= -p $(pidof kubelet)             # the fully expanded command line actually running</code></pre>
+<p>So the kubelet's configuration comes from four places, in this precedence: command-line flags (from the env files above) &gt; <code>/var/lib/kubelet/config.yaml</code> (the KubeletConfiguration: cgroupDriver, staticPodPath, clusterDNS, eviction thresholds, rotateCertificates…) &gt; defaults. Most tuning belongs in config.yaml; <code>--node-ip</code> and the runtime endpoint are the flags you will actually see.</p>
+<figure data-anim="unit-lifecycle"></figure>
+
+<h2>journald</h2>
+<p>systemd captures stdout/stderr of every service into the <strong>journal</strong>, a binary indexed log in <code>/var/log/journal</code> (persistent) or <code>/run/log/journal</code> (volatile). The kubelet and containerd log there; container logs do not (they go to files under <code>/var/log/pods</code>, see <a href="../lessons/d56-monitoring-logging.html">Day 56</a>).</p>
+<pre><code class="lang-bash">$ journalctl -u kubelet                        # everything from the unit (pager)
+$ journalctl -u kubelet -f                     # follow
+$ journalctl -u kubelet -n 100 --no-pager      # last 100 lines, no pager (scripts, exam)
+$ journalctl -u kubelet --since "10 min ago"; journalctl -u kubelet --since "2025-01-01 09:00" --until "2025-01-01 09:30"
+$ journalctl -u kubelet -p err                 # priority err and worse (emerg alert crit err warning notice info debug)
+$ journalctl -u kubelet -b                     # this boot only; -b -1 = previous boot (why did it crash before reboot?)
+$ journalctl -u kubelet -o json-pretty | head -30   # structured fields
+$ journalctl -u kubelet | grep -iE 'error|fail' | tail -20
+$ journalctl -u containerd -u kubelet --since "5 min ago"   # several units interleaved
+$ journalctl -k | grep -iE 'oom|killed process'             # kernel messages (dmesg) — OOM kills
+$ journalctl --disk-usage; sudo journalctl --vacuum-size=200M; sudo journalctl --vacuum-time=7d   # DiskPressure relief
+$ grep -E '^(SystemMaxUse|Storage)' /etc/systemd/journald.conf</code></pre>
+<p>Reading kubelet logs: lines are <code>Ixxxx</code>/<code>Wxxxx</code>/<code>Exxxx</code> (info/warning/error) with the source file. Search for <code>E</code> lines first; the phrases you want are in <a href="../lessons/d58-troubleshoot-data-plane.html">Day 58</a>.</p>
+
+<h2>systemd and cgroups</h2>
+<p>systemd owns the cgroup tree on a modern node. Every service runs in its own cgroup under <code>system.slice</code>; resource directives in unit files map to cgroup files (<code>CPUQuota=</code> → <code>cpu.max</code>, <code>MemoryMax=</code> → <code>memory.max</code>). With the <strong>systemd cgroup driver</strong>, containerd asks systemd to create a transient <em>scope</em> per container (the <code>cri-containerd-….scope</code> names in <a href="l03-cgroups.html">L3</a>) under the kubelet's slices, so there is one manager of the tree. With <code>cgroupfs</code>, the runtime writes directories itself and systemd does not know about them — which works until systemd reorganises the tree and orphans them.</p>
+<pre><code class="lang-bash">$ systemd-cgls --no-pager | head -30                       # the tree with unit names
+$ systemctl status kubelet | grep -A3 CGroup               # /system.slice/kubelet.service and its processes
+$ systemd-run --unit=burn --scope -p CPUQuota=20% sh -c 'yes &gt; /dev/null'   # an ad-hoc limited process; Ctrl-C to stop
+$ systemctl set-property containerd.service MemoryMax=2G   # live + persisted drop-in
+$ systemd-cgtop                                            # top, by cgroup</code></pre>
+
+<h2>Other units you will meet</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Unit</th><th>Role</th></tr>
+<tr><td><code>containerd.service</code> / <code>cri-o.service</code> / <code>docker.service</code></td><td>The runtime. <code>Delegate=yes</code> lets it manage cgroups below itself.</td></tr>
+<tr><td><code>kubelet.service</code></td><td>The node agent.</td></tr>
+<tr><td><code>systemd-resolved.service</code></td><td>Stub DNS resolver on Ubuntu; owns <code>/etc/resolv.conf</code> → CoreDNS forwards to it (<a href="l08-dns-resolution.html">L8</a>).</td></tr>
+<tr><td><code>systemd-timesyncd</code> / <code>chronyd</code></td><td>NTP — TLS breaks when clocks drift.</td></tr>
+<tr><td><code>*.mount</code>, <code>*.swap</code></td><td><code>systemctl mask swap.target</code> or <code>swapoff -a</code> + fstab for the kubelet.</td></tr>
+<tr><td><code>*.timer</code></td><td>systemd's cron: <code>systemctl list-timers</code> (etcd backups on the control plane are often timers).</td></tr>
+<tr><td><code>etcd.service</code></td><td>Only on clusters that run etcd outside kubeadm's static Pod.</td></tr>
+</table></div>
+
+<div class="lab"><h3>Hands-on lab (15 min) — any systemd host or a KIND node (<code>docker exec -it cka-worker bash</code>)</h3>
+<pre><code class="lang-bash">$ systemctl status kubelet --no-pager | head -12
+$ systemctl cat kubelet | grep -E '^(ExecStart|Environment|EnvironmentFile|Restart)'
+$ ps -o args= -p $(pidof kubelet) | tr ' ' '\n' | grep -E '^--' | head
+$ journalctl -u kubelet -n 5 --no-pager; journalctl -u kubelet -p warning --since "1 hour ago" --no-pager | tail -5
+# break the drop-in, observe the restart loop, fix, reload
+$ sed -i 's#/var/lib/kubelet/config.yaml#/var/lib/kubelet/config.yml#' /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf
+$ systemctl restart kubelet; sleep 3; systemctl status kubelet --no-pager | head -6     # still running the OLD definition + warning about changed unit file
+$ systemctl daemon-reload &amp;&amp; systemctl restart kubelet; sleep 5; systemctl status kubelet --no-pager | head -6   # now failing: "failed to load Kubelet config file"
+$ journalctl -u kubelet -n 3 --no-pager
+$ sed -i 's#config.yml#config.yaml#' /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf &amp;&amp; systemctl daemon-reload &amp;&amp; systemctl restart kubelet; sleep 5; systemctl is-active kubelet
+$ systemd-cgls --no-pager | grep -A3 kubepods | head</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>kubelet and containerd are systemd services; everything else is a container. <code>systemctl status/restart</code> and <code>journalctl -u</code> are the node's first commands.</li>
+<li>Unit file + drop-ins define ExecStart and environment; kubeadm's drop-in assembles the kubelet command line from env files. <code>daemon-reload</code> after any edit.</li>
+<li><code>Restart=always</code> + <code>RestartSec=10</code> is why a misconfigured kubelet flaps instead of dying.</li>
+<li><code>journalctl -u X -n N --no-pager</code>, <code>-f</code>, <code>--since</code>, <code>-p err</code>, <code>-b -1</code>, <code>-k</code>; vacuum when the journal fills the disk.</li>
+<li>systemd owns the cgroup tree; the systemd cgroup driver keeps the runtime and kubelet inside it.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('sd', 20, 30, 140, 50, ['systemd (PID 1)', 'unit cache'], { subfs: 9, subcls: 'muted', cls: 'pur' })
+    + S.term('files', 200, 20, 300, 90, ['kubelet.service', '  ExecStart=/usr/bin/kubelet $ARGS', '  Restart=always  RestartSec=10', '10-kubeadm.conf: --config=/var/lib/kubelet/config.yaml'], { fs: 9 })
+    + S.box('proc', 540, 30, 160, 50, ['kubelet process', 'active (running)'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.term('j', 20, 130, 680, 100, ['journalctl -u kubelet', '', '', ''], { fs: 9.5 })
+    + S.arrow('a1', 160, 55, 198, 55, { cls: 'dashed', label: 'loaded at boot / daemon-reload', ly: 100, lx: 180 }) + S.arrow('a2', 500, 55, 538, 55, { cls: 'hl' })
+    + S.text('m', 360, 265, '', { cls: 'sm b' });
+  Anim.define('unit-lifecycle', { w: 720, h: 280, title: 'Unit file → process → journal', ms: 2800, svg, steps: [
+    { c: 'At boot systemd reads the unit file and its drop-ins once, builds the command line, and starts the kubelet in its own cgroup. Its stdout/stderr go to the journal.', on(q){ q('#j-l1').text('I0101 kubelet[812]: Started kubelet').style('fill', 'var(--green)'); } },
+    { c: 'You edit the drop-in (say, a typo in the config path). <b>Nothing changes</b>: systemd still holds the old definition. <code>systemctl status</code> warns the file changed on disk.', on(q){ q('#files-l3').text('10-kubeadm.conf: --config=/var/lib/kubelet/config.yml   ← edited').style('fill', 'var(--amber)'); q('#m').text('edited on disk ≠ loaded'); } },
+    { c: '<code>systemctl restart kubelet</code> without daemon-reload restarts with the <i>old</i> arguments. It still works — which is confusing when you meant to test a fix.', on(q){ q('#j-l2').text('I0101 kubelet[913]: Started kubelet   (old ExecStart!)').style('fill', 'var(--amber)'); } },
+    { c: '<code>systemctl daemon-reload</code> re-reads units; now <code>restart</code> uses the new drop-in. The kubelet fails to load the config and exits; <code>Restart=always</code> starts it again 10 s later, forever.', on(q){ q('#a1').set('hl'); q('#proc rect').set('bad'); q('#proc text:nth-of-type(2)').text('activating (auto-restart)'); q('#j-l2').text('E0101 kubelet[1020]: failed to load Kubelet config file /var/lib/kubelet/config.yml').style('fill', 'var(--red)'); q('#j-l3').text('kubelet.service: Scheduled restart job, restart counter is at 3').style('fill', 'var(--red)'); q('#m').text('flapping: the journal shows the restart loop'); } },
+    { c: 'Fix the path, <code>daemon-reload</code>, <code>restart</code>: active (running). The node returns to Ready within ~40 s. Three commands, in that order, every time.', on(q){ q('#files-l3').text('10-kubeadm.conf: --config=/var/lib/kubelet/config.yaml').style('fill', 'var(--green)'); q('#proc rect').set('ok'); q('#proc text:nth-of-type(2)').text('active (running)'); q('#j-l3').text('I0101 kubelet[1102]: Successfully registered node worker-1').style('fill', 'var(--green)'); q('#m').text('edit → daemon-reload → restart → journalctl'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

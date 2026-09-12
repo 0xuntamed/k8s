@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 21 · Multi-Container Pods · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d21" data-root="../" data-linux="l02,l04" data-related="d03,d26">
+<article class="lesson">
+<p class="lead">A Pod is not "a container"; it is a group of containers that share a network namespace, can share volumes, and are always scheduled together on one node. Most Pods have one container. The rest use a handful of named patterns — <strong>init</strong>, <strong>sidecar</strong>, <strong>ambassador</strong>, <strong>adapter</strong> — to bolt cross-cutting behaviour onto an application without changing its image. Knowing what a Pod actually shares tells you exactly when a second container belongs in it.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>What containers in a Pod share (network, volumes, IPC, lifecycle) and what they do not (filesystem, processes by default)</li>
+<li>Init containers: sequential, run-to-completion setup</li>
+<li>Native sidecars (<code>restartPolicy: Always</code> in <code>initContainers</code>) vs the old sidecar pattern</li>
+<li>Ambassador and adapter patterns and when to use each</li>
+<li>Debugging: <code>-c</code>, ephemeral debug containers, shared process namespace</li>
+</ul></div>
+
+<h2>What a Pod shares</h2>
+<figure data-anim="pod-shared"></figure>
+<div class="tbl-wrap"><table>
+<tr><th>Shared by all containers in a Pod</th><th>Private to each container</th></tr>
+<tr><td><strong>Network namespace</strong> — one IP, one port space; containers talk over <code>localhost</code>. Two containers cannot both listen on :8080.</td><td><strong>Mount namespace / root filesystem</strong> — each container sees its own image. To share files, mount the same volume in both.</td></tr>
+<tr><td><strong>Volumes</strong> declared at Pod level, mounted per container at any path.</td><td><strong>PID namespace</strong> — by default each container sees only its own processes (<code>shareProcessNamespace: true</code> changes this).</td></tr>
+<tr><td><strong>IPC namespace</strong> — SysV shared memory, semaphores.</td><td><strong>cgroup limits</strong> — requests/limits are per container (the Pod cgroup is the sum).</td></tr>
+<tr><td><strong>Node, scheduling, lifecycle</strong> — created, scheduled and deleted as a unit.</td><td><strong>Environment variables, securityContext, probes</strong> — per container.</td></tr>
+</table></div>
+<div class="callout linux" data-ref="l02"><div class="ct">Under the hood · Linux</div><p>The kubelet first creates a <strong>pause</strong> container (image <code>registry.k8s.io/pause</code>) — a tiny process that does nothing but sleep. Its only job is to <em>own</em> the Pod's network and IPC namespaces so they outlive any application container restarts. Every application container is then started with <code>--net=container:pause</code> semantics (Day 3's <code>--network container:x</code>), joining those namespaces. That is why a Pod keeps its IP when a container crashes, and why <code>crictl ps</code> on a node shows a pause container per Pod. Each application container still gets its own mount namespace built from its own image layers.</p></div>
+
+<h2>Init containers</h2>
+<p>Init containers run <strong>before</strong> the app containers, <strong>one at a time, in order</strong>, each to completion. If one fails, the kubelet restarts it (per <code>restartPolicy</code>) and the app containers never start. They use their own images — perfect for tools you do not want in the app image.</p>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+spec:
+  initContainers:
+  - name: wait-for-db
+    image: busybox:1.36
+    command: ['sh', '-c', 'until nc -z db 5432; do echo waiting; sleep 2; done']
+  - name: migrate
+    image: myapi:2.1
+    command: ['./migrate', '--up']
+    envFrom: [{secretRef: {name: db-creds}}]
+  - name: fetch-config
+    image: curlimages/curl
+    command: ['sh', '-c', 'curl -s http://config-svc/api.json -o /config/api.json']
+    volumeMounts: [{name: cfg, mountPath: /config}]
+  containers:
+  - name: api
+    image: myapi:2.1
+    volumeMounts: [{name: cfg, mountPath: /etc/api, readOnly: true}]
+  volumes:
+  - name: cfg
+    emptyDir: {}</code></pre>
+<ul>
+<li>Status while inits run: <code>Init:0/3</code>, <code>Init:1/3</code>… then <code>PodInitializing</code>, then <code>Running</code>. <code>Init:Error</code> / <code>Init:CrashLoopBackOff</code> point at the failing init.</li>
+<li>Init containers <em>cannot</em> have probes or lifecycle hooks; their resources count toward scheduling as the max of any single init (they run serially) vs the sum of app containers.</li>
+<li><code>kubectl logs api -c wait-for-db</code> to read an init container's output.</li>
+</ul>
+
+<h2>Sidecars — and the native sidecar feature</h2>
+<p>A sidecar is a long-running helper that lives alongside the app: a log shipper that tails a shared volume, a proxy that terminates TLS, an agent that refreshes credentials. Historically you put it in <code>containers</code> next to the app, which had two problems: no start ordering (the app could start before its proxy was ready) and no stop ordering (the sidecar could die first, leaving the app unable to reach the network during shutdown; in Jobs the sidecar never exited, so the Job never completed).</p>
+<p>Since Kubernetes 1.29 (GA in 1.33), an init container with <code>restartPolicy: Always</code> is a <strong>native sidecar</strong>: it starts in init order, is considered "started" once its startup probe passes, keeps running for the whole Pod lifetime, is restarted if it dies, and is stopped <em>after</em> the app containers during termination. Jobs complete when the main containers finish.</p>
+<pre><code class="lang-yaml">spec:
+  initContainers:
+  - name: log-shipper              # native sidecar
+    image: fluent/fluent-bit
+    restartPolicy: Always          # ← the whole feature
+    volumeMounts: [{name: logs, mountPath: /var/log/app}]
+    startupProbe:
+      httpGet: {path: /api/v1/health, port: 2020}
+  containers:
+  - name: app
+    image: myapp:3.0
+    volumeMounts: [{name: logs, mountPath: /var/log/app}]
+  volumes:
+  - name: logs
+    emptyDir: {}</code></pre>
+<figure data-anim="init-sidecar"></figure>
+
+<h2>Ambassador and adapter</h2>
+<div class="compare">
+<div><h4>Ambassador — outbound proxy</h4><p>The app talks to <code>localhost:5432</code>; an ambassador container in the same Pod forwards to the real database, handling discovery, TLS, retries, sharding or connection pooling. The app image stays environment-agnostic. Service meshes (Istio's Envoy sidecar) are ambassadors for all traffic.</p><pre><code class="lang-yaml">containers:
+- name: app
+  env: [{name: DB_HOST, value: "127.0.0.1"}]
+- name: pgbouncer            # ambassador
+  image: edoburu/pgbouncer
+  env: [{name: DB_HOST, value: "prod-db.internal"}]</code></pre></div>
+<div><h4>Adapter — normalise output</h4><p>The app exposes metrics or logs in its own format; an adapter container reads them (via a shared volume or localhost) and re-exposes them in the format the platform expects — Prometheus exposition, JSON logs. Nothing in the app changes.</p><pre><code class="lang-yaml">containers:
+- name: redis
+  image: redis:7
+- name: redis-exporter     # adapter: redis INFO → /metrics
+  image: oliver006/redis_exporter
+  args: ["--redis.addr=localhost:6379"]
+  ports: [{containerPort: 9121}]</code></pre></div>
+</div>
+
+<h2>Working with multi-container Pods</h2>
+<pre><code class="lang-bash">$ kubectl get pod api                          # READY 2/2 — one number per container
+$ kubectl logs api -c log-shipper -f           # -c is mandatory with 2+ containers
+$ kubectl logs api --all-containers --prefix
+$ kubectl exec -it api -c app -- sh
+$ kubectl describe pod api                     # per-container state, restarts, init container section
+$ kubectl debug -it api --image=busybox --target=app   # ephemeral container sharing app's PID namespace</code></pre>
+<pre><code class="lang-yaml">spec:
+  shareProcessNamespace: true    # all containers see each other's processes; kill -HUP 1 works across them</code></pre>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Add a sidecar that tails the app's log file" → shared <code>emptyDir</code>, mounted in both, sidecar runs <code>tail -F /var/log/app.log</code>. Generate the Pod YAML, add the second container and the volume.</li>
+<li>Pod stuck <code>Init:0/1</code> → <code>kubectl logs pod -c &lt;init-name&gt;</code>; the init is waiting for something.</li>
+<li>Always pass <code>-c</code> when the task mentions a specific container; the default is the first one and the grader checks the right one.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: multi}
+spec:
+  initContainers:
+  - name: init
+    image: busybox:1.36
+    command: ['sh','-c','echo "$(date) init done" &gt; /work/init.txt; sleep 5']
+    volumeMounts: [{name: work, mountPath: /work}]
+  containers:
+  - name: writer
+    image: busybox:1.36
+    command: ['sh','-c','while true; do date &gt;&gt; /work/app.log; sleep 2; done']
+    volumeMounts: [{name: work, mountPath: /work}]
+  - name: reader
+    image: busybox:1.36
+    command: ['sh','-c','tail -F /work/app.log']
+    volumeMounts: [{name: work, mountPath: /work}]
+  - name: web
+    image: nginx
+  volumes: [{name: work, emptyDir: {}}]
+EOF
+$ kubectl get pod multi -w                         # Init:0/1 → PodInitializing → Running 3/3
+$ kubectl logs multi -c reader --tail=3            # sees writer's lines via the shared volume
+$ kubectl exec multi -c reader -- cat /work/init.txt
+$ kubectl exec multi -c writer -- wget -qO- http://localhost | head -2     # nginx via localhost: shared netns
+$ kubectl exec multi -c writer -- ps                # only its own processes: separate PID ns
+$ kubectl delete pod multi $now</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Containers in a Pod share network (localhost, one IP), volumes and IPC; they keep separate filesystems and (by default) PID namespaces. The pause container holds the shared namespaces.</li>
+<li>Init containers run sequentially to completion before app containers; use them for waiting, migrations, fetching config.</li>
+<li>Native sidecar = init container with <code>restartPolicy: Always</code>: ordered start, restarts, stops after the app, lets Jobs finish.</li>
+<li>Ambassador proxies outbound; adapter normalises outbound formats. Both keep the app image unchanged.</li>
+<li>Use <code>-c</code> everywhere; <code>kubectl debug --target</code> for images without a shell.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.zone('pod', 20, 20, 680, 290, 'Pod api · 10.244.1.9 · node worker-2', { cls: 'hl' })
+    + S.box('pause', 300, 45, 120, 36, ['pause', 'owns net + ipc ns'], { subfs: 8, subcls: 'muted', cls: 'soft' })
+    + S.box('c1', 60, 110, 200, 120, ['container: app', 'rootfs: myapi:2.1', 'PID ns: own'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('c2', 460, 110, 200, 120, ['container: shipper', 'rootfs: fluent-bit', 'PID ns: own'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('vol', 285, 250, 150, 40, ['volume: logs (emptyDir)'], { fs: 10, cls: 'warn' })
+    + S.arrow('n1', 260, 130, 300, 81, { d: 'M 255 120 L 300 78', cls: 'dashed', label: 'joins netns', lx: 250, ly: 96 }) + S.arrow('n2', 460, 130, 420, 81, { d: 'M 465 120 L 420 78', cls: 'dashed' })
+    + S.arrow('v1', 160, 230, 290, 262, { d: 'M 160 230 L 290 262', cls: 'hid', label: '/var/log/app', lx: 190, ly: 262 }) + S.arrow('v2', 560, 230, 430, 262, { d: 'M 560 230 L 430 262', cls: 'hid', label: '/logs', lx: 520, ly: 262 })
+    + S.arrow('lo', 260, 170, 460, 170, { cls: 'hid', label: 'localhost:2020', ly: 162 });
+  Anim.define('pod-shared', { w: 720, h: 320, title: 'What a Pod shares', ms: 2800, svg: s1, steps: [
+    { c: 'The kubelet starts a <b>pause</b> container first. It does nothing — it just exists so the Pod\'s network and IPC namespaces have an owner that never restarts.', on(q){ q('#pause rect').set('hl'); } },
+    { c: 'Application containers are started <b>into</b> those namespaces. One IP, one port space: both containers see the same <code>eth0</code>.', on(q){ q('#n1,#n2').set('hl'); q('#c1 rect,#c2 rect').set('hl'); } },
+    { c: 'So they can talk over <b>localhost</b> with no Service, no DNS, no network policy in the way.', on(q){ q('#lo').show().set('ok'); } },
+    { c: 'Filesystems are <b>not</b> shared: each container has its own root from its own image. To exchange files, a Pod-level volume is mounted into both — at any path each prefers.', on(q){ q('#v1,#v2').show().set('hl'); q('#vol rect').set('warn'); } },
+    { c: 'Processes are also separate by default: <code>ps</code> in app does not show fluent-bit. <code>shareProcessNamespace: true</code> merges them when you need signals across containers.', on(q){ q('#c1 text:nth-of-type(3)').text('PID ns: own (or shared)'); } },
+  ]});
+
+  const T = (id, x, y, w, label, cls, hidden) => S.box(id, x, y, w, 30, label, { fs: 10, cls, hidden, lcls: 'mono' });
+  let s2 = S.text('t0', 60, 30, 'time →', { cls: 'sm muted left' });
+  [0, 1, 2, 3, 4, 5].forEach(i => s2 += `<line x1="${120 + i * 96}" y1="40" x2="${120 + i * 96}" y2="290" stroke="var(--border)" stroke-dasharray="3 4"/>` + S.text(`tk${i}`, 120 + i * 96, 300, ['t0', 't1', 't2', 't3', 'stop', 'gone'][i], { cls: 'xs muted mono' }));
+  s2 += S.text('l1', 20, 76, 'init: migrate', { cls: 'xs left' }) + T('b1', 120, 60, 90, 'runs → exit 0', 'ok', true);
+  s2 += S.text('l2', 20, 126, 'sidecar: proxy', { cls: 'xs left' }) + T('b2', 216, 110, 300, 'running (restartPolicy: Always)', 'pur', true);
+  s2 += S.text('l3', 20, 176, 'container: app', { cls: 'xs left' }) + T('b3', 312, 160, 200, 'running', 'hl', true);
+  s2 += S.text('l4', 20, 226, 'container: worker', { cls: 'xs left' }) + T('b4', 312, 210, 200, 'running', 'hl', true);
+  s2 += S.text('m', 360, 275, '', { cls: 'sm b' });
+  Anim.define('init-sidecar', { w: 720, h: 315, title: 'Init → sidecar → app → teardown', ms: 2600, svg: s2, steps: [
+    { c: 'A Pod with one init container (<code>migrate</code>), one native sidecar (<code>proxy</code>, an init container with <code>restartPolicy: Always</code>) and two app containers.', on(q){} },
+    { c: '<b>t0</b>: init containers run in order. <code>migrate</code> runs to completion; nothing else starts until it exits 0. Status: <code>Init:0/2</code>.', on(q){ q('#b1').show(); q('#m').text('Init:0/2'); } },
+    { c: '<b>t1</b>: next in the list is the sidecar. It starts and — because its restartPolicy is Always — the kubelet does not wait for it to <i>exit</i>, only for its startup probe to pass. Status: <code>Init:1/2</code>.', on(q){ q('#b2').show(); q('#m').text('Init:1/2 → sidecar started, probe passed'); } },
+    { c: '<b>t2</b>: app containers start in parallel. The proxy is already serving, so the app\'s first request succeeds. Status: <code>Running 3/3</code>.', on(q){ q('#b3,#b4').show(); q('#m').text('Running 3/3'); } },
+    { c: 'If the proxy crashes it is restarted independently, like any container. If <code>app</code> crashes, the proxy keeps running — the Pod IP and the sidecar\'s state survive.', on(q){ q('#b2').text('crash → restarted'); q('#b2 rect').set('warn'); } },
+    { c: '<b>stop</b>: on deletion, app containers get SIGTERM <b>first</b>. Only after they exit does the kubelet stop the sidecar — the app can still use the proxy while draining. In a Job, the Pod completes when the app containers finish, ignoring the sidecar.', on(q){ q('#b3 rect,#b4 rect').set('bad'); q('#b3,#b4').text('SIGTERM → exit'); q('#b2').width(390).text('keeps running until app containers exit'); q('#b2 rect').set('pur'); q('#m').text('ordered teardown: apps, then sidecars'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

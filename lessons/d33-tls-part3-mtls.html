@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 33 · TLS Masterclass 3: The Cluster PKI · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d33" data-root="../" data-linux="l09" data-related="d07,d32,d57">
+<article class="lesson">
+<p class="lead">A kubeadm cluster carries about twenty certificates and three CAs, and every one of them exists for a specific conversation: kubectl → API server, API server → etcd, API server → kubelet, kubelet → API server, scheduler → API server. Once you can say <em>who is the client, who is the server, and which CA do they share</em> for each arrow, <code>/etc/kubernetes/pki</code> stops being a pile of files and becomes a map — and expired-certificate outages become ten-minute fixes.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The three CAs: cluster CA, etcd CA, front-proxy CA — and why there are three</li>
+<li>Every file in <code>/etc/kubernetes/pki</code> and which component uses it as server or client</li>
+<li>The kubelet's certificates and the kubeconfigs of the control-plane components</li>
+<li>ServiceAccount signing keys (<code>sa.key</code>/<code>sa.pub</code>) — the one pair that is not X.509</li>
+<li>Reading and verifying any of them with openssl and <code>kubeadm certs</code></li>
+</ul></div>
+
+<h2>The map</h2>
+<figure data-anim="pki-map"></figure>
+
+<h2>Three CAs</h2>
+<div class="tbl-wrap"><table>
+<tr><th>CA</th><th>Files</th><th>Signs</th><th>Why separate</th></tr>
+<tr><td><strong>Cluster CA</strong> ("kubernetes")</td><td><code>pki/ca.crt</code>, <code>pki/ca.key</code></td><td>API server serving cert; all client certs to the API server (admin, kubelets, scheduler, controller-manager, kube-proxy); API server's client cert to kubelets; kubelet serving certs (if enabled)</td><td>The trust root of the cluster; what every kubeconfig's <code>certificate-authority-data</code> is</td></tr>
+<tr><td><strong>etcd CA</strong></td><td><code>pki/etcd/ca.crt</code>, <code>pki/etcd/ca.key</code></td><td>etcd server cert, etcd peer certs, API server's client cert to etcd, healthcheck client</td><td>etcd is the most sensitive component; isolating its trust means a leaked cluster-CA-signed cert cannot read etcd directly</td></tr>
+<tr><td><strong>Front-proxy CA</strong></td><td><code>pki/front-proxy-ca.crt/.key</code></td><td><code>front-proxy-client.crt</code></td><td>Used by the API aggregation layer: the API server proves to extension API servers (metrics-server!) that requests were forwarded by it, not forged</td></tr>
+</table></div>
+
+<h2>Every file in /etc/kubernetes/pki</h2>
+<pre><code class="lang-bash">$ sudo tree /etc/kubernetes/pki
+/etc/kubernetes/pki
+├── ca.crt / ca.key                          # cluster CA
+├── apiserver.crt / .key                     # API server SERVING cert (SANs: kubernetes, kubernetes.default.svc…, 10.96.0.1, node IP)
+├── apiserver-kubelet-client.crt / .key      # API server as CLIENT to kubelets (logs, exec, port-forward)  O=kubeadm:cluster-admins
+├── apiserver-etcd-client.crt / .key         # API server as CLIENT to etcd   (signed by etcd CA)
+├── front-proxy-ca.crt / .key                # front-proxy CA
+├── front-proxy-client.crt / .key            # API server as CLIENT to aggregated API servers
+├── sa.key / sa.pub                          # ServiceAccount token signing key pair (NOT x509 — plain RSA)
+└── etcd/
+    ├── ca.crt / ca.key                      # etcd CA
+    ├── server.crt / .key                    # etcd SERVING cert (SANs: localhost, node IP)
+    ├── peer.crt / .key                      # etcd ↔ etcd (both server and client usage)
+    └── healthcheck-client.crt / .key        # for liveness probes / etcdctl on the node</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Conversation</th><th>Client presents</th><th>Server presents</th><th>Both verify against</th></tr>
+<tr><td>kubectl → API server</td><td>admin.conf's cert (CN=kubernetes-admin)</td><td>apiserver.crt</td><td>cluster CA</td></tr>
+<tr><td>scheduler / controller-manager → API server</td><td>certs embedded in scheduler.conf / controller-manager.conf (CN=system:kube-scheduler, system:kube-controller-manager)</td><td>apiserver.crt</td><td>cluster CA</td></tr>
+<tr><td>kubelet → API server</td><td><code>/var/lib/kubelet/pki/kubelet-client-current.pem</code> (CN=system:node:&lt;name&gt;, O=system:nodes)</td><td>apiserver.crt</td><td>cluster CA</td></tr>
+<tr><td>API server → kubelet (:10250)</td><td>apiserver-kubelet-client.crt</td><td><code>/var/lib/kubelet/pki/kubelet.crt</code> (self-signed by default!)</td><td>kubelet: cluster CA (<code>clientCAFile</code>); API server: usually does <em>not</em> verify the kubelet (unless <code>--kubelet-certificate-authority</code>)</td></tr>
+<tr><td>API server → etcd (:2379)</td><td>apiserver-etcd-client.crt</td><td>etcd/server.crt</td><td>etcd CA</td></tr>
+<tr><td>etcd ↔ etcd (:2380)</td><td>etcd/peer.crt</td><td>etcd/peer.crt</td><td>etcd CA</td></tr>
+<tr><td>API server → metrics-server (aggregation)</td><td>front-proxy-client.crt</td><td>metrics-server's own cert</td><td>front-proxy CA (via the <code>extension-apiserver-authentication</code> ConfigMap)</td></tr>
+</table></div>
+
+<h2>Where the API server is told all this</h2>
+<pre><code class="lang-bash">$ grep -E 'ca-file|cert-file|key-file|client-ca|etcd-' /etc/kubernetes/manifests/kube-apiserver.yaml
+    - --client-ca-file=/etc/kubernetes/pki/ca.crt                       # verify client certs (kubectl, kubelets…)
+    - --tls-cert-file=/etc/kubernetes/pki/apiserver.crt                 # serve
+    - --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+    - --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt
+    - --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key
+    - --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt                     # verify etcd
+    - --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt     # authenticate to etcd
+    - --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+    - --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt
+    - --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key
+    - --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt
+    - --service-account-key-file=/etc/kubernetes/pki/sa.pub             # verify SA tokens
+    - --service-account-signing-key-file=/etc/kubernetes/pki/sa.key     # sign SA tokens
+$ grep -E 'cert|key|ca' /etc/kubernetes/manifests/etcd.yaml
+$ grep -E 'clientCAFile|tlsCert|tlsPrivate|rotate' /var/lib/kubelet/config.yaml</code></pre>
+<p>Every flag above is one row of the table: a <em>serving</em> pair, a <em>client</em> pair, or a <em>CA to verify the other side</em>. The kubeconfigs <code>admin.conf</code>, <code>super-admin.conf</code>, <code>scheduler.conf</code>, <code>controller-manager.conf</code> and <code>kubelet.conf</code> in <code>/etc/kubernetes/</code> embed the cluster CA plus each component's client cert and key (kubelet.conf points at the rotating file in <code>/var/lib/kubelet/pki</code>).</p>
+
+<h2>Kubelet certificates and rotation</h2>
+<p>The kubelet is special: it bootstraps. On <code>kubeadm join</code> it uses a short-lived <strong>bootstrap token</strong> to submit a CSR for its client certificate (CN=system:node:&lt;name&gt;, O=system:nodes), which the controller-manager's CSR approver signs automatically. The result is <code>/var/lib/kubelet/pki/kubelet-client-current.pem</code>, valid one year, and with <code>rotateCertificates: true</code> the kubelet renews it itself before expiry. Its <em>serving</em> cert (<code>kubelet.crt</code>) is self-signed by default; enabling <code>serverTLSBootstrap: true</code> makes it request a CA-signed one (needed if you want the API server to verify kubelets, e.g. for metrics-server without <code>--kubelet-insecure-tls</code>).</p>
+
+<h2>sa.key / sa.pub: the odd pair out</h2>
+<p>These are not certificates. <code>sa.key</code> is a plain RSA private key the API server (actually the token controller in kube-controller-manager, plus the API server for TokenRequest) uses to <strong>sign ServiceAccount JWTs</strong>; <code>sa.pub</code> verifies them. Lose <code>sa.key</code> and every SA token in the cluster becomes invalid at once. <a href="d37-service-accounts.html">Day 37</a>.</p>
+
+<h2>Inspecting and checking expiry</h2>
+<pre><code class="lang-bash">$ sudo kubeadm certs check-expiration
+CERTIFICATE                EXPIRES                  RESIDUAL TIME   CERTIFICATE AUTHORITY   EXTERNALLY MANAGED
+admin.conf                 Jan 01, 2026 10:00 UTC   300d            ca                      no
+apiserver                  Jan 01, 2026 10:00 UTC   300d            ca                      no
+apiserver-etcd-client      Jan 01, 2026 10:00 UTC   300d            etcd-ca                 no
+…
+CERTIFICATE AUTHORITY   EXPIRES                  RESIDUAL TIME
+ca                      Dec 30, 2034 10:00 UTC   9y
+$ for f in /etc/kubernetes/pki/*.crt; do echo "$f: $(sudo openssl x509 -in $f -noout -subject -enddate | tr '\n' ' ')"; done
+$ sudo openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -ext subjectAltName
+$ sudo openssl verify -CAfile /etc/kubernetes/pki/ca.crt /etc/kubernetes/pki/apiserver.crt
+$ sudo openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/apiserver-etcd-client.crt</code></pre>
+<p>Leaf certificates are issued for <strong>1 year</strong>; CAs for <strong>10 years</strong>. <code>kubeadm upgrade</code> renews all leaves automatically, so clusters upgraded at least yearly never expire — clusters left alone do, exactly one year after install, all at once. Renewal is on <a href="d34-tls-part4-csr.html">Day 34</a>.</p>
+
+<div class="callout linux" data-ref="l09"><div class="ct">Under the hood · Linux</div><p>The control-plane static Pods get these files via <code>hostPath</code> mounts of <code>/etc/kubernetes/pki</code> (read-only) — look at the <code>volumes</code> in <code>kube-apiserver.yaml</code>. Permissions matter: <code>*.key</code> files are <code>0600 root</code>, certificates <code>0644</code>. The etcd Pod runs as root and reads <code>pki/etcd</code>; to use <code>etcdctl</code> yourself you pass the same three files: <code>ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key endpoint health</code> — which is precisely the "client presents / server presents / both verify against" triple from the table, and the command you will need for etcd backups.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Which certificate does the API server use to talk to etcd?" → <code>apiserver-etcd-client.crt</code>. "…to kubelets?" → <code>apiserver-kubelet-client.crt</code>. "What are the SANs of the API server cert?" → <code>openssl x509 -ext subjectAltName</code>.</li>
+<li>etcdctl needs <code>--cacert --cert --key</code> from <code>pki/etcd/</code> — memorise the paths; the backup/restore task depends on them.</li>
+<li>Control plane down + kubelet logs full of "x509: certificate has expired" → <code>kubeadm certs renew all</code>, restart the static Pods, copy the new admin.conf.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ docker exec -it cka-control-plane bash
+# kubeadm certs check-expiration
+# for f in /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt; do printf '%-55s %s\n' "$f" "$(openssl x509 -in $f -noout -subject | sed 's/subject=//')"; done
+# openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -ext subjectAltName
+# openssl verify -CAfile /etc/kubernetes/pki/ca.crt /etc/kubernetes/pki/apiserver-kubelet-client.crt
+# openssl verify -CAfile /etc/kubernetes/pki/ca.crt /etc/kubernetes/pki/apiserver-etcd-client.crt      # FAILS: wrong CA
+# openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/apiserver-etcd-client.crt # OK
+# grep -E '\-\-(client-ca|tls-cert|etcd-|kubelet-client)' /etc/kubernetes/manifests/kube-apiserver.yaml
+# openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -subject      # CN=system:node:…, O=system:nodes
+# ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key endpoint health
+# exit</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Three CAs: cluster (<code>ca.crt</code>), etcd (<code>etcd/ca.crt</code>), front-proxy. Each conversation has a client cert, a server cert and a shared CA.</li>
+<li>API server: serves with <code>apiserver.crt</code>; is a client with <code>apiserver-kubelet-client</code>, <code>apiserver-etcd-client</code>, <code>front-proxy-client</code>.</li>
+<li>Kubelets bootstrap their own client certs (CN=system:node:&lt;name&gt;) and rotate them; serving certs are self-signed unless configured.</li>
+<li><code>sa.key</code>/<code>sa.pub</code> sign and verify ServiceAccount tokens — not X.509.</li>
+<li>Leaves last 1 year, CAs 10; <code>kubeadm certs check-expiration</code> is the first command when a cluster "just stopped working".</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('api', 250, 120, 200, 60, ['kube-apiserver', 'serves: apiserver.crt'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('etcd', 540, 120, 150, 60, ['etcd', 'serves: etcd/server.crt'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('kl', 250, 250, 200, 60, ['kubelet (each node)', 'serves: kubelet.crt (self-signed)'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('sched', 30, 120, 160, 60, ['scheduler / ctrl-mgr', 'client: *.conf certs'], { subfs: 9, subcls: 'mono muted' })
+    + S.icon('kc', 100, 40, 'laptop', { label: 'kubectl (admin.conf)', ly: 28 })
+    + S.box('ms', 540, 250, 150, 60, ['metrics-server', '(aggregated API)'], { subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.arrow('a1', 140, 55, 250, 125, { d: 'M 140 55 L 250 125', cls: 'hid', label: 'kubernetes-admin', lx: 210, ly: 80 })
+    + S.arrow('a2', 190, 150, 248, 150, { cls: 'hid' })
+    + S.arrow('a3', 330, 250, 330, 182, { cls: 'hid', label: 'system:node:x', lx: 380, ly: 220 })
+    + S.arrow('a4', 370, 182, 370, 248, { cls: 'hid', label: 'apiserver-kubelet-client', lx: 445, ly: 240 })
+    + S.arrow('a5', 450, 150, 538, 150, { cls: 'hid', label: 'apiserver-etcd-client', ly: 140 })
+    + S.arrow('a6', 450, 170, 538, 255, { d: 'M 450 172 L 538 258', cls: 'hid', label: 'front-proxy-client', lx: 520, ly: 225 })
+    + S.text('ca', 360, 30, '', { cls: 'sm b' }) + S.text('m', 360, 330, '', { cls: 'xs muted' });
+  Anim.define('pki-map', { w: 720, h: 340, title: 'Who presents what to whom', ms: 3000, svg, steps: [
+    { c: 'Six components, one API server in the middle. Every arrow is an mTLS connection: the arrow\'s tail is the client, its label is the <b>client certificate</b> it presents.', on(q){} },
+    { c: '<b>Cluster CA</b> signs everything that talks to the API server: admin\'s cert, the scheduler and controller-manager certs in their kubeconfigs, and every kubelet\'s client cert. All verify <code>apiserver.crt</code> against the same CA.', on(q){ q('#a1,#a2,#a3').show().set('hl'); q('#ca').text('cluster CA (ca.crt): admin, scheduler, controller-manager, kubelets → apiserver'); q('#api rect').set('hl'); } },
+    { c: 'The API server is also a <b>client</b>. To kubelets (for logs/exec) it presents <code>apiserver-kubelet-client.crt</code>, which the kubelet verifies against… the cluster CA again.', on(q){ q('#a4').show().set('hl'); q('#kl rect').set('hl'); q('#ca').text('cluster CA also signs apiserver-kubelet-client'); } },
+    { c: 'To <b>etcd</b> it presents <code>apiserver-etcd-client.crt</code>, signed by the separate <b>etcd CA</b>. A cluster-CA cert is useless here — the trust domains are isolated.', on(q){ q('#a1,#a2,#a3,#a4').set(); q('#kl rect').set(); q('#a5').show().set('ok'); q('#etcd rect').set('pur'); q('#ca').text('etcd CA (etcd/ca.crt): apiserver-etcd-client, etcd server & peer'); } },
+    { c: 'To aggregated API servers like metrics-server it presents <code>front-proxy-client.crt</code>, signed by the <b>front-proxy CA</b>, so the extension can trust that the request headers (user, groups) were set by the real API server.', on(q){ q('#a5').set(); q('#etcd rect').set('pur'); q('#a6').show().set('hl'); q('#ms rect').set('cy'); q('#ca').text('front-proxy CA: front-proxy-client → aggregated APIs'); } },
+    { c: 'Three CAs, ~20 certificates, one rule: for each arrow, the client presents a cert signed by a CA the server holds, and the server presents one signed by a CA the client holds.', on(q){ q('.ar').set('ok'); q('#ca').text('client cert ← CA → server cert, per conversation'); q('#m').text('kubeadm certs check-expiration lists them all'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

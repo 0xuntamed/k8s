@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 27 · Persistent Storage: PV, PVC, StorageClass · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d27" data-root="../" data-linux="l04" data-related="d25,d26,d44">
+<article class="lesson">
+<p class="lead">Persistent storage in Kubernetes separates three concerns that used to be one: <em>what storage exists</em> (a <strong>PersistentVolume</strong>, cluster-scoped, created by an admin or a provisioner), <em>what an application needs</em> (a <strong>PersistentVolumeClaim</strong>, namespaced, written by the developer), and <em>how to create more on demand</em> (a <strong>StorageClass</strong>). The Pod only ever references the claim. This decoupling is what lets the same manifest run on EBS, Ceph or a local disk.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>PV: capacity, access modes, reclaim policy, volume mode, node affinity</li>
+<li>PVC: how a claim finds and binds a volume, and why binding is one-to-one</li>
+<li>StorageClass and dynamic provisioning; <code>volumeBindingMode: WaitForFirstConsumer</code>; expansion</li>
+<li>hostPath and local volumes — and why hostPath is for single-node testing only</li>
+<li>PV/PVC phases and the troubleshooting path for Pending claims and FailedMount Pods</li>
+</ul></div>
+
+<h2>The three objects</h2>
+<figure data-anim="pv-pvc"></figure>
+
+<h3>PersistentVolume (cluster-scoped)</h3>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-nfs-01
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+  - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs
+  volumeMode: Filesystem
+  mountOptions: [hard, nfsvers=4.1]
+  nfs:
+    server: 10.0.0.50
+    path: /exports/data</code></pre>
+<ul class="notes">
+<li><b>capacity.storage</b> — size. A claim binds to a PV with at least this much.</li>
+<li><b>accessModes</b> — what the <em>backend</em> supports: <code>ReadWriteOnce</code> (RWO, one node), <code>ReadOnlyMany</code> (ROX), <code>ReadWriteMany</code> (RWX, many nodes — NFS, CephFS, EFS), <code>ReadWriteOncePod</code> (RWOP, one Pod). Block devices like EBS are RWO only.</li>
+<li><b>persistentVolumeReclaimPolicy</b> — what happens when the claim is deleted: <code>Retain</code> (keep data, PV becomes <em>Released</em> and must be cleaned by hand), <code>Delete</code> (provisioner deletes the backend disk — default for dynamic PVs). <code>Recycle</code> is deprecated.</li>
+<li><b>storageClassName</b> — a label that claims must match. Empty string = only claims that ask for no class.</li>
+<li><b>volumeMode</b> — <code>Filesystem</code> (mounted) or <code>Block</code> (raw device at <code>volumeDevices</code>).</li>
+<li>The last block is the <b>source</b>: <code>nfs</code>, <code>csi</code>, <code>hostPath</code>, <code>local</code>, <code>iscsi</code>, <code>fc</code>…</li>
+</ul>
+</div>
+
+<h3>PersistentVolumeClaim (namespaced)</h3>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: shop
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: fast-ssd
+  volumeMode: Filesystem
+  # selector:              # optional, static PVs only
+  #   matchLabels: {tier: gold}</code></pre>
+<ul class="notes">
+<li>A claim is a <b>request</b>: size, modes, class. The control plane finds a PV that satisfies it (or creates one).</li>
+<li><b>Binding rules</b>: PV capacity ≥ request; PV modes ⊇ requested modes; same <code>storageClassName</code>; selector matches PV labels; not already bound. Among candidates, the smallest sufficient PV wins.</li>
+<li>Binding is <b>exclusive and one-to-one</b>: a 100 Gi PV bound to a 10 Gi claim gives that claim all 100 Gi and nobody else anything.</li>
+<li>Omit <code>storageClassName</code> and the cluster's <em>default</em> StorageClass is used (if one is annotated as default). Set it to <code>""</code> to force a static PV with no class.</li>
+</ul>
+</div>
+<pre><code class="lang-yaml"># the Pod references only the claim
+spec:
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: data
+  containers:
+  - name: db
+    image: postgres:16
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data</code></pre>
+
+<h3>StorageClass and dynamic provisioning</h3>
+<pre><code class="lang-yaml">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com             # which CSI driver creates volumes
+parameters:                              # driver-specific
+  type: gp3
+  iops: "6000"
+  encrypted: "true"
+reclaimPolicy: Delete                    # applied to PVs it creates
+volumeBindingMode: WaitForFirstConsumer  # or Immediate
+allowVolumeExpansion: true</code></pre>
+<p>With a StorageClass present, a PVC that names it (or the default) triggers the provisioner to <strong>create</strong> a backend volume and a matching PV, then bind. Nobody pre-creates PVs. This is how every cloud cluster works; static PVs are for NFS servers, pre-existing disks and bare metal.</p>
+<dl class="kv">
+<dt>volumeBindingMode: Immediate</dt><dd>Provision and bind as soon as the PVC exists. Problem on multi-zone clouds: the disk may be created in zone A while the Pod is later scheduled to zone B and cannot attach.</dd>
+<dt>volumeBindingMode: WaitForFirstConsumer</dt><dd>Leave the PVC <code>Pending</code> until a Pod using it is scheduled; then provision in that Pod's zone. The PVC shows <code>WaitForFirstConsumer</code> in its events — this is <em>not</em> an error. Recommended for block storage.</dd>
+<dt>allowVolumeExpansion</dt><dd>Edit the PVC's <code>requests.storage</code> upward and the CSI driver grows the disk and (for most filesystems) the filesystem online. Shrinking is never supported.</dd>
+<dt>Default class</dt><dd>At most one should carry the annotation; <code>kubectl get sc</code> marks it <code>(default)</code>. <code>kubectl patch sc X -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'</code>.</dd>
+</dl>
+
+<h2>hostPath and local</h2>
+<div class="compare">
+<div><h4>hostPath</h4><pre><code class="lang-yaml">volumes:
+- name: data
+  hostPath:
+    path: /data/db
+    type: DirectoryOrCreate   # Directory · File · Socket · ""</code></pre><p>Mounts a directory <em>of whichever node the Pod lands on</em>. Reschedule the Pod and the data is "gone" (it is still on the old node). No capacity, no scheduling awareness, and root on the node is one <code>hostPath: /</code> away. Use for: node agents (log collectors, CNI), single-node dev (KIND, minikube), the course demos. Never for production data.</p></div>
+<div><h4>local</h4><pre><code class="lang-yaml">kind: PersistentVolume
+spec:
+  capacity: {storage: 500Gi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-nvme
+  local:
+    path: /mnt/nvme0
+  nodeAffinity:              # REQUIRED
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values: [worker-3]</code></pre><p>A PV backed by a node disk, with mandatory <code>nodeAffinity</code> so the scheduler puts any Pod using the claim on <em>that</em> node. Proper capacity, proper binding, used with a <code>WaitForFirstConsumer</code> class. The right way to use fast local disks for databases that replicate themselves (Cassandra, Kafka).</p></div>
+</div>
+
+<h2>Phases and troubleshooting</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Object</th><th>Phase</th><th>Meaning</th></tr>
+<tr><td>PV</td><td><code>Available</code></td><td>Free, not yet bound.</td></tr>
+<tr><td>PV</td><td><code>Bound</code></td><td>Bound to a claim (shown in CLAIM column).</td></tr>
+<tr><td>PV</td><td><code>Released</code></td><td>Claim deleted, policy Retain: data still there, but <strong>not reusable</strong> until you remove <code>spec.claimRef</code> (or delete and re-create the PV).</td></tr>
+<tr><td>PV</td><td><code>Failed</code></td><td>Automatic reclamation failed.</td></tr>
+<tr><td>PVC</td><td><code>Pending</code></td><td>No matching PV and no provisioner did anything — or WaitForFirstConsumer with no Pod yet.</td></tr>
+<tr><td>PVC</td><td><code>Bound</code></td><td>Ready to use.</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ kubectl get pv,pvc -A
+$ kubectl describe pvc data          # Events: "no persistent volumes available for this claim and no storage class is set" / "waiting for first consumer" / provisioner errors
+$ kubectl get sc                     # is there a default? does the class name match?
+$ kubectl describe pod db | grep -A5 Events   # FailedMount / FailedAttachVolume / "volume node affinity conflict"
+$ kubectl get volumeattachments      # CSI attach state
+$ kubectl patch pv pv-01 -p '{"spec":{"claimRef": null}}'   # make a Released PV Available again (data intact)</code></pre>
+<div class="callout warn"><div class="ct">Two objects, two lifetimes</div><p>Deleting a Pod never deletes its PVC. Deleting a PVC that a Pod still uses is <em>blocked</em> by a finalizer (<code>kubernetes.io/pvc-protection</code>) until the Pod is gone — the PVC shows <code>Terminating</code> meanwhile. Deleting a PVC with a <code>Delete</code>-policy PV deletes the backend disk: there is no undo. For anything you care about, use <code>Retain</code> and snapshots.</p></div>
+
+<div class="callout linux" data-ref="l04"><div class="ct">Under the hood · Linux</div><p>For a block-backed PV on a node: the CSI node plugin's <code>NodeStageVolume</code> finds the attached device (<code>/dev/nvme1n1</code>), formats it if blank (<code>mkfs.ext4</code>/<code>xfs</code>), and mounts it once at a <em>global</em> staging path <code>/var/lib/kubelet/plugins/kubernetes.io/csi/&lt;driver&gt;/&lt;hash&gt;/globalmount</code>. <code>NodePublishVolume</code> then <strong>bind-mounts</strong> that into <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/kubernetes.io~csi/&lt;pv&gt;/mount</code>, and the runtime bind-mounts <em>that</em> into the container. Three nested mounts, all visible in <code>findmnt</code> on the node. For NFS the "stage" is a network mount; for hostPath there is no stage at all — just one bind mount of the node path. RWO is enforced by the attach step (the cloud refuses to attach one disk to two VMs), not by the kernel.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Static flow to memorise: create PV (with <code>hostPath</code> in the exam), create PVC with matching size/mode/class, reference <code>persistentVolumeClaim.claimName</code> in the Pod. Verify <code>get pv,pvc</code> shows <code>Bound</code>.</li>
+<li>PVC Pending: compare <code>storageClassName</code> (a PV with no class only binds a PVC with <code>storageClassName: ""</code> or unset <em>and</em> no default class), access modes, and size.</li>
+<li>Reuse a Released PV: clear <code>spec.claimRef</code>.</li>
+<li>Expanding: edit the PVC, not the PV; the class must allow expansion.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash"># static: hostPath PV + PVC (KIND)
+$ cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: pv-manual}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath: {path: /tmp/pv-manual, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: claim-manual}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 500Mi}}
+  storageClassName: manual
+EOF
+$ kubectl get pv,pvc                              # both Bound; PV capacity 1Gi even though 500Mi was asked
+$ kubectl run w --image=busybox --command -- sh -c 'echo hi &gt; /data/f; sleep 3600' $do | sed '/spec:/a\  volumes: [{name: d, persistentVolumeClaim: {claimName: claim-manual}}]' | sed '/image: busybox/a\    volumeMounts: [{name: d, mountPath: /data}]' | kubectl apply -f -
+$ kubectl exec w -- cat /data/f
+$ kubectl delete pod w $now; kubectl delete pvc claim-manual; kubectl get pv     # Released
+$ kubectl patch pv pv-manual -p '{"spec":{"claimRef":null}}'; kubectl get pv       # Available again
+# dynamic: KIND's default class
+$ kubectl get sc
+$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: dyn}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+EOF
+$ kubectl get pvc dyn; kubectl describe pvc dyn | tail -3     # Pending: WaitForFirstConsumer
+$ kubectl run w2 --image=busybox --command -- sleep 3600 $do | sed '/spec:/a\  volumes: [{name: d, persistentVolumeClaim: {claimName: dyn}}]' | sed '/image: busybox/a\    volumeMounts: [{name: d, mountPath: /data}]' | kubectl apply -f -
+$ kubectl get pv,pvc                                            # a PV appeared and bound once the Pod was scheduled
+$ kubectl delete pod w2 $now; kubectl delete pvc dyn; kubectl get pv   # Delete policy: PV gone
+$ kubectl delete pv pv-manual</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>PV = supply (cluster-scoped), PVC = demand (namespaced), Pod references the PVC. Binding is exclusive, one-to-one, by size/modes/class.</li>
+<li>Access modes describe the backend; RWO block disks vs RWX file systems. Reclaim policy decides what happens to data after the claim is gone.</li>
+<li>StorageClass + provisioner = dynamic provisioning; use <code>WaitForFirstConsumer</code> on multi-zone clusters; expansion is one-way.</li>
+<li><code>hostPath</code> is node-local and unsafe for real data; <code>local</code> PVs with nodeAffinity are the proper node-disk option.</li>
+<li>Released PVs need <code>claimRef</code> cleared; PVCs in use are protected from deletion.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.zone('ns', 20, 20, 300, 280, 'namespace shop (developer)')
+    + S.zone('cl', 400, 20, 300, 280, 'cluster scope (admin / provisioner)')
+    + S.box('pvc', 50, 70, 240, 70, ['PVC data', '10Gi · RWO · class fast-ssd', 'phase: Pending'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('pod', 50, 200, 240, 60, ['Pod db', 'volumes: persistentVolumeClaim: data'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('sc', 430, 60, 240, 60, ['StorageClass fast-ssd', 'provisioner: ebs.csi.aws.com', 'WaitForFirstConsumer'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('pv', 430, 160, 240, 70, ['PV pvc-8f3a…', '10Gi · RWO · zone eu-west-1b', 'phase: Bound'], { subfs: 9, subcls: 'mono muted', cls: 'ok', hidden: true })
+    + S.icon('disk', 550, 268, 'db', { label: 'EBS vol-0abc (gp3)', ly: 26, hidden: true })
+    + S.arrow('a1', 290, 105, 428, 90, { d: 'M 290 105 L 428 92', cls: 'hid', label: 'names class', ly: 86 })
+    + S.arrow('a2', 550, 120, 550, 158, { cls: 'hid', label: 'CreateVolume', lx: 605 })
+    + S.arrow('a3', 428, 195, 290, 120, { d: 'M 428 195 L 292 122', cls: 'hid', label: 'bind', lx: 340, ly: 150 })
+    + S.arrow('a4', 170, 200, 170, 142, { cls: 'hid' })
+    + S.arrow('a5', 550, 232, 550, 250, { cls: 'hid' });
+  Anim.define('pv-pvc', { w: 720, h: 310, title: 'PVC → StorageClass → PV → disk', ms: 2800, svg, steps: [
+    { c: 'A developer creates a <b>PVC</b>: "10 Gi, ReadWriteOnce, class fast-ssd". No PV matches; the claim is <b>Pending</b>. Nothing else exists yet.', on(q){ q('#pvc rect').set('warn'); } },
+    { c: 'The claim names a <b>StorageClass</b> with <code>WaitForFirstConsumer</code>, so the provisioner deliberately waits — it does not yet know which zone the Pod will run in.', on(q){ q('#a1').show().set('hl'); q('#sc rect').set('pur'); q('#pvc text:nth-of-type(3)').text('phase: Pending (waiting for first consumer)'); } },
+    { c: 'A Pod referencing the claim is created and <b>scheduled</b> to a node in zone eu-west-1b. Now the provisioner knows where the disk must live.', on(q){ q('#pod').show(); q('#a4').show().set('hl'); } },
+    { c: 'The CSI external-provisioner calls <code>CreateVolume</code>: a real EBS volume is created in eu-west-1b, and a <b>PV</b> object describing it is written to the API.', on(q){ q('#a2').show().set('hl'); q('#pv').show(); q('#a5').show(); q('#disk').show(); } },
+    { c: 'The PV is <b>bound</b> to the PVC (each records the other). The PVC is Bound; the kubelet attaches, formats and mounts the disk into the Pod.', on(q){ q('#a3').show().set('ok'); q('#pvc rect').set('ok'); q('#pvc text:nth-of-type(3)').text('phase: Bound → pvc-8f3a…'); q('#pod rect').set('ok'); } },
+    { c: 'Delete the Pod: PVC and PV stay, data intact — a new Pod can claim it. Delete the PVC: with <code>reclaimPolicy: Delete</code> the PV <i>and the EBS volume</i> are destroyed; with <code>Retain</code> the PV goes to Released and the disk survives.', on(q){ q('#pod').add('hid'); q('#a4').add('hid'); q('#pv text:nth-of-type(3)').text('phase: Bound (pod gone, data kept)'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

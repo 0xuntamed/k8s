@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 44 · StatefulSets · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d44" data-root="../" data-related="d10,d12,d27,d48">
+<article class="lesson">
+<p class="lead">A Deployment's Pods are interchangeable: random names, any order, shared nothing. A database replica is not: it has a role (primary or follower), a disk that must follow it, and peers that address it by name. A <strong>StatefulSet</strong> gives each Pod a <em>stable identity</em> — an ordinal name, a DNS entry, and its own PersistentVolumeClaim — and creates, updates and deletes them in order. This lesson builds one, shows what "stable" means in practice, and runs through the course's multi-AZ pattern on EKS.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>What stable identity means: name, network, storage — and why a headless Service is required</li>
+<li><code>volumeClaimTemplates</code>: one PVC per Pod, kept across restarts and scale-downs</li>
+<li>Ordered creation, deletion and rolling updates; <code>podManagementPolicy</code>, <code>partition</code>, <code>OnDelete</code></li>
+<li>The multi-AZ pattern: WaitForFirstConsumer classes and topology spread</li>
+<li>Operational realities: scaling down does not delete PVCs, updates are not automatic on failure, and when to use an operator instead</li>
+</ul></div>
+
+<h2>Three kinds of stability</h2>
+<figure data-anim="sts-identity"></figure>
+<div class="tbl-wrap"><table>
+<tr><th></th><th>Deployment</th><th>StatefulSet</th></tr>
+<tr><td>Pod names</td><td><code>web-7d9f8-x4k2p</code> (random)</td><td><code>db-0</code>, <code>db-1</code>, <code>db-2</code> (ordinal, reused after restart)</td></tr>
+<tr><td>DNS</td><td>Only the Service name</td><td><code>db-0.db.ns.svc.cluster.local</code> per Pod via a headless Service</td></tr>
+<tr><td>Storage</td><td>Shared PVC (if any) — all Pods mount the same one</td><td>One PVC per Pod from <code>volumeClaimTemplates</code>; <code>db-1</code> always gets <code>data-db-1</code></td></tr>
+<tr><td>Start/stop order</td><td>All at once</td><td>0, 1, 2… on create; 2, 1, 0 on delete; each waits for the previous to be Ready</td></tr>
+<tr><td>Update</td><td>Surge + roll</td><td>In-place, one at a time, reverse ordinal, no surge</td></tr>
+<tr><td>Use</td><td>Stateless services</td><td>Databases, queues, consensus systems, anything with per-instance disk or identity</td></tr>
+</table></div>
+
+<h2>The manifest</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: db                       # the "serviceName" below
+spec:
+  clusterIP: None                # HEADLESS: DNS returns pod IPs, per-pod records
+  selector: {app: db}
+  ports: [{name: pg, port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db                # governs the per-pod DNS names
+  replicas: 3
+  selector:
+    matchLabels: {app: db}
+  podManagementPolicy: OrderedReady   # or Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0               # only ordinals ≥ partition are updated
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain          # or Delete
+    whenScaled: Retain
+  template:
+    metadata:
+      labels: {app: db}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: postgres
+        image: postgres:16
+        ports: [{containerPort: 5432, name: pg}]
+        env:
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:          # a PVC "stamp": data-db-0, data-db-1, data-db-2
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: gp3-wffc
+      resources: {requests: {storage: 20Gi}}</code></pre>
+<ul class="notes">
+<li><b>Headless Service</b> — <code>clusterIP: None</code>. Required. It creates the DNS records <code>db-0.db</code>, <code>db-1.db</code>… A second, normal Service can exist for load-balanced reads.</li>
+<li><b>serviceName</b> — ties Pods to that headless Service for DNS.</li>
+<li><b>podManagementPolicy</b> — <code>OrderedReady</code> (default): strictly sequential; <code>Parallel</code>: create/delete all at once (identity and PVCs still stable — good for systems that do their own coordination, like Cassandra/Elasticsearch).</li>
+<li><b>partition</b> — canary control: with 3 replicas and <code>partition: 2</code>, only <code>db-2</code> gets the new template. Lower it to roll further.</li>
+<li><b>persistentVolumeClaimRetentionPolicy</b> — since 1.27 (GA 1.32): whether PVCs are deleted when the StatefulSet is deleted or scaled down. Default keeps them (data safety).</li>
+<li><b>volumeClaimTemplates</b> — a PVC spec; the controller creates <code>&lt;template&gt;-&lt;sts&gt;-&lt;ordinal&gt;</code> for each Pod on first creation and re-attaches the same one forever after.</li>
+<li>Pods also carry the label <code>statefulset.kubernetes.io/pod-name: db-1</code> — handy for a Service that targets one specific Pod.</li>
+</ul>
+</div>
+
+<h2>Ordered lifecycle</h2>
+<pre><code class="lang-bash">$ kubectl apply -f db.yaml && kubectl get pods -l app=db -w
+db-0  0/1  Pending → ContainerCreating → Running (1/1)
+db-1  0/1  …                         # created only after db-0 is Ready
+db-2  0/1  …
+$ kubectl get pvc                    # data-db-0, data-db-1, data-db-2 — Bound
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup db-1.db.default.svc.cluster.local   # a single pod IP
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup db                                  # all three
+$ kubectl delete pod db-1            # comes back as db-1, same PVC, same DNS name, possibly on another node
+$ kubectl scale sts db --replicas=2  # db-2 removed (highest ordinal first); data-db-2 PVC REMAINS
+$ kubectl scale sts db --replicas=3  # db-2 returns and re-attaches data-db-2 — its old data is there</code></pre>
+<figure data-anim="sts-rollout"></figure>
+<pre><code class="lang-bash">$ kubectl set image sts/db postgres=postgres:16.4        # rolling update: db-2, then db-1, then db-0, each waiting for Ready
+$ kubectl rollout status sts/db
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":2}}}}'   # canary: only db-2 updates
+$ kubectl rollout history sts/db; kubectl rollout undo sts/db</code></pre>
+<div class="callout warn"><div class="ct">Things that surprise people</div><ul>
+<li>A stuck Pod (e.g. <code>db-1</code> CrashLoopBackOff) <strong>blocks</strong> the ordered rollout and any scale-up beyond it. Fix it, or delete it so the controller re-creates it with the current template.</li>
+<li>Scaling down never deletes PVCs (unless the retention policy says so). Leftover claims cost money and hold data — decide deliberately.</li>
+<li>Deleting the StatefulSet with <code>--cascade=orphan</code> leaves Pods running — the way to migrate or re-create the controller object without downtime.</li>
+<li>A StatefulSet gives you identity, not replication. Postgres does not know <code>db-1</code> should follow <code>db-0</code>; that is application configuration, or an operator's job (CloudNativePG, Zalando, Percona).</li>
+</ul></div>
+
+<h2>The multi-AZ pattern (EKS demo)</h2>
+<p>Three replicas should sit in three availability zones with their disks. Two things make that work: a StorageClass with <code>WaitForFirstConsumer</code> so each EBS volume is created in the zone of the Pod that will use it (<a href="d27-persistent-volumes.html">Day 27</a>), and a topology spread constraint so the Pods themselves are spread (<a href="d18-taints-vs-affinity.html">Day 18</a>). Once <code>data-db-1</code> exists in <code>eu-west-1b</code>, <code>db-1</code> is pinned to that zone forever — the PV's node affinity does that automatically.</p>
+<pre><code class="lang-yaml">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: gp3-wffc}
+provisioner: ebs.csi.aws.com
+parameters: {type: gp3, encrypted: "true"}
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+# in the StatefulSet's pod template:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector: {matchLabels: {app: db}}</code></pre>
+<pre><code class="lang-bash">$ kubectl get pods -l app=db -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
+$ kubectl get pv -o custom-columns=NAME:.metadata.name,CLAIM:.spec.claimRef.name,ZONE:.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]
+$ kubectl get nodes -L topology.kubernetes.io/zone</code></pre>
+<p>Lose a zone and <code>db-1</code> stays Pending until that zone returns — its disk is there. That is correct behaviour for a database: the alternative (a fresh empty disk elsewhere) would be data loss. Cross-zone failover is the application's or operator's job (promote <code>db-2</code>), not the scheduler's.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>There is no <code>kubectl create statefulset</code>. Generate a Deployment, change <code>kind</code>, add <code>serviceName</code>, replace <code>strategy</code> with <code>updateStrategy</code>, add <code>volumeClaimTemplates</code>. And create the headless Service.</li>
+<li>Pods stuck at <code>db-0</code> Pending: usually the PVC — no StorageClass, or WaitForFirstConsumer with an unschedulable Pod. <code>describe pvc</code>.</li>
+<li>Know the DNS shape: <code>&lt;pod&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code>.</li>
+<li>Deleting a StatefulSet does not delete its PVCs by default.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl apply -f - &lt;&lt;EOF
+apiVersion: v1
+kind: Service
+metadata: {name: web}
+spec: {clusterIP: None, selector: {app: web}, ports: [{port: 80}]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: web}
+spec:
+  serviceName: web
+  replicas: 3
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.26
+        command: ['sh','-c','echo "$(hostname) $(date)" &gt;&gt; /usr/share/nginx/html/index.html; exec nginx -g "daemon off;"']
+        volumeMounts: [{name: www, mountPath: /usr/share/nginx/html}]
+  volumeClaimTemplates:
+  - metadata: {name: www}
+    spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 100Mi}}}
+EOF
+$ kubectl get pods -l app=web -w                                  # ordered creation
+$ kubectl get pvc
+$ kubectl run t --rm -it --image=busybox:1.36 -- sh -c 'nslookup web-1.web; wget -qO- web-1.web'
+$ kubectl delete pod web-1 && sleep 15 && kubectl exec web-1 -- cat /usr/share/nginx/html/index.html   # two lines: same PVC
+$ kubectl scale sts web --replicas=1; kubectl get pods,pvc         # web-2, web-1 gone; PVCs stay
+$ kubectl scale sts web --replicas=3; kubectl exec web-2 -- cat /usr/share/nginx/html/index.html      # old data back
+$ kubectl set image sts/web nginx=nginx:1.27 && kubectl get pods -l app=web -w                        # 2 → 1 → 0
+$ kubectl delete sts web; kubectl delete svc web; kubectl delete pvc -l app=web</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>StatefulSet = stable ordinal names, per-Pod DNS via a headless Service, per-Pod PVCs via volumeClaimTemplates.</li>
+<li>Ordered create (0→N, wait Ready), delete (N→0), rolling update (N→0, one at a time, <code>partition</code> for canaries).</li>
+<li>Restart or reschedule keeps name and PVC; scale-down keeps PVCs unless the retention policy says otherwise.</li>
+<li>Multi-AZ: WaitForFirstConsumer storage + topology spread; a Pod follows its disk's zone.</li>
+<li>Identity is not replication — use an operator for real database HA.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.box('svc', 260, 20, 200, 44, ['Service db (headless)', 'clusterIP: None'], { subfs: 9, subcls: 'mono muted', cls: 'cy' });
+  [0, 1, 2].forEach(i => { const x = 60 + i * 220; s1 += S.node(`n${i}`, x, 100, 180, 190, `zone ${['a','b','c'][i]}`, { sub: '' }) + S.pod(`p${i}`, x + 90, 160, `db-${i}`, { cls: 'ok', w: 70, sub: `db-${i}.db.ns.svc` }) + S.box(`v${i}`, x + 40, 220, 100, 40, [`PVC data-db-${i}`, '20Gi in zone ' + ['a','b','c'][i]], { subfs: 8, subcls: 'mono muted', cls: 'warn' }) + S.arrow(`m${i}`, x + 90, 175, x + 90, 218, { cls: 'ok' }); });
+  s1 += S.text('m', 360, 305, '', { cls: 'sm b' });
+  Anim.define('sts-identity', { w: 720, h: 320, title: 'Stable name, DNS and disk', ms: 2800, svg: s1, steps: [
+    { c: 'Three replicas, each with a fixed ordinal name, its own DNS record under the headless Service, and its own PVC — provisioned in the zone where the Pod first ran.', on(q){} },
+    { c: '<code>db-1</code> dies (node failure). Its PVC and DNS record stay. The controller creates a Pod with the <b>same name</b>, which must land where its disk is — zone b — and re-attaches the same volume.', on(q){ q('#p1').add('hid'); q('#n1 rect').set('bad'); q('#m').text('db-1 gone; data-db-1 and db-1.db remain'); } },
+    { c: 'Back: same identity, same data, same address. Peers that were configured with <code>db-1.db</code> reconnect without any change.', on(q){ q('#p1').show(); q('#n1 rect').set(); q('#p1 rect').set('hl'); q('#m').text('db-1 is back — identical identity'); } },
+    { c: 'Scale down to 2: <code>db-2</code> (highest ordinal) is removed. Its PVC is <b>kept</b> by default — the data is not lost, and scaling back up re-attaches it.', on(q){ q('#p2').add('hid'); q('#m2').add('hid'); q('#v2 rect').set('warn'); q('#m').text('scale 3 → 2: pod removed, PVC data-db-2 retained'); } },
+    { c: 'Contrast with a Deployment: random names, no per-Pod DNS, and any PVC is shared by all replicas. That is fine for stateless web tiers and wrong for anything that owns data.', on(q){ q('#p2').show(); q('#m2').rm('hid'); q('#m').text('identity + ordering + storage = StatefulSet'); } },
+  ]});
+
+  let s2 = S.box('sts', 20, 20, 300, 50, ['StatefulSet db · replicas 3', 'image: postgres:16.3 → 16.4'], { subfs: 9, subcls: 'mono muted' })
+    + S.text('pt', 520, 48, 'partition: 0', { cls: 'sm mono muted' });
+  [0, 1, 2].forEach(i => s2 += S.pod(`p${i}`, 130 + i * 200, 140, `db-${i}`, { cls: 'ok', w: 80, sub: '16.3' }));
+  s2 += S.text('m', 360, 220, '', { cls: 'sm b' });
+  Anim.define('sts-rollout', { w: 720, h: 240, title: 'Ordered rolling update', ms: 2400, svg: s2, steps: [
+    { c: 'You change the image. Unlike a Deployment there is no surge: the controller updates <b>in place, in reverse ordinal order</b>.', on(q){} },
+    { c: '<code>db-2</code> first: terminated, re-created with the new template, wait until Ready. db-0 and db-1 keep serving.', on(q){ q('#p2 rect').set('warn'); q('#p2 text:nth-of-type(2)').text('16.4'); q('#m').text('db-2 → 16.4'); } },
+    { c: 'Then <code>db-1</code>. If db-1 fails to become Ready, the rollout <b>stops here</b> — db-0 is never touched. That is deliberate: the lowest ordinal is usually the primary.', on(q){ q('#p2 rect').set('ok'); q('#p1 rect').set('warn'); q('#p1 text:nth-of-type(2)').text('16.4'); q('#m').text('db-1 → 16.4 (a failure here halts the rollout)'); } },
+    { c: 'Finally <code>db-0</code>. Done: three Pods, same names, same PVCs, new image.', on(q){ q('#p1 rect').set('ok'); q('#p0 rect').set('warn'); q('#p0 text:nth-of-type(2)').text('16.4'); q('#m').text('db-0 → 16.4 · rollout complete'); } },
+    { c: 'With <code>partition: 2</code> only ordinals ≥ 2 would have been updated — a canary on db-2 while 0 and 1 stay on 16.3. Lower the partition to continue.', on(q){ q('#p0 rect').set('ok'); q('#pt').text('partition: 2 → only db-2'); q('#p0 text:nth-of-type(2)').text('16.3'); q('#p1 text:nth-of-type(2)').text('16.3'); q('#p1 rect,#p0 rect').set('gray'); q('#m').text('canary via partition'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

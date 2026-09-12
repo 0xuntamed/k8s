@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Glossary · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<script src="js/theme.js"></script>
+<style>
+.gl-filter{width:100%;font:inherit;font-size:1rem;padding:.7rem 1rem;border:1px solid var(--border2);border-radius:10px;background:var(--surface);color:var(--text);margin:1rem 0 .5rem}
+.gl-filter:focus{outline:none;border-color:var(--accent)}
+.gl-letters{display:flex;flex-wrap:wrap;gap:.3rem;margin:.4rem 0 1.4rem}
+.gl-letters a{width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:6px;font-size:.8rem;font-weight:600;color:var(--text2)}
+.gl-letters a:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
+.gl dl{margin:0}
+.gl h2{font-size:1rem;color:var(--muted);margin:1.6rem 0 .4rem;padding-bottom:.3rem;border-bottom:1px solid var(--border)}
+.gl .t{padding:.55rem 0;border-bottom:1px solid color-mix(in srgb,var(--border) 60%,transparent)}
+.gl .t.hide,.gl h2.hide{display:none}
+.gl dt{font-weight:700;display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
+.gl dt .k{font-size:.72rem;font-weight:500;color:var(--muted)}
+.gl dt a{font-size:.72rem;font-weight:500}
+.gl dd{margin:.15rem 0 0;color:var(--text2);font-size:.92rem}
+.gl-count{font-size:.8rem;color:var(--muted)}
+</style>
+</head>
+<body data-page="glossary" data-root="">
+<article class="gl">
+<h1>Glossary</h1>
+<p class="lead">Every term used across the course, in one or two sentences, with the lesson that explains it. Filter as you type.</p>
+<input class="gl-filter" id="f" type="search" placeholder="Filter terms…" autocomplete="off">
+<div class="gl-count" id="cnt"></div>
+<div class="gl-letters" id="letters"></div>
+<div id="list"></div>
+</article>
+
+<script src="js/curriculum.js"></script>
+<script src="js/anim.js"></script>
+<script src="js/app.js"></script>
+<script>
+(function(){
+  // [term, definition, lesson-id or null, kind]
+  const T = [
+    ['Admission controller', 'Code in the API server that runs after authorization on writes; mutating plugins/webhooks change the object, validating ones accept or reject it.', 'd38', 'k8s'],
+    ['Affinity (node / pod)', 'Scheduling rules that attract a Pod to nodes with certain labels (node affinity) or to/away from Pods with certain labels within a topology (pod affinity / anti-affinity).', 'd17', 'k8s'],
+    ['Aggregated API', 'An extension API server registered via APIService, proxied by kube-apiserver; metrics-server is one.', 'd39', 'k8s'],
+    ['Annotation', 'Free-form key/value metadata on an object, for tools and humans; never used for selection.', 'd09', 'k8s'],
+    ['API group / version', 'The namespace of a resource type in the API path: core ("" → /api/v1), apps/v1, batch/v1, networking.k8s.io/v1…', 'd35', 'k8s'],
+    ['API server (kube-apiserver)', 'The control-plane front door: authenticates, authorizes, admits, validates and persists every request; the only component that talks to etcd.', 'd07', 'k8s'],
+    ['AppArmor', 'A path-based Linux mandatory-access-control system; profiles restrict what files/capabilities a program may use.', 'l06', 'linux'],
+    ['Argo CD', 'A GitOps controller: an Application CR points at a git path; Argo continuously syncs the cluster to it.', 'd60', 'eco'],
+    ['Authentication', 'Establishing who a request is from: client certificates, bearer tokens (ServiceAccount, OIDC, static), webhooks, proxies.', 'd37', 'k8s'],
+    ['Authorization', 'Deciding whether an authenticated identity may perform a verb on a resource; modes: Node, RBAC, ABAC, Webhook.', 'd35', 'k8s'],
+    ['Bind mount', 'Mounting an existing directory at a second path; the mechanism behind hostPath and every volumeMount.', 'l04', 'linux'],
+    ['Binding', 'The API object the scheduler creates to set a Pod\'s spec.nodeName.', 'd15', 'k8s'],
+    ['Bootstrap token', 'A short-lived token (kube-system Secret) that lets kubeadm join fetch the CA and request a kubelet certificate.', 'd54', 'k8s'],
+    ['Bridge (Linux)', 'A virtual L2 switch (docker0, cni0/br0) that veth pairs plug into.', 'l05', 'linux'],
+    ['Capability (Linux)', 'One of ~41 pieces of root\'s privilege (NET_BIND_SERVICE, SYS_ADMIN…), granted or dropped per process.', 'l06', 'linux'],
+    ['cAdvisor', 'The container metrics collector built into the kubelet; source of CPU/memory usage for metrics-server and Prometheus.', 'd56', 'k8s'],
+    ['Certificate (X.509)', 'A public key plus identity (CN, SANs), validity dates and usages, signed by a CA.', 'd31', 'tls'],
+    ['Certificate Authority (CA)', 'A key pair whose certificate is trusted as an anchor; it signs other certificates. kubeadm creates a cluster CA, an etcd CA and a front-proxy CA.', 'd31', 'tls'],
+    ['CertificateSigningRequest (CSR)', 'An API object carrying a PKCS#10 CSR for approval and signing by a cluster signer.', 'd34', 'k8s'],
+    ['cgroup (control group)', 'A kernel mechanism that limits and accounts CPU, memory, PIDs and I/O for a group of processes; the basis of requests/limits.', 'l03', 'linux'],
+    ['cgroup driver', 'Who creates cgroups for containers: systemd or cgroupfs. kubelet and runtime must agree.', 'd54', 'k8s'],
+    ['ClusterIP', 'The default Service type: a virtual IP reachable inside the cluster, implemented by kube-proxy.', 'd12', 'k8s'],
+    ['ClusterRole / ClusterRoleBinding', 'Cluster-scoped RBAC rules and the binding that grants them across all namespaces (or, via a RoleBinding, within one).', 'd36', 'k8s'],
+    ['CNI (Container Network Interface)', 'The plugin interface (binaries in /opt/cni/bin, config in /etc/cni/net.d) that gives a Pod an IP and wires its network.', 'd25', 'k8s'],
+    ['ConfigMap', 'Key/value configuration injected into Pods as environment variables or files.', 'd28', 'k8s'],
+    ['conntrack', 'The netfilter connection-tracking table that remembers NAT decisions per flow so replies are un-NATed.', 'l05', 'linux'],
+    ['Container', 'A process (tree) running in its own namespaces and cgroup on a layered root filesystem from an image.', 'd01', 'k8s'],
+    ['containerd', 'The CRI container runtime the kubelet talks to; drives runc.', 'd01', 'k8s'],
+    ['Context (kubeconfig)', 'A named (cluster, user, namespace) triple that kubectl uses.', 'd08', 'k8s'],
+    ['Control plane', 'kube-apiserver, etcd, kube-scheduler, kube-controller-manager (and cloud-controller-manager).', 'd07', 'k8s'],
+    ['Controller', 'A loop that watches objects, compares desired with actual state, and acts to converge them.', 'd06', 'k8s'],
+    ['Copy-up', 'OverlayFS behaviour: the first write to a lower-layer file copies it whole into the upper layer.', 'l04', 'linux'],
+    ['CoreDNS', 'The cluster DNS server (Service kube-dns), answering cluster.local names from its watch of Services and Pods.', 'd48', 'k8s'],
+    ['CRD (CustomResourceDefinition)', 'An object that defines a new resource type served by the API server, with a schema.', 'd39', 'k8s'],
+    ['CRI (Container Runtime Interface)', 'The gRPC API between the kubelet and a runtime (containerd, CRI-O); crictl is its CLI.', 'd25', 'k8s'],
+    ['CronJob', 'Creates Jobs on a cron schedule.', 'd29', 'k8s'],
+    ['DaemonSet', 'Runs one Pod per (matching) node.', 'd29', 'k8s'],
+    ['Deployment', 'Manages ReplicaSets to provide rolling updates and rollbacks for stateless Pods.', 'd10', 'k8s'],
+    ['DNAT', 'Destination NAT: rewriting a packet\'s destination address/port; how Service VIPs reach Pods.', 'l05', 'linux'],
+    ['Downward API', 'Exposes a Pod\'s own metadata and resources to its containers as env vars or files.', 'd26', 'k8s'],
+    ['Drain', 'kubectl drain: cordon a node and evict its Pods (respecting PDBs) for maintenance.', 'd55', 'k8s'],
+    ['emptyDir', 'A per-Pod scratch volume that lives as long as the Pod is on the node; optionally tmpfs.', 'd26', 'k8s'],
+    ['EndpointSlice', 'The object listing the ready IPs behind a Service; consumed by kube-proxy and ingress controllers.', 'd12', 'k8s'],
+    ['Ephemeral container', 'A container added to a running Pod for debugging (kubectl debug).', 'd21', 'k8s'],
+    ['etcd', 'The distributed key-value store holding all cluster state; only the API server reads/writes it.', 'd07', 'k8s'],
+    ['Eviction', 'Removal of a Pod from a node by the kubelet (pressure), the scheduler (preemption), or the Eviction API (drain).', 'd19', 'k8s'],
+    ['ExternalName', 'A Service type that is just a DNS CNAME to an external hostname.', 'd12', 'k8s'],
+    ['Finalizer', 'A marker on an object that blocks its deletion until a controller removes it after cleanup.', 'd40', 'k8s'],
+    ['fsGroup', 'A Pod securityContext field: volumes are chowned to this GID and the process gets it as a supplementary group.', 'd41', 'k8s'],
+    ['Gateway API', 'The successor to Ingress: GatewayClass (implementation), Gateway (listeners, owned by platform), HTTPRoute (rules, owned by apps).', 'd52', 'k8s'],
+    ['GitOps', 'Git is the source of truth for cluster state; a controller reconciles the cluster to it.', 'd60', 'eco'],
+    ['Headless Service', 'A Service with clusterIP: None; DNS returns Pod IPs directly; gives StatefulSet Pods stable names.', 'd12', 'k8s'],
+    ['Helm', 'The package manager: charts (templates + values) installed as releases with revisions and rollback.', 'd43', 'eco'],
+    ['hostPath', 'A volume mounting a directory of the node the Pod runs on.', 'd27', 'k8s'],
+    ['HPA (HorizontalPodAutoscaler)', 'Scales replicas based on metrics (CPU/memory utilisation vs request, or custom metrics).', 'd20', 'k8s'],
+    ['Image', 'A read-only stack of filesystem layers plus metadata (entrypoint, env, ports), stored in a registry.', 'd01', 'k8s'],
+    ['imagePullPolicy', 'Always / IfNotPresent / Never; defaults to Always for :latest, else IfNotPresent.', 'd22', 'k8s'],
+    ['imagePullSecrets', 'A reference to a dockerconfigjson Secret so the kubelet can pull from a private registry.', 'd45', 'k8s'],
+    ['Ingress', 'L7 routing rules (host/path → Service) implemented by an Ingress controller; one LB for many Services.', 'd49', 'k8s'],
+    ['Init container', 'A container that runs to completion before app containers start; sequential.', 'd21', 'k8s'],
+    ['iptables / nftables', 'The Linux packet-filter and NAT framework; kube-proxy and CNIs program it.', 'l05', 'linux'],
+    ['IPVS', 'An in-kernel L4 load balancer; an alternative kube-proxy mode.', 'd12', 'k8s'],
+    ['IRSA', 'IAM Roles for Service Accounts (AWS): exchange a projected SA token for cloud credentials.', 'd50', 'eco'],
+    ['Job', 'Runs Pods to completion with retries; completions and parallelism.', 'd29', 'k8s'],
+    ['journald', 'systemd\'s log store; journalctl -u kubelet reads the kubelet\'s logs.', 'l07', 'linux'],
+    ['JSONPath', 'kubectl\'s template language for picking fields: -o jsonpath=\'{.items[*].metadata.name}\'.', 'd59', 'k8s'],
+    ['JWT', 'A signed JSON token; ServiceAccount tokens are JWTs signed with sa.key.', 'd37', 'tls'],
+    ['KIND', 'Kubernetes in Docker: a real cluster whose nodes are containers.', 'd08', 'eco'],
+    ['kubeadm', 'The tool that bootstraps (init/join), upgrades and renews certificates for a cluster.', 'd54', 'k8s'],
+    ['kubeconfig', 'The file with clusters (server + CA), users (credentials) and contexts that kubectl uses.', 'd32', 'k8s'],
+    ['kube-controller-manager', 'The binary running the built-in controllers (Deployment, ReplicaSet, Node, Job, EndpointSlice…).', 'd07', 'k8s'],
+    ['kubelet', 'The node agent (a systemd service) that runs Pods assigned to its node via the CRI and reports status.', 'd07', 'k8s'],
+    ['kube-proxy', 'The DaemonSet that programs iptables/IPVS rules implementing Services on every node.', 'd12', 'k8s'],
+    ['kube-scheduler', 'Assigns unscheduled Pods to nodes by filtering and scoring.', 'd18', 'k8s'],
+    ['Kustomize', 'Overlays that patch plain YAML bases without templating; kubectl apply -k.', 'd42', 'eco'],
+    ['Label / selector', 'Key/value tags on objects and the expressions (matchLabels, matchExpressions) that select them; the glue between Services, controllers and Pods.', 'd09', 'k8s'],
+    ['Layer', 'One filesystem diff in an image, produced by a Dockerfile instruction; shared between images and containers.', 'd02', 'k8s'],
+    ['Lease', 'An object used for leader election and node heartbeats (kube-node-lease).', 'd14', 'k8s'],
+    ['LimitRange', 'Per-namespace defaults and bounds for container/Pod/PVC resources, applied at admission.', 'd19', 'k8s'],
+    ['Liveness / readiness / startup probe', 'Kubelet health checks: liveness restarts, readiness gates traffic, startup delays the others.', 'd23', 'k8s'],
+    ['LoadBalancer (Service)', 'A Service type that asks the cloud for an external load balancer in front of a NodePort.', 'd12', 'k8s'],
+    ['MASQUERADE / SNAT', 'Source NAT to the outgoing interface\'s IP; Pod → internet traffic.', 'l05', 'linux'],
+    ['metrics-server', 'Serves current CPU/memory per Pod/node (metrics.k8s.io) for kubectl top and the HPA.', 'd20', 'k8s'],
+    ['Mirror Pod', 'The read-only API representation of a static Pod, named <pod>-<node>.', 'd15', 'k8s'],
+    ['mTLS', 'Mutual TLS: both sides present certificates; how every component authenticates to the API server.', 'd32', 'tls'],
+    ['Multi-stage build', 'A Dockerfile with several FROM stages; only the last is shipped.', 'd05', 'k8s'],
+    ['Namespace (Kubernetes)', 'A partition of the API for namespaced objects; unit for RBAC, quotas and NetworkPolicies.', 'd14', 'k8s'],
+    ['Namespace (Linux)', 'Kernel isolation of a global resource (pid, net, mnt, uts, ipc, user, cgroup) for a process group.', 'l02', 'linux'],
+    ['ndots', 'resolv.conf option: names with fewer dots are tried with the search list first; Kubernetes sets 5.', 'l08', 'linux'],
+    ['NetworkPolicy', 'Pod-level firewall rules (ingress/egress allow lists) enforced by the CNI.', 'd47', 'k8s'],
+    ['Node', 'A machine (VM or physical) running kubelet, a runtime, kube-proxy and a CNI, registered in the API.', 'd07', 'k8s'],
+    ['NodePort', 'A Service type exposing a port (30000–32767) on every node that forwards to the Service.', 'd12', 'k8s'],
+    ['no_new_privs', 'A process flag that prevents execve from granting more privilege (setuid, file caps).', 'l06', 'linux'],
+    ['OIDC', 'OpenID Connect: an external identity provider issues ID tokens the API server accepts as user credentials.', 'd37', 'tls'],
+    ['OOMKilled', 'A container killed by the kernel OOM killer for exceeding its memory limit; exit code 137.', 'd19', 'k8s'],
+    ['Operator', 'A CRD plus a controller that manages an application\'s lifecycle the way a human operator would.', 'd40', 'k8s'],
+    ['OverlayFS', 'A union filesystem stacking read-only lower dirs with one writable upper dir; how images become root filesystems.', 'l04', 'linux'],
+    ['ownerReference', 'Metadata linking a child object to its owner; enables garbage collection.', 'd40', 'k8s'],
+    ['Pause container', 'The infrastructure container that holds a Pod\'s shared namespaces.', 'd21', 'k8s'],
+    ['PID 1', 'The first process in a PID namespace: ignores unhandled signals, must reap orphans, ends the namespace when it exits.', 'l01', 'linux'],
+    ['Pod', 'One or more containers sharing network and IPC namespaces and volumes, scheduled together.', 'd07', 'k8s'],
+    ['PodDisruptionBudget (PDB)', 'Limits voluntary disruptions (drain, eviction API) to keep a minimum of Pods available.', 'd55', 'k8s'],
+    ['Pod Security Admission / Standards', 'Built-in enforcement of privileged / baseline / restricted profiles per namespace via labels.', 'd41', 'k8s'],
+    ['Preemption', 'The scheduler evicting lower-priority Pods to make room for a higher-priority one.', 'd46', 'k8s'],
+    ['PriorityClass', 'A named priority value assigned to Pods; affects queue order, preemption and eviction.', 'd46', 'k8s'],
+    ['Projected volume', 'One volume combining ConfigMaps, Secrets, downward API and SA tokens.', 'd26', 'k8s'],
+    ['Prometheus', 'A pull-based metrics database scraping /metrics endpoints; the de facto monitoring stack.', 'd56', 'eco'],
+    ['PV / PVC / StorageClass', 'PersistentVolume (supply, cluster-scoped), PersistentVolumeClaim (demand, namespaced), StorageClass (dynamic provisioner).', 'd27', 'k8s'],
+    ['QoS class', 'Guaranteed / Burstable / BestEffort, derived from requests and limits; decides eviction order.', 'd19', 'k8s'],
+    ['RBAC', 'Role-Based Access Control: Roles/ClusterRoles (rules) bound to subjects by RoleBindings/ClusterRoleBindings; additive.', 'd36', 'k8s'],
+    ['Reconcile', 'One iteration of a controller: read desired, read actual, act, report.', 'd40', 'k8s'],
+    ['ReferenceGrant', 'Gateway API object letting routes/Gateways reference objects in another namespace.', 'd52', 'k8s'],
+    ['Registry', 'A server storing images (Docker Hub, GHCR, ECR…); nodes pull from it by name.', 'd02', 'k8s'],
+    ['ReplicaSet', 'Keeps N Pods matching a selector alive from a template.', 'd10', 'k8s'],
+    ['Requests / limits', 'Requests: scheduling and guaranteed share (cpu.weight). Limits: hard ceilings (cpu.max, memory.max).', 'd19', 'k8s'],
+    ['ResourceQuota', 'Per-namespace caps on total requests/limits/object counts.', 'd14', 'k8s'],
+    ['restartPolicy', 'Always / OnFailure / Never — how the kubelet treats exited containers.', 'd22', 'k8s'],
+    ['Rolling update', 'Replacing Pods gradually via a new ReplicaSet, bounded by maxSurge/maxUnavailable.', 'd10', 'k8s'],
+    ['runc', 'The reference OCI runtime that creates namespaces/cgroups and execs the container process.', 'd01', 'k8s'],
+    ['SAN (Subject Alternative Name)', 'The names/IPs a certificate is valid for; clients match against these.', 'd31', 'tls'],
+    ['seccomp', 'A syscall filter applied to a process; RuntimeDefault blocks dangerous syscalls.', 'l06', 'linux'],
+    ['Secret', 'Key/value credentials, base64-encoded in etcd; injected as env or tmpfs files.', 'd28', 'k8s'],
+    ['securityContext', 'Pod/container settings mapping to Linux process attributes: UIDs, capabilities, seccomp, read-only rootfs.', 'd41', 'k8s'],
+    ['Service', 'A stable virtual IP and DNS name load-balancing to Pods selected by label.', 'd12', 'k8s'],
+    ['ServiceAccount', 'A namespaced identity for Pods; its JWT token is projected into the Pod.', 'd37', 'k8s'],
+    ['Sidecar', 'A helper container in the same Pod; natively an init container with restartPolicy: Always.', 'd21', 'k8s'],
+    ['Signal', 'An asynchronous notification to a process (SIGTERM asks, SIGKILL forces).', 'l01', 'linux'],
+    ['SNI', 'Server Name Indication: the hostname in a TLS ClientHello, used to pick a certificate.', 'd51', 'tls'],
+    ['StatefulSet', 'Manages Pods with stable ordinal names, per-Pod DNS and per-Pod PVCs, in order.', 'd44', 'k8s'],
+    ['Static Pod', 'A Pod run by the kubelet from a manifest file in staticPodPath, without the API server.', 'd15', 'k8s'],
+    ['systemd', 'Linux init and service manager; kubelet and containerd are systemd units.', 'l07', 'linux'],
+    ['Taint / toleration', 'A node property that repels Pods unless they carry a matching toleration; NoSchedule, PreferNoSchedule, NoExecute.', 'd16', 'k8s'],
+    ['terminationGracePeriodSeconds', 'Time between SIGTERM and SIGKILL when a Pod is deleted (default 30).', 'd22', 'k8s'],
+    ['TLS', 'Transport Layer Security: key exchange + certificates + symmetric encryption; the basis of HTTPS and mTLS.', 'd31', 'tls'],
+    ['tmpfs', 'A RAM-backed filesystem; Secrets, ConfigMaps and emptyDir medium: Memory use it.', 'l04', 'linux'],
+    ['TokenRequest', 'The API the kubelet uses to mint bound, expiring ServiceAccount tokens.', 'd37', 'k8s'],
+    ['Topology spread constraint', 'A rule keeping Pod counts even across zones/nodes (maxSkew).', 'd18', 'k8s'],
+    ['ValidatingAdmissionPolicy', 'In-process CEL validation rules evaluated by the API server; no webhook needed.', 'd38', 'k8s'],
+    ['veth pair', 'A virtual cable with two ends; one end goes into a Pod\'s network namespace.', 'l05', 'linux'],
+    ['Version skew', 'Allowed version differences: kubelet up to 3 minors behind the API server, never ahead.', 'd55', 'k8s'],
+    ['Volume', 'A directory made available to containers in a Pod; declared in spec.volumes, mounted per container.', 'd26', 'k8s'],
+    ['VPA', 'VerticalPodAutoscaler: recommends or applies right-sized requests.', 'd20', 'k8s'],
+    ['Webhook (admission)', 'An HTTPS service the API server calls to mutate or validate objects (MutatingWebhookConfiguration / ValidatingWebhookConfiguration).', 'd38', 'k8s'],
+    ['Whiteout', 'An OverlayFS marker in the upper layer that hides a file from a lower layer.', 'l04', 'linux'],
+    ['WaitForFirstConsumer', 'A StorageClass binding mode that delays provisioning until a Pod is scheduled, so the volume lands in the right zone.', 'd27', 'k8s'],
+    ['Zombie process', 'An exited process whose parent has not yet called wait(); accumulates if PID 1 does not reap.', 'l01', 'linux'],
+  ];
+  T.sort((a, b) => a[0].localeCompare(b[0], 'en', { sensitivity: 'base' }));
+  const K = window.K8N;
+  const list = document.getElementById('list'), f = document.getElementById('f'), cnt = document.getElementById('cnt'), letters = document.getElementById('letters');
+  const kindLabel = { k8s: 'Kubernetes', linux: 'Linux', tls: 'TLS / auth', eco: 'Ecosystem' };
+  let html = '', last = '';
+  T.forEach(([term, def, ref, kind]) => {
+    const L = term[0].toUpperCase();
+    if (L !== last) { html += `<h2 id="L-${L}" data-letter="${L}">${L}</h2>`; last = L; }
+    const e = ref && K.byId[ref];
+    const link = e ? `<a href="${K.href(e)}">${e.day != null ? 'Day ' + e.day : 'Linux L' + (K.linux.indexOf(e) + 1)} →</a>` : '';
+    html += `<div class="t" data-letter="${L}"><dt>${term}<span class="k">${kindLabel[kind] || ''}</span>${link}</dt><dd>${def}</dd></div>`;
+  });
+  list.innerHTML = html;
+  [...new Set(T.map(t => t[0][0].toUpperCase()))].forEach(L => { const a = document.createElement('a'); a.href = '#L-' + L; a.textContent = L; letters.appendChild(a); });
+  const terms = [...list.querySelectorAll('.t')], heads = [...list.querySelectorAll('h2')];
+  function apply() {
+    const q = f.value.trim().toLowerCase(); let n = 0;
+    terms.forEach(t => { const hit = !q || t.textContent.toLowerCase().includes(q); t.classList.toggle('hide', !hit); if (hit) n++; });
+    heads.forEach(h => h.classList.toggle('hide', !terms.some(t => t.dataset.letter === h.dataset.letter && !t.classList.contains('hide'))));
+    cnt.textContent = `${n} of ${terms.length} terms`;
+  }
+  f.addEventListener('input', apply); apply();
+})();
+</script>
+</body>
+</html>

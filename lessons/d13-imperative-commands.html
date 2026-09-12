@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 13 · Imperative Commands · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d13" data-root="../" data-linux="l10" data-related="d09">
+<article class="lesson">
+<p class="lead">The CKA gives you two hours for 15–20 tasks. Typing YAML from memory is how people run out of time. This lesson is the imperative toolbox: the commands that create Deployments, Services and Pods in one line, generate manifests you then tweak, change live objects in place, and — most important — the fixed sequence of commands you run when something is broken.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Creating: <code>run</code>, <code>create deploy/svc/cm/secret/job/cronjob/ns/sa</code>, <code>expose</code></li>
+<li>Changing: <code>scale</code>, <code>set image/env/resources</code>, <code>edit</code>, <code>patch</code>, <code>label</code>, <code>annotate</code>, <code>rollout</code></li>
+<li>Inspecting: <code>get -o …</code>, <code>describe</code>, <code>logs</code>, <code>exec</code>, <code>port-forward</code>, <code>cp</code>, <code>top</code>, <code>events</code></li>
+<li>The troubleshooting ladder and the flags that make kubectl fast</li>
+</ul></div>
+
+<h2>Session setup (do this first, every time)</h2>
+<pre><code class="lang-bash">$ alias k=kubectl
+$ export do="--dry-run=client -o yaml"      # k run x --image=nginx $do > x.yaml
+$ export now="--force --grace-period=0"     # k delete pod x $now  (instant delete)
+$ source &lt;(kubectl completion bash) && complete -o default -F __start_kubectl k
+$ kubectl config set-context --current --namespace=&lt;ns&gt;    # when a task lives in one namespace</code></pre>
+<p>Vim tip for the exam terminal: <code>~/.vimrc</code> with <code>set ts=2 sw=2 et</code> so tabs become two spaces and pasted YAML keeps its indentation (<code>:set paste</code> before pasting).</p>
+
+<h2>Create</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Creates</th><th>Notes</th></tr>
+<tr><td>k run web --image=nginx --port=80</td><td>Pod</td><td><code>--labels=a=b,c=d</code>, <code>--env=K=V</code>, <code>--restart=Never</code> (default Always), <code>--command -- sleep 3600</code>, <code>--rm -it</code> for throwaway shells.</td></tr>
+<tr><td>k create deploy web --image=nginx --replicas=3 --port=80</td><td>Deployment</td><td>Container name = image name without tag. <code>-- cmd args</code> after the image sets the command.</td></tr>
+<tr><td>k expose deploy web --port=80 --target-port=8080 --type=NodePort --name=web-svc</td><td>Service</td><td>Copies the selector from the Deployment/Pod. Cannot set <code>nodePort</code>; edit afterwards.</td></tr>
+<tr><td>k create svc clusterip web --tcp=80:8080</td><td>Service</td><td>Selector is <code>app=web</code>; often needs editing. <code>nodeport</code>, <code>loadbalancer</code>, <code>externalname --external-name=…</code> variants.</td></tr>
+<tr><td>k create cm app --from-literal=K=V --from-file=cfg.ini --from-env-file=.env</td><td>ConfigMap</td><td><code>--from-file=key=path</code> to control the key name.</td></tr>
+<tr><td>k create secret generic db --from-literal=pw=s3cret</td><td>Secret</td><td>Also <code>docker-registry</code> and <code>tls --cert --key</code>.</td></tr>
+<tr><td>k create job once --image=busybox -- echo hi</td><td>Job</td><td><code>k create job x --from=cronjob/y</code> to run a CronJob now.</td></tr>
+<tr><td>k create cronjob nightly --image=busybox --schedule="0 2 * * *" -- date</td><td>CronJob</td><td></td></tr>
+<tr><td>k create ns dev · k create sa builder · k create role/rolebinding/clusterrole/clusterrolebinding</td><td>Namespace, SA, RBAC</td><td>RBAC forms on <a href="d36-rbac.html">Day 36</a>.</td></tr>
+<tr><td>k create ingress web --rule="shop.com/*=web:80"</td><td>Ingress</td><td></td></tr>
+<tr><td>k create quota q --hard=pods=10,cpu=4</td><td>ResourceQuota</td><td></td></tr>
+</table></div>
+<div class="callout tip"><div class="ct">Generate, then edit</div><p>Anything the one-liner cannot express (volumes, probes, affinity, multiple containers) you add by generating YAML first: <code>k run web --image=nginx $do &gt; web.yaml</code>, edit, <code>k apply -f web.yaml</code>. Generated files are minimal and correctly indented — far safer than hand-typing.</p></div>
+
+<h2>Change</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Effect</th></tr>
+<tr><td>k scale deploy web --replicas=5</td><td>Also works for rs, sts. <code>--current-replicas=3</code> as a precondition.</td></tr>
+<tr><td>k set image deploy/web nginx=nginx:1.27</td><td>Container <em>name</em>=image. Triggers a rollout. <code>*=img</code> for all containers.</td></tr>
+<tr><td>k set env deploy/web LOG_LEVEL=debug · k set env deploy/web --from=configmap/app</td><td>Add/replace env vars (<code>K-</code> removes).</td></tr>
+<tr><td>k set resources deploy/web --limits=cpu=200m,memory=256Mi --requests=cpu=100m,memory=128Mi</td><td>Resource fields without editing YAML.</td></tr>
+<tr><td>k set serviceaccount deploy/web builder</td><td>Change the Pod template's SA.</td></tr>
+<tr><td>k edit deploy web</td><td>Live edit in <code>$EDITOR</code>. If validation fails the editor reopens; a temp file path is printed if you quit.</td></tr>
+<tr><td>k patch deploy web -p '{"spec":{"replicas":2}}'</td><td>Strategic merge patch (default). <code>--type=json -p '[{"op":"replace","path":"/spec/replicas","value":2}]'</code> for precise edits.</td></tr>
+<tr><td>k label pod web tier=fe · k label pod web tier- · k label node n1 disk=ssd</td><td>Add / remove labels. <code>--overwrite</code> to change an existing value.</td></tr>
+<tr><td>k annotate deploy web kubernetes.io/change-cause="v1.27"</td><td>Annotations.</td></tr>
+<tr><td>k taint node n1 key=value:NoSchedule · k taint node n1 key-</td><td>Taints (<a href="d16-taints-tolerations.html">Day 16</a>).</td></tr>
+<tr><td>k cordon / uncordon / drain n1 --ignore-daemonsets --delete-emptydir-data</td><td>Node maintenance (<a href="d55-kubeadm-upgrade.html">Day 55</a>).</td></tr>
+<tr><td>k rollout status/history/undo/restart/pause/resume deploy/web</td><td><a href="d10-replicasets-deployments.html">Day 10</a>.</td></tr>
+<tr><td>k replace --force -f pod.yaml</td><td>Delete and re-create — the way to change immutable Pod fields from a file.</td></tr>
+<tr><td>k delete pod web $now · k delete -f dir/ · k delete pods -l app=web · k delete pod --all</td><td>Delete variants. <code>--cascade=orphan</code> keeps dependents.</td></tr>
+</table></div>
+
+<h2>Inspect</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Shows</th></tr>
+<tr><td>k get pods -o wide</td><td>+ node, IP, nominated node, readiness gates. Add <code>-A</code> for all namespaces, <code>-w</code> to watch, <code>--show-labels</code>, <code>-l k=v</code>, <code>--field-selector status.phase=Running</code>, <code>--sort-by=.metadata.creationTimestamp</code>.</td></tr>
+<tr><td>k get pod web -o yaml / -o json</td><td>Full object incl. status. Pipe to <code>grep -A</code>, <code>yq</code>, <code>jq</code>.</td></tr>
+<tr><td>k get pods -o name · -o jsonpath='{.items[*].metadata.name}' · -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName</td><td>Machine-friendly output (<a href="d59-jsonpath.html">Day 59</a>).</td></tr>
+<tr><td>k get all · k get deploy,svc,ep</td><td>Multiple kinds at once (<code>all</code> is not actually everything — no cm, secrets, ingress, pv…).</td></tr>
+<tr><td>k describe pod web</td><td>Human-readable state <strong>plus Events</strong> — the first stop for any broken object.</td></tr>
+<tr><td>k logs web · -c sidecar · -f · --previous · --since=5m · --tail=50 · -l app=web --all-containers</td><td>Container stdout/stderr. <code>--previous</code> is the crashed container's last log — essential for CrashLoopBackOff.</td></tr>
+<tr><td>k exec -it web -- sh · k exec web -c app -- env</td><td>Run a command in a container.</td></tr>
+<tr><td>k port-forward svc/web 8080:80 · pod/web 8080:80</td><td>Tunnel a local port to a Service/Pod for testing without NodePorts.</td></tr>
+<tr><td>k cp web:/var/log/app.log ./app.log</td><td>Copy files (needs <code>tar</code> in the container).</td></tr>
+<tr><td>k top pod / k top node</td><td>Live CPU/memory (needs metrics-server).</td></tr>
+<tr><td>k events --for pod/web · k get events --sort-by=.lastTimestamp -A</td><td>Cluster events: scheduling, pulls, probes, OOM, evictions.</td></tr>
+<tr><td>k api-resources · k explain &lt;kind&gt;.&lt;path&gt;</td><td>Discovery and docs (<a href="d09-yaml-imperative-declarative.html">Day 9</a>).</td></tr>
+<tr><td>k auth can-i create pods --as=jane -n dev</td><td>RBAC check (<a href="d36-rbac.html">Day 36</a>).</td></tr>
+<tr><td>k debug pod/web -it --image=busybox --target=app · k debug node/n1 -it --image=ubuntu</td><td>Ephemeral debug container sharing the target's namespaces; or a privileged Pod on a node with the host filesystem at <code>/host</code>.</td></tr>
+</table></div>
+
+<h2>The troubleshooting ladder</h2>
+<p>Run these in order and stop when you see the problem. Ninety percent of broken workloads are diagnosed at rung 2 or 3.</p>
+<ol class="steps">
+<li><strong><code>k get pods -o wide</code></strong> — what state? <code>Pending</code> (no node / not scheduled), <code>ContainerCreating</code> (pull, volume, CNI), <code>CrashLoopBackOff</code> (app exits), <code>ImagePullBackOff</code> (image name/registry/secret), <code>Error</code>, <code>OOMKilled</code> (in <code>describe</code>), <code>Running</code> but <code>0/1</code> READY (readiness probe). Which node? Restart count?</li>
+<li><strong><code>k describe pod</code></strong> — read the <em>Events</em> at the bottom: <code>FailedScheduling</code> (why, exactly: taints, resources, affinity), <code>Failed to pull image</code>, <code>Unhealthy</code> (probe), <code>FailedMount</code>, <code>Back-off restarting</code>. Check <em>Last State: Terminated, Reason, Exit Code</em>.</li>
+<li><strong><code>k logs pod --previous</code></strong> — what did the app say before it died? Missing env var, wrong DB host, permission denied, port in use.</li>
+<li><strong><code>k exec -it pod -- sh</code></strong> — is the config mounted? Can you <code>wget</code> the dependency? What does <code>env</code> show? (No shell? <code>k debug</code>.)</li>
+<li><strong><code>k get svc,endpointslices</code> + <code>k describe svc</code></strong> — for connectivity: does the selector match, are there endpoints, is <code>targetPort</code> right? Test with a busybox Pod.</li>
+<li><strong><code>k get events -A --sort-by=.lastTimestamp</code></strong> and <strong><code>k get nodes</code> / <code>k describe node</code></strong> — cluster-level: node NotReady, pressure conditions, evictions.</li>
+<li><strong>On the node</strong> — <code>systemctl status kubelet</code>, <code>journalctl -u kubelet</code>, <code>crictl ps/logs</code> (<a href="d58-troubleshoot-data-plane.html">Day 58</a>).</li>
+</ol>
+<figure data-anim="ts-ladder"></figure>
+
+<div class="callout linux" data-ref="l10"><div class="ct">Under the hood · Linux</div><p>kubectl is a REST client; every one of these commands is an HTTP call you can watch with <code>kubectl -v=8 get pods</code>. <code>logs</code>, <code>exec</code>, <code>port-forward</code> and <code>cp</code> are the exceptions that reach a <em>node</em>: the API server proxies them to the kubelet's port 10250, which reads the container's log file under <code>/var/log/pods/</code> or spawns a process inside the container via the CRI. That is why <code>exec</code> can fail when the API server cannot reach the node even though <code>get</code> works — and why the <a href="../linux/l10-shell-toolkit.html">shell toolkit</a> (grep, jq, ss, journalctl) is half of troubleshooting.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Read the task twice, note the namespace and any exact names/ports, and confirm at the end with a <code>get</code>. Partial credit exists; a wrong namespace scores zero.</li>
+<li>Never <code>k edit</code> a Pod's immutable fields (image is allowed; most others are not). Get the YAML, delete with <code>$now</code>, re-apply.</li>
+<li>When a task says "use the existing Pod", prefer <code>k get pod x -o yaml &gt; x.yaml</code> over rebuilding from scratch.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3><p>Break things, then climb the ladder.</p>
+<pre><code class="lang-bash">$ k create deploy broken --image=nginx:1.99 --replicas=1      # bad tag
+$ k get pods; k describe pod -l app=broken | tail -8              # ImagePullBackOff, "manifest unknown"
+$ k set image deploy/broken nginx=nginx:1.27 && k rollout status deploy/broken
+$ k run crasher --image=busybox --command -- sh -c 'echo starting; exit 1'
+$ k get pod crasher -w                                            # CrashLoopBackOff, restarts climbing
+$ k logs crasher --previous; k describe pod crasher | grep -A3 'Last State'
+$ k expose deploy broken --port=80 --target-port=8080 --name=wrongport
+$ k get endpointslices -l kubernetes.io/service-name=wrongport    # endpoints exist, but port 8080 is wrong
+$ k patch svc wrongport -p '{"spec":{"ports":[{"port":80,"targetPort":80}]}}'
+$ k run t --rm -it --image=busybox:1.36 -- wget -qO- --timeout=2 http://wrongport | head -2
+$ k delete deploy broken; k delete pod crasher $now; k delete svc wrongport</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Set <code>alias k</code>, <code>$do</code>, <code>$now</code> and the namespace before anything else.</li>
+<li><code>run</code>/<code>create</code>/<code>expose</code> for creation; <code>$do &gt; file</code> for anything with extra fields.</li>
+<li><code>scale</code>, <code>set image</code>, <code>edit</code>, <code>patch</code>, <code>label</code> change live objects; <code>replace --force</code> for immutable fields.</li>
+<li>Troubleshoot in order: get → describe (Events) → logs --previous → exec → svc/endpoints → events/nodes → node shell.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  const rungs = [['k get pods -o wide', 'STATUS · READY · RESTARTS · NODE'], ['k describe pod', 'Events · Last State · Exit Code'], ['k logs --previous', 'what the app said before dying'], ['k exec / k debug', 'config, env, connectivity from inside'], ['k get svc, endpointslices', 'selector, targetPort, readiness'], ['k get events -A / nodes', 'scheduling, pressure, evictions'], ['node: journalctl -u kubelet, crictl', 'runtime and kubelet']];
+  let svg = '';
+  rungs.forEach((r, i) => { const y = 20 + i * 42; svg += S.box(`r${i}`, 40, y, 300, 34, r[0], { fs: 11, lcls: 'mono', cls: 'soft' }) + S.text(`t${i}`, 360, y + 21, r[1], { cls: 'sm muted left' }); });
+  svg += S.text('verdict', 540, 300, '', { cls: 'sm b' });
+  const cases = [
+    ['Pod shows <b>ImagePullBackOff</b>. Rung 1 already tells you the category; rung 2\'s events say "manifest unknown" — a bad tag. Fix: <code>k set image</code>.', [0, 1], 'bad image tag'],
+    ['Pod is <b>CrashLoopBackOff</b>, restarts climbing. Rung 2 gives exit code 1; rung 3 shows "connection refused to db:5432". Fix the config, not the Pod.', [0, 1, 2], 'app cannot reach its dependency'],
+    ['Pod is <b>Running 1/1</b> but the frontend gets errors. Rungs 1–4 are clean. Rung 5: the Service has <b>no endpoints</b> — selector <code>app=api</code> vs label <code>app=apis</code>.', [0, 1, 2, 3, 4], 'selector typo'],
+    ['Pods on one node are all <b>Pending</b> or evicted. Rung 6: node <b>NotReady</b>, <code>DiskPressure=True</code>. Rung 7: <code>journalctl -u kubelet</code> shows image GC failing. Fix on the node.', [0, 1, 5, 6], 'node problem'],
+  ];
+  const steps = [{ c: 'Seven rungs. Always start at the top; each rung either explains the symptom or narrows it.', on(q){} }];
+  cases.forEach(cse => steps.push({ c: cse[0], ms: 3600, on(q){ q('.nb').set('soft'); cse[1].forEach(i => q(`#r${i} rect`).set('hl')); q(`#r${cse[1][cse[1].length - 1]} rect`).set('ok'); q('#verdict').text('→ ' + cse[2]); } }));
+  Anim.define('ts-ladder', { w: 720, h: 320, title: 'The troubleshooting ladder', svg, steps });
+})();
+</script>
+</body>
+</html>

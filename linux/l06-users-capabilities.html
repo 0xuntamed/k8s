@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L6 · Users, Permissions & Capabilities · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l06" data-root="../" data-related="d41,d28,d36">
+<article class="lesson">
+<p class="lead">Every field in a Pod's <code>securityContext</code> sets a Linux process attribute: its UID and GIDs, its capability sets, its <code>no_new_privs</code> flag, its seccomp filter, its LSM profile. The kernel checks those attributes on every file open, every socket bind, every mount. Know the attributes and the checks, and "why can't my non-root container write to the volume" or "why does <code>privileged</code> equal root on the node" have exact answers.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>UIDs, GIDs, <code>/etc/passwd</code>, the effective/real/saved ids, and what root means</li>
+<li>File permissions and ownership: mode bits, setuid/setgid/sticky, umask, <code>fsGroup</code> mechanics</li>
+<li>Capabilities: the sets, the list that matters, <code>capsh</code>/<code>getpcaps</code>, file capabilities</li>
+<li><code>no_new_privs</code>, seccomp, AppArmor/SELinux — the extra fences</li>
+<li>What <code>privileged</code> actually enables</li>
+</ul></div>
+
+<h2>Users and groups</h2>
+<pre><code class="lang-bash">$ id                                  # uid=1000(alice) gid=1000(alice) groups=1000(alice),27(sudo),999(docker)
+$ cat /etc/passwd | head -3           # name:x:uid:gid:comment:home:shell — a mapping for humans; the KERNEL only knows numbers
+$ getent passwd 65534                 # nobody
+$ cat /proc/$$/status | grep -E '^(Uid|Gid|Groups)'   # real, effective, saved, filesystem uid; supplementary groups
+$ sudo -u nobody id; su -s /bin/sh nobody -c id</code></pre>
+<p>The kernel identifies a process by numeric <strong>uid/gid</strong> plus a list of supplementary groups. <code>/etc/passwd</code> and <code>/etc/group</code> only translate names — which is why a container image can run as UID 1000 with no passwd entry at all (<code>USER 1000</code> works; <code>USER app</code> needs the entry), and why <code>runAsNonRoot: true</code> with <code>USER app</code> fails unless the kubelet can resolve the name to a non-zero number. UID 0 is root: the kernel skips most permission checks for it — <em>modulo capabilities</em>, below.</p>
+
+<h2>File permissions</h2>
+<pre><code class="lang-bash">$ ls -l /etc/shadow /usr/bin/passwd /tmp
+-rw-r-----  1 root shadow   1234  /etc/shadow      # owner rw, group r, other none
+-rwsr-xr-x  1 root root    68208  /usr/bin/passwd  # s = SETUID: runs as the file's owner (root) regardless of who executes it
+drwxrwxrwt 15 root root     4096  /tmp             # t = STICKY: only the owner may delete their files
+$ stat -c '%a %U:%G %n' /etc/shadow               # 640 root:shadow
+$ chmod 0640 f; chmod u+x,g-w f; chown app:app f; chgrp 2000 -R /data
+$ umask                                            # 0022 → new files 644, dirs 755
+$ chmod g+s /data                                  # SETGID on a dir: new files inherit the dir's group (what fsGroup relies on)</code></pre>
+<p>The check on <code>open()</code>: if the process's effective uid owns the file, use the owner bits; else if any of its gids matches the file's group, use the group bits; else other bits. Root (with <code>CAP_DAC_OVERRIDE</code>) bypasses it. This is the whole story behind <strong>fsGroup</strong>: the kubelet <code>chown</code>s the volume to the gid, sets setgid on directories, and adds the gid to the container's supplementary groups — so a non-root process passes the group check.</p>
+<figure data-anim="perm-check"></figure>
+
+<h2>Capabilities</h2>
+<p>Since Linux 2.2 the privileges of root are split into ~41 <strong>capabilities</strong>, checked individually by the kernel. A process carries several sets; the ones that matter for containers:</p>
+<dl class="kv">
+<dt>Effective</dt><dd>What the kernel checks right now. <code>CapEff</code> in <code>/proc/PID/status</code>.</dd>
+<dt>Permitted</dt><dd>What the process may raise into effective.</dd>
+<dt>Bounding</dt><dd>The ceiling: nothing outside it can ever be gained, even via setuid binaries. Containers set this to the allowed list.</dd>
+<dt>Inheritable / Ambient</dt><dd>What survives <code>execve</code>; ambient lets non-root processes keep caps across exec (how a non-root nginx keeps NET_BIND_SERVICE).</dd>
+</dl>
+<div class="tbl-wrap"><table>
+<tr><th>Capability</th><th>Allows</th><th>Container default?</th><th>Notes</th></tr>
+<tr><td><code>NET_BIND_SERVICE</code></td><td>Bind ports &lt; 1024</td><td>Yes</td><td>The only one the <em>restricted</em> profile lets you add</td></tr>
+<tr><td><code>CHOWN</code>, <code>FOWNER</code>, <code>DAC_OVERRIDE</code>, <code>FSETID</code></td><td>Change ownership / bypass file permission checks</td><td>Yes</td><td>What makes root "own everything"</td></tr>
+<tr><td><code>SETUID</code>, <code>SETGID</code>, <code>SETPCAP</code></td><td>Change ids / capabilities</td><td>Yes</td><td>Needed by entrypoints that drop to a user (<code>gosu</code>, <code>su-exec</code>)</td></tr>
+<tr><td><code>KILL</code></td><td>Signal processes of other users</td><td>Yes</td><td></td></tr>
+<tr><td><code>NET_RAW</code></td><td>Raw sockets: ping (old), packet crafting, ARP spoofing</td><td>Yes (Docker); dropped by many hardened profiles</td><td>Drop it</td></tr>
+<tr><td><code>SYS_CHROOT</code>, <code>MKNOD</code>, <code>AUDIT_WRITE</code>, <code>SETFCAP</code></td><td>chroot, device nodes, audit log, file caps</td><td>Yes</td><td>Rarely needed by apps</td></tr>
+<tr><td><code>NET_ADMIN</code></td><td>Interfaces, routes, iptables, netns</td><td>No</td><td>CNI, kube-proxy, Istio init</td></tr>
+<tr><td><code>SYS_ADMIN</code></td><td>mount, and a huge grab-bag — "the new root"</td><td>No</td><td>CSI node plugins, FUSE; never for apps</td></tr>
+<tr><td><code>SYS_PTRACE</code></td><td>Trace other processes</td><td>No</td><td>Debuggers, profilers (<code>kubectl debug --target</code> shares PID ns instead)</td></tr>
+<tr><td><code>SYS_MODULE</code>, <code>SYS_RAWIO</code>, <code>SYS_BOOT</code>, <code>SYS_TIME</code>, <code>BPF</code>, <code>PERFMON</code></td><td>Kernel modules, raw I/O, reboot, clock, eBPF, perf</td><td>No</td><td>Equivalent to owning the node</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ grep Cap /proc/$$/status                       # CapInh/CapPrm/CapEff/CapBnd/CapAmb as hex masks
+$ capsh --decode=00000000a80425fb                 # → cap_chown,cap_dac_override,…,cap_net_bind_service,…  (containerd's default set)
+$ getpcaps $$; getpcaps $(pgrep -o nginx)         # by PID
+$ getcap /usr/bin/ping                            # file capabilities: cap_net_raw=ep — lets ping work without setuid
+$ sudo setcap cap_net_bind_service=+ep /usr/local/bin/myserver     # non-root process may bind :80
+$ capsh --drop=cap_net_raw -- -c 'ping -c1 1.1.1.1'                # simulate a drop
+$ docker run --rm --cap-drop=ALL --cap-add=NET_BIND_SERVICE alpine sh -c 'grep CapEff /proc/self/status'   # 0000000000000400</code></pre>
+<p>Inside a container the runtime sets the <strong>bounding</strong> set to the allowed list (default ~14, or exactly what <code>capabilities.add</code> says after <code>drop: [ALL]</code>). A root process gets those as effective; a non-root process gets none unless ambient/file caps grant them. That is why "run as non-root + drop ALL + add NET_BIND_SERVICE" is the restricted profile: the process has one narrowly scoped power and no way to get more.</p>
+
+<h2>no_new_privs, seccomp, LSMs</h2>
+<dl class="kv">
+<dt>no_new_privs</dt><dd><code>prctl(PR_SET_NO_NEW_PRIVS)</code>: once set, <code>execve</code> can never grant more privilege — setuid bits and file capabilities are ignored. <code>allowPrivilegeEscalation: false</code>. Cheap, always set it.</dd>
+<dt>seccomp</dt><dd>A BPF filter on system calls. containerd's default profile blocks ~40 dangerous ones (<code>mount</code>, <code>reboot</code>, <code>kexec_load</code>, <code>ptrace</code> on older kernels…). <code>seccompProfile: {type: RuntimeDefault}</code>. <code>Unconfined</code> = no filter (what <code>privileged</code> implies). Custom: a JSON profile on the node, <code>type: Localhost</code>.</dd>
+<dt>AppArmor</dt><dd>Path-based mandatory access control on Debian/Ubuntu: a profile lists which files/capabilities/network a program may use. <code>appArmorProfile: {type: RuntimeDefault}</code> (1.30+; previously an annotation). <code>aa-status</code> on the node.</dd>
+<dt>SELinux</dt><dd>Label-based MAC on RHEL/Fedora: every process and file has a context; policy decides. Containers get a unique MCS label so one cannot read another's files even as root. <code>seLinuxOptions</code>; <code>getenforce</code>, <code>ls -Z</code>.</dd>
+</dl>
+<pre><code class="lang-bash">$ grep -E 'NoNewPrivs|Seccomp' /proc/$(pgrep -o nginx)/status     # NoNewPrivs: 1, Seccomp: 2 (filter mode)
+$ docker run --rm alpine grep Seccomp /proc/self/status             # 2 = default profile applied
+$ docker run --rm --security-opt seccomp=unconfined alpine grep Seccomp /proc/self/status   # 0
+$ cat /sys/kernel/security/apparmor/profiles | head; aa-status | head -5</code></pre>
+
+<h2>What <code>privileged: true</code> does</h2>
+<p>All capabilities in the bounding set; all host devices in <code>/dev</code>; <code>/sys</code> and <code>/proc/sys</code> writable; no seccomp filter; no AppArmor/SELinux confinement; masked paths unmasked. The process is root on the host kernel with every tool needed to escape: <code>mount /dev/sda1 /mnt</code>, <code>nsenter -t 1 -a</code>, load a kernel module. It exists for infrastructure Pods (CNI, CSI, some monitoring) and nothing else — which is what the <em>baseline</em> Pod Security Standard forbids.</p>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ docker run --rm alpine sh -c 'id; grep CapEff /proc/self/status'                       # root, default caps
+$ docker run --rm -u 1000 alpine sh -c 'id; grep CapEff /proc/self/status; touch /etc/x || echo denied'   # non-root: caps 0, EACCES
+$ docker run --rm --cap-drop=ALL alpine sh -c 'id; chown 1 /tmp || echo "root without CAP_CHOWN cannot chown"'
+$ docker run --rm -u 1000 --cap-add=NET_BIND_SERVICE alpine sh -c 'grep CapEff /proc/self/status'   # still 0! non-root needs ambient caps…
+$ docker run --rm -u 1000 alpine sh -c 'nc -l -p 80 &amp; sleep 1; echo $?'                 # …bind :80 fails as uid 1000
+$ docker run --rm --security-opt no-new-privileges alpine sh -c 'grep NoNewPrivs /proc/self/status'
+$ docker run --rm --privileged alpine sh -c 'grep CapEff /proc/self/status; ls /dev | wc -l; grep Seccomp /proc/self/status'   # all caps, all devices, no seccomp
+# fsGroup mechanics by hand
+$ mkdir /tmp/vol; sudo chown root:2000 /tmp/vol; sudo chmod 2770 /tmp/vol
+$ docker run --rm -u 1000:1000 --group-add 2000 -v /tmp/vol:/data alpine sh -c 'id; touch /data/f &amp;&amp; ls -l /data'   # writable via group 2000; file inherits gid (setgid dir)</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>The kernel knows numbers: uid/gid/supplementary groups. Names come from <code>/etc/passwd</code> and are optional.</li>
+<li>File access = owner/group/other bits checked against the process's ids; <code>fsGroup</code> works by chown + setgid + supplementary group.</li>
+<li>Root's power is ~41 capabilities checked per operation; containers bound them; drop ALL and add back only what is needed. Non-root processes get none unless ambient/file caps grant them.</li>
+<li><code>no_new_privs</code>, seccomp and AppArmor/SELinux are independent fences; <code>privileged</code> removes all of them and equals root on the node.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('proc', 20, 30, 220, 70, ['process', 'uid=1000  gid=3000', 'groups=[3000, 2000]'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('file', 480, 30, 220, 70, ['/data/db/pgdata', 'owner root:2000', 'mode drwxrwx---  (2770)'], { subfs: 9, subcls: 'mono muted', cls: 'warn' })
+    + S.term('chk', 20, 130, 680, 110, ['open("/data/db/pgdata/x", O_CREAT|O_WRONLY)', 'step 1: euid 1000 == owner 0 ?', 'step 2: any gid in [3000, 2000] == file group 2000 ?', 'step 3: (otherwise) other bits', 'result: —'], { fs: 9.5 })
+    + S.text('m', 360, 275, '', { cls: 'sm b' });
+  Anim.define('perm-check', { w: 720, h: 290, title: 'The permission check behind fsGroup', ms: 2800, svg, steps: [
+    { c: 'A non-root process (uid 1000) opens a file for writing in a PVC directory owned by root with group 2000 and mode 2770.', on(q){} },
+    { c: '<b>Step 1</b>: is the process\'s effective uid the owner? 1000 ≠ 0 → no. Owner bits do not apply. (Root with CAP_DAC_OVERRIDE would already have passed.)', on(q){ q('#chk-l1').style('fill', 'var(--red)'); } },
+    { c: '<b>Step 2</b>: does any of the process\'s groups match the file\'s group (2000)? The kubelet added 2000 as a <b>supplementary group</b> because the Pod set <code>fsGroup: 2000</code> → yes. Group bits: rwx → allowed.', on(q){ q('#chk-l2').style('fill', 'var(--green)'); q('#chk-l4').text('result: allowed (group rwx)').style('fill', 'var(--green)'); q('#m').text('fsGroup = chown to gid + setgid dir + add gid to the process'); } },
+    { c: 'Without fsGroup: groups=[3000] only, step 2 fails, step 3 checks "other" bits (---) → <b>EACCES, Permission denied</b>. That is the classic "non-root container cannot write to its volume".', on(q){ q('#proc text:nth-of-type(3)').text('groups=[3000]'); q('#chk-l2').text('step 2: any gid in [3000] == 2000 ?').style('fill', 'var(--red)'); q('#chk-l3').style('fill', 'var(--red)'); q('#chk-l4').text('result: EACCES (Permission denied)').style('fill', 'var(--red)'); q('#m').text('fix: fsGroup, or an init container that chowns, or a permissive mode'); } },
+    { c: 'The setgid bit (the 2 in 2770) makes new files inside inherit group 2000, so files the app creates stay writable by the next Pod that mounts the volume with the same fsGroup.', on(q){ q('#m').text('setgid directories keep the group consistent'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

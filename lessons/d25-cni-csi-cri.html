@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 25 · CNI, CSI, CRI & Add-ons · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d25" data-root="../" data-linux="l05,l04" data-related="d07,d27,d54">
+<article class="lesson">
+<p class="lead">Kubernetes itself does not run containers, does not assign IP addresses, and does not attach disks. It defines three <strong>interfaces</strong> — CRI for runtimes, CNI for networking, CSI for storage — and lets you plug in an implementation for each. Everything else that a cluster "obviously has" (DNS, metrics, a dashboard) is an <strong>add-on</strong>: a normal workload you install. Knowing which layer owns which job is the difference between a 5-minute fix and an afternoon of guessing.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Core vs extensions: what Kubernetes ships and what it expects you to bring</li>
+<li>CRI: how the kubelet talks to containerd/CRI-O, and <code>crictl</code></li>
+<li>CNI: how a Pod gets an IP, where plugins live, and the popular implementations</li>
+<li>CSI: the controller/node split, the sidecar pattern, and dynamic provisioning</li>
+<li>Add-ons and other plugin points (device plugins, admission webhooks, scheduler plugins)</li>
+</ul></div>
+
+<h2>The extension points</h2>
+<figure data-anim="pod-create-plugins"></figure>
+<div class="tbl-wrap"><table>
+<tr><th>Interface</th><th>Who calls it</th><th>Protocol</th><th>Implementations</th><th>Fails how?</th></tr>
+<tr><td><strong>CRI</strong> Container Runtime Interface</td><td>kubelet</td><td>gRPC over a Unix socket</td><td>containerd, CRI-O (Docker via cri-dockerd)</td><td>Node NotReady; "container runtime is down"</td></tr>
+<tr><td><strong>CNI</strong> Container Network Interface</td><td>runtime (on behalf of kubelet), per Pod sandbox</td><td>Exec a binary with JSON on stdin (ADD/DEL/CHECK)</td><td>Calico, Cilium, Flannel, Weave, kindnet, cloud VPC CNIs</td><td>Node NotReady ("network plugin not ready"); Pods stuck ContainerCreating</td></tr>
+<tr><td><strong>CSI</strong> Container Storage Interface</td><td>controller-manager (provision/attach) and kubelet (mount)</td><td>gRPC via sidecars</td><td>EBS, GCE PD, Azure Disk, Ceph RBD, NFS, Longhorn, Portworx</td><td>PVC Pending; Pod stuck with FailedMount / FailedAttachVolume</td></tr>
+</table></div>
+
+<h2>CRI — the runtime</h2>
+<p>The kubelet's only way to run a container is the CRI: <code>RunPodSandbox</code> (the pause container + namespaces), <code>PullImage</code>, <code>CreateContainer</code>, <code>StartContainer</code>, <code>ContainerStatus</code>, <code>Exec</code>… containerd implements it directly through its <code>cri</code> plugin. The socket is configured in the kubelet (<code>--container-runtime-endpoint=unix:///run/containerd/containerd.sock</code>).</p>
+<pre><code class="lang-bash">$ crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps      # or set /etc/crictl.yaml once
+$ crictl pods                            # sandboxes (one per Pod)
+$ crictl ps -a                           # containers incl. exited
+$ crictl logs &lt;container-id&gt;
+$ crictl inspect &lt;container-id&gt; | jq '.info.runtimeSpec.linux.namespaces'
+$ crictl images; crictl rmi --prune
+$ systemctl status containerd; journalctl -u containerd -n 50
+$ cat /etc/containerd/config.toml | grep -A3 'runc.options'    # SystemdCgroup = true is required with the systemd cgroup driver</code></pre>
+<div class="callout warn"><div class="ct">cgroup driver mismatch</div><p>The kubelet and the runtime must agree on who manages cgroups: <code>cgroupfs</code> or <code>systemd</code>. Modern kubeadm defaults the kubelet to <code>systemd</code>; containerd must then have <code>SystemdCgroup = true</code>. A mismatch produces a node that flaps NotReady with cryptic kubelet errors. <a href="d54-kubeadm-cluster.html">Day 54</a> sets this up.</p></div>
+
+<h2>CNI — the network</h2>
+<p>When the kubelet creates a Pod sandbox, the runtime looks in <code>/etc/cni/net.d/</code> for the first config file, finds the plugin binary named there in <code>/opt/cni/bin/</code>, and executes it with <code>CNI_COMMAND=ADD</code>, the sandbox's network-namespace path, and the config on stdin. The plugin creates a veth pair, moves one end into the namespace, assigns an IP from the node's Pod CIDR, sets routes, and returns the IP as JSON. On Pod deletion it is called with <code>DEL</code>. That is the whole interface; everything a CNI does across nodes (routing, overlays, policies) is the implementation's business.</p>
+<pre><code class="lang-bash">$ ls /etc/cni/net.d/                       # 10-calico.conflist, 10-kindnet.conflist …
+$ cat /etc/cni/net.d/10-calico.conflist | jq '.plugins[].type'
+$ ls /opt/cni/bin/                         # calico, bridge, host-local, loopback, portmap, bandwidth …
+$ kubectl get pods -n kube-system -l k8s-app=calico-node -o wide   # the DaemonSet that installs and runs it
+$ kubectl get node worker-1 -o jsonpath='{.spec.podCIDR}'          # this node's Pod IP range</code></pre>
+<div class="grid-2">
+<div class="card"><h4>Calico</h4><p>BGP or VXLAN routing, mature NetworkPolicy, optional eBPF data plane. The course uses it with kubeadm (Day 54).</p></div>
+<div class="card"><h4>Cilium</h4><p>eBPF-based: replaces kube-proxy, L7 policies, Hubble observability. Fast and increasingly the default.</p></div>
+<div class="card"><h4>Flannel</h4><p>Simplest overlay (VXLAN). No NetworkPolicy support on its own.</p></div>
+<div class="card"><h4>Cloud VPC CNIs</h4><p>AWS VPC CNI, Azure CNI, GKE: Pods get real VPC IPs; policies via an add-on.</p></div>
+</div>
+<p><strong>No CNI installed</strong> is the most recognisable failure: every node stays <code>NotReady</code> with <code>container runtime network not ready: cni plugin not initialized</code>, and CoreDNS Pods sit in <code>Pending</code>/<code>ContainerCreating</code>. kubeadm deliberately leaves this step to you.</p>
+
+<div class="callout linux" data-ref="l05"><div class="ct">Under the hood · Linux</div><p>You can run a CNI plugin by hand. Create a netns (<code>ip netns add test</code>), then <code>CNI_COMMAND=ADD CNI_CONTAINERID=x CNI_NETNS=/var/run/netns/test CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; /etc/cni/net.d/10-bridge.conf</code>. The plugin prints the JSON result with the assigned IP, and <code>ip netns exec test ip addr</code> shows a new <code>eth0</code>. The "reference" plugins (<code>bridge</code>, <code>host-local</code> IPAM, <code>loopback</code>, <code>portmap</code>) are exactly what kindnet chains together; Calico and Cilium replace <code>bridge</code> with their own routing but still chain <code>portmap</code> for hostPort and <code>bandwidth</code> for traffic shaping.</p></div>
+
+<h2>CSI — the storage</h2>
+<p>A CSI driver has two halves. The <strong>controller</strong> half (a Deployment, usually 1–2 replicas) creates and deletes volumes in the backend and attaches/detaches them to nodes. The <strong>node</strong> half (a DaemonSet) formats and mounts an attached volume into the Pod's directory. Kubernetes talks to both through standard <em>sidecar</em> containers that translate API objects into gRPC calls: <code>external-provisioner</code> (watches PVCs), <code>external-attacher</code> (VolumeAttachment objects), <code>external-resizer</code>, <code>external-snapshotter</code>, <code>node-driver-registrar</code> (tells the kubelet the driver exists), <code>livenessprobe</code>.</p>
+<pre><code class="lang-bash">$ kubectl get csidrivers                          # ebs.csi.aws.com, csi.tigera.io …
+$ kubectl get csinodes -o yaml | grep -A4 drivers   # which drivers each node has registered
+$ kubectl get pods -n kube-system -l app=ebs-csi-controller   # controller Deployment
+$ kubectl get pods -n kube-system -l app=ebs-csi-node -o wide  # node DaemonSet
+$ ls /var/lib/kubelet/plugins/                     # driver sockets on a node
+$ kubectl get volumeattachments                    # what is attached where</code></pre>
+<p>The flow for a dynamically provisioned disk: PVC created → external-provisioner calls <code>CreateVolume</code> → PV object created and bound → Pod scheduled → external-attacher calls <code>ControllerPublishVolume</code> (attach disk to that VM) → kubelet calls <code>NodeStageVolume</code> (format + mount to a staging dir) and <code>NodePublishVolume</code> (bind-mount into the Pod). <a href="d27-persistent-volumes.html">Day 27</a> covers the objects; this is the machinery behind them. The old "in-tree" plugins (<code>awsElasticBlockStore:</code> etc.) are gone — migrated to CSI and removed from core.</p>
+
+<h2>Add-ons and other plugin points</h2>
+<dl class="kv">
+<dt>CoreDNS</dt><dd>Cluster DNS — a Deployment plus the <code>kube-dns</code> Service. Installed by kubeadm; not part of the control plane binaries.</dd>
+<dt>metrics-server</dt><dd>Resource metrics for <code>kubectl top</code> and the HPA (Day 20).</dd>
+<dt>Ingress / Gateway controllers</dt><dd>nginx, Traefik, AWS LB Controller, NGINX Gateway Fabric (Days 49–53).</dd>
+<dt>Device plugins</dt><dd>Advertise GPUs, FPGAs, SR-IOV NICs as extended resources (<code>nvidia.com/gpu</code>) via a gRPC socket in <code>/var/lib/kubelet/device-plugins/</code>.</dd>
+<dt>Admission webhooks</dt><dd>External policy: OPA Gatekeeper, Kyverno, cert-manager's injector (Day 38).</dd>
+<dt>Scheduler plugins / custom schedulers</dt><dd>Extend filter/score or run a second scheduler selected by <code>schedulerName</code>.</dd>
+<dt>Cloud controller manager</dt><dd>LoadBalancers, node lifecycle, routes — per cloud.</dd>
+<dt>Operators &amp; CRDs</dt><dd>New API types with their own controllers (Days 39–40).</dd>
+</dl>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Node NotReady + "cni plugin not initialized" → install/repair the CNI (check the DaemonSet, <code>/etc/cni/net.d</code>, <code>/opt/cni/bin</code>).</li>
+<li>Node NotReady + kubelet logs mention the runtime socket → <code>systemctl status containerd</code>, socket path in kubelet config.</li>
+<li>PVC Pending with "waiting for a volume to be created" → provisioner (CSI controller or StorageClass) problem, not a Pod problem.</li>
+<li><code>crictl</code> is your <code>docker ps</code> on exam nodes.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash"># inside a KIND node
+$ docker exec -it cka-worker bash
+# crictl config
+# ls /etc/cni/net.d && cat /etc/cni/net.d/10-kindnet.conflist
+# ls /opt/cni/bin
+# crictl pods | head; crictl ps | head
+# crictl inspectp $(crictl pods -q | head -1) | jq '.info.runtimeSpec.linux.namespaces'
+# cat /var/lib/kubelet/config.yaml | grep -iE 'cgroupDriver|containerRuntimeEndpoint'
+# exit
+$ kubectl get csidrivers; kubectl get storageclass          # KIND ships a local-path provisioner (not CSI) as its default class
+$ kubectl get node cka-worker -o jsonpath='{.spec.podCIDR}{"\n"}'
+# break the CNI on one node and watch
+$ docker exec cka-worker2 mv /etc/cni/net.d/10-kindnet.conflist /tmp/
+$ kubectl run t --image=nginx $do | sed '/spec:/a\  nodeName: cka-worker2' | kubectl apply -f -
+$ kubectl describe pod t | tail -4          # FailedCreatePodSandBox: … cni plugin not initialized
+$ docker exec cka-worker2 mv /tmp/10-kindnet.conflist /etc/cni/net.d/; sleep 10; kubectl get pod t
+$ kubectl delete pod t $now</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Kubernetes core delegates running containers (CRI), Pod networking (CNI) and storage (CSI) to pluggable implementations.</li>
+<li>CRI = kubelet → containerd over gRPC; <code>crictl</code> is the CLI. cgroup drivers must match.</li>
+<li>CNI = a binary in <code>/opt/cni/bin</code> configured by <code>/etc/cni/net.d</code>, run per Pod with ADD/DEL. No CNI → nodes NotReady.</li>
+<li>CSI = controller (provision/attach) + node (mount) halves, driven by standard sidecars; PVC → CreateVolume → attach → stage → publish.</li>
+<li>DNS, metrics, ingress, GPUs, policy engines are add-ons and plugins, installed and troubleshot like any workload.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('api', 20, 20, 130, 44, ['API server', 'pod bound → node'], { subfs: 9, subcls: 'muted' })
+    + S.box('kl', 20, 110, 130, 44, ['kubelet'], { fs: 12 })
+    + S.arrow('a0', 85, 64, 85, 108, { cls: 'dashed', label: 'watch', lx: 110 })
+    + S.box('cri', 220, 110, 130, 44, ['containerd', 'CRI · gRPC socket'], { subfs: 9, subcls: 'muted', cls: 'soft' })
+    + S.box('cni', 420, 40, 130, 44, ['CNI plugin', '/opt/cni/bin/calico'], { subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('csi', 420, 180, 130, 44, ['CSI node plugin', 'NodePublishVolume'], { subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.node('pod', 590, 30, 120, 230, 'pod', { sub: '' })
+    + S.box('pause', 605, 70, 90, 30, 'pause', { fs: 10, cls: 'soft', hidden: true })
+    + S.text('ip', 650, 118, '', { cls: 'xs mono okc' })
+    + S.box('vol', 605, 140, 90, 30, '/data mounted', { fs: 9, cls: 'warn', hidden: true })
+    + S.box('app', 605, 200, 90, 30, 'app container', { fs: 9, cls: 'ok', hidden: true })
+    + S.arrow('a1', 150, 132, 218, 132, { cls: 'hid', label: 'RunPodSandbox', ly: 122 })
+    + S.arrow('a2', 350, 120, 418, 70, { d: 'M 350 120 L 418 72', cls: 'hid', label: 'exec ADD', lx: 400, ly: 90 })
+    + S.arrow('a3', 550, 62, 603, 80, { d: 'M 550 62 L 603 80', cls: 'hid' })
+    + S.arrow('a4', 150, 145, 418, 200, { d: 'M 150 145 L 418 200', cls: 'hid', label: 'mount volume', lx: 290, ly: 185 })
+    + S.arrow('a5', 550, 202, 603, 155, { d: 'M 550 202 L 603 158', cls: 'hid' })
+    + S.arrow('a6', 350, 145, 603, 215, { d: 'M 350 145 L 603 215', cls: 'hid', label: 'CreateContainer / StartContainer', lx: 440, ly: 250 })
+    + S.text('m', 300, 290, '', { cls: 'sm b left' });
+  Anim.define('pod-create-plugins', { w: 720, h: 305, title: 'One Pod, three interfaces', ms: 2800, svg, steps: [
+    { c: 'The kubelet sees a Pod bound to its node with a PVC-backed volume. It has three jobs to delegate: a sandbox, an IP, and a mount.', on(q){ q('#kl rect').set('hl'); } },
+    { c: '<b>CRI</b>: <code>RunPodSandbox</code> asks containerd to create the pause container and the Pod\'s namespaces.', on(q){ q('#a1').show().set('hl'); q('#cri rect').set('hl'); q('#pause').show(); q('#m').text('sandbox created (namespaces exist, no network yet)'); } },
+    { c: '<b>CNI</b>: containerd reads <code>/etc/cni/net.d</code> and <i>executes</i> the plugin binary with <code>ADD</code> and the netns path. The plugin creates a veth, assigns an IP, and returns it.', on(q){ q('#a2').show().set('hl'); q('#cni rect').set('cy'); q('#a3').show().set('ok'); q('#ip').text('10.244.2.17'); q('#m').text('IP assigned by the CNI plugin, reported back through CRI'); } },
+    { c: '<b>CSI</b>: the kubelet asks the node plugin (via its socket in /var/lib/kubelet/plugins) to <code>NodePublishVolume</code> — bind-mount the already-attached, formatted disk into the Pod\'s volume directory.', on(q){ q('#a4').show().set('hl'); q('#csi rect').set('warn'); q('#a5').show().set('ok'); q('#vol').show(); q('#m').text('volume mounted at /var/lib/kubelet/pods/<uid>/volumes/…'); } },
+    { c: '<b>CRI</b> again: <code>CreateContainer</code> + <code>StartContainer</code> for each app container, joining the sandbox namespaces and bind-mounting the volume directory. Pod: Running.', on(q){ q('#a6').show().set('ok'); q('#app').show(); q('#kl rect').set('ok'); q('#m').text('Running — any of the three failing shows up as ContainerCreating'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

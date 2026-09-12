@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 7 · Kubernetes Architecture · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d07" data-root="../" data-linux="l07,l02,l05">
+<article class="lesson">
+<p class="lead">A Kubernetes cluster is a small number of <strong>control-plane</strong> processes that hold and act on desired state, plus any number of <strong>worker nodes</strong> that run the actual containers. Every process talks only to the API server, and the API server talks only to etcd. This page names each component, then follows one <code>kubectl apply</code> of a Deployment through all of them — the single most useful sequence to have in your head for the exam and for real troubleshooting.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The control-plane components: kube-apiserver, etcd, kube-scheduler, kube-controller-manager, cloud-controller-manager</li>
+<li>The node components: kubelet, kube-proxy, container runtime (containerd) and the CNI plugin</li>
+<li>The hub-and-spoke rule: everything goes through the API server; only the API server touches etcd</li>
+<li>Step by step: what happens between <code>kubectl apply -f deployment.yaml</code> and a running container</li>
+<li>How these components are actually installed on a Linux machine (static Pods and systemd)</li>
+</ul></div>
+
+<h2>The map</h2>
+<figure data-anim="arch-map"></figure>
+
+<h2>Control plane</h2>
+<dl class="kv">
+<dt>kube-apiserver</dt><dd>The front door and the <em>only</em> component that reads or writes etcd. Every request — from kubectl, from the scheduler, from a kubelet — is a REST call to the API server, where it is <strong>authenticated</strong>, <strong>authorized</strong>, run through <strong>admission controllers</strong>, validated, and persisted. It is stateless and can be scaled horizontally behind a load balancer.</dd>
+<dt>etcd</dt><dd>A distributed, strongly consistent key-value store (Raft consensus). It holds the entire cluster state: every object you have ever created lives here as a key like <code>/registry/deployments/default/web</code>. Lose etcd without a backup and you lose the cluster's memory; the nodes keep running containers, but nothing can be changed. Runs as 1, 3 or 5 members (odd numbers, for quorum).</dd>
+<dt>kube-scheduler</dt><dd>Watches for Pods that have no <code>spec.nodeName</code>, evaluates every node (filtering: enough CPU? tolerates the taints? matches affinity? — then scoring: spread, least-loaded, image locality) and writes its decision back to the API as a <em>Binding</em>. It never talks to nodes.</dd>
+<dt>kube-controller-manager</dt><dd>One binary running dozens of control loops: the Deployment controller, ReplicaSet controller, Node controller (marks nodes NotReady), Job controller, EndpointSlice controller, ServiceAccount controller, garbage collector… Each watches its kind of object and acts through the API.</dd>
+<dt>cloud-controller-manager</dt><dd>The cloud-specific loops split out so Kubernetes core stays vendor-neutral: creating cloud load balancers for <code>type: LoadBalancer</code> Services, attaching disks, labelling nodes with zone/region, deleting Node objects when the VM is gone.</dd>
+</dl>
+
+<h2>Worker nodes</h2>
+<dl class="kv">
+<dt>kubelet</dt><dd>The node agent. It registers the node, <em>watches</em> the API server for Pods assigned to it, and makes them real: pulls images, asks the runtime to create containers, mounts volumes, runs probes, and reports Pod and node status back. It is the only Kubernetes component that is not a Pod — it is a <strong>systemd service</strong> on the host, because something has to start the Pods.</dd>
+<dt>Container runtime</dt><dd>containerd (or CRI-O). The kubelet talks to it over the <strong>Container Runtime Interface</strong> (a gRPC socket, <code>/run/containerd/containerd.sock</code>). It pulls images and drives runc, exactly as on <a href="d01-docker-fundamentals.html">Day 1</a>.</dd>
+<dt>kube-proxy</dt><dd>Watches Services and EndpointSlices and programs the node's <strong>iptables</strong> (or IPVS) rules so that traffic to a Service's virtual IP is DNAT'ed to a healthy Pod. Runs as a DaemonSet. (Some CNIs, e.g. Cilium, replace it with eBPF.)</dd>
+<dt>CNI plugin</dt><dd>Calico, Cilium, Flannel, … Called by the runtime when a Pod is created to give it an IP and wire it into the cluster network. Not part of Kubernetes proper — a cluster without one has nodes stuck in <code>NotReady</code>. <a href="d25-cni-csi-cri.html">Day 25</a>.</dd>
+</dl>
+
+<div class="callout mental"><div class="ct">Mental model: hub and spoke</div><p>No component talks to another component directly — <em>everyone watches and writes the API server</em>. The scheduler does not tell the kubelet "start this"; it writes <code>nodeName</code> on the Pod, and the kubelet notices because it is watching for Pods with its name. This decoupling is why any single component can crash and restart without the others caring, and why the whole thing is extensible: your own controller uses the same watch-and-write pattern (<a href="d40-operators.html">Day 40</a>).</p></div>
+
+<h2>From <code>kubectl apply</code> to a running container</h2>
+<p>Play this one slowly. It is the sequence behind every exam question of the form "the Pod is Pending / ContainerCreating / not on the node I expected — why?"</p>
+<figure data-anim="deploy-flow"></figure>
+
+<ol class="steps">
+<li><strong>kubectl → API server.</strong> kubectl reads your kubeconfig, converts the YAML to JSON and sends <code>POST /apis/apps/v1/namespaces/default/deployments</code> over TLS.</li>
+<li><strong>Authentication, authorization, admission.</strong> The API server checks who you are (client cert / token), whether RBAC allows <code>create deployments</code> in that namespace, then runs admission plugins that may mutate (add defaults) or reject the object. <a href="d35-authorization-api.html">Days 35–38</a>.</li>
+<li><strong>Persist to etcd.</strong> The validated Deployment is written. The API server responds <code>201 Created</code>. Nothing is running yet.</li>
+<li><strong>Deployment controller</strong> (in kube-controller-manager) receives a watch event: new Deployment with no ReplicaSet → it creates a ReplicaSet with the Pod template and <code>replicas: 3</code>.</li>
+<li><strong>ReplicaSet controller</strong> sees a ReplicaSet with 0/3 Pods → creates three Pod objects. Each has <code>spec.nodeName</code> empty and status <code>Pending</code>.</li>
+<li><strong>Scheduler</strong> sees unscheduled Pods. For each: filter nodes, score the survivors, pick the winner, write a Binding. The Pod now has <code>nodeName: worker-2</code>. Still Pending.</li>
+<li><strong>kubelet on worker-2</strong> sees a Pod bound to it. It calls the CRI: pull image, create the Pod sandbox (the shared network namespace — the CNI plugin assigns the IP here), create and start containers. Status becomes <code>ContainerCreating</code> then <code>Running</code>.</li>
+<li><strong>Status flows back.</strong> The kubelet PATCHes the Pod status (IP, phase, container states) to the API server → etcd. <code>kubectl get pods</code> reads it from there — kubectl never contacts a node.</li>
+<li><strong>kube-proxy</strong> (if a Service selects these Pods) sees new EndpointSlices and rewrites iptables on every node so the Service IP now includes the new Pod.</li>
+</ol>
+
+<div class="callout linux" data-ref="l07,l02"><div class="ct">Under the hood · Linux (how the control plane is actually installed)</div>
+<p>On a kubeadm cluster the four control-plane components are ordinary containers — but a chicken-and-egg problem exists: who starts the API server before there is an API server? The answer is <strong>static Pods</strong>: the kubelet watches the directory <code>/etc/kubernetes/manifests/</code> and runs any Pod YAML it finds there, no API server required. So:</p>
+<pre><code class="lang-bash">$ systemctl status kubelet                 # the one real service
+$ ls /etc/kubernetes/manifests/            # etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml
+$ crictl ps | grep -E 'apiserver|etcd|scheduler|controller'   # they are just containers
+$ sudo ls /var/lib/etcd/member/            # etcd's data on disk
+$ ls /etc/kubernetes/pki/                  # the certificates they use to talk to each other</code></pre>
+<p>Edit a manifest in that directory and the kubelet restarts that component — this is how you change API-server flags, and it is how <a href="d57-troubleshoot-control-plane.html">Day 57</a> breaks and fixes control planes. Managed services (EKS, GKE, AKS) hide the control plane entirely; you only ever see worker nodes.</p></div>
+
+<h2>Where each component lives</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Component</th><th>Runs as</th><th>Listens on</th><th>Talks to</th></tr>
+<tr><td>kube-apiserver</td><td>static Pod</td><td>:6443 (TLS)</td><td>etcd :2379; is called by everything else</td></tr>
+<tr><td>etcd</td><td>static Pod</td><td>:2379 client, :2380 peer</td><td>other etcd members</td></tr>
+<tr><td>kube-scheduler</td><td>static Pod</td><td>:10259 (metrics/health)</td><td>API server</td></tr>
+<tr><td>kube-controller-manager</td><td>static Pod</td><td>:10257</td><td>API server</td></tr>
+<tr><td>kubelet</td><td>systemd service</td><td>:10250 (API server calls it for logs/exec)</td><td>API server, containerd socket, CNI</td></tr>
+<tr><td>kube-proxy</td><td>DaemonSet Pod</td><td>:10256 health</td><td>API server; writes iptables/IPVS</td></tr>
+<tr><td>CoreDNS</td><td>Deployment (add-on)</td><td>:53 via Service <code>kube-dns</code></td><td>API server (watches Services)</td></tr>
+<tr><td>CNI plugin (e.g. Calico)</td><td>DaemonSet + binaries in <code>/opt/cni/bin</code></td><td>varies</td><td>API server or its own datastore</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><p>Map symptoms to components: Pods stuck <code>Pending</code> with no node → scheduler (or no node fits); <code>Pending</code> with a node but nothing happening → kubelet/runtime on that node; <code>kubectl</code> times out → API server (or kubeconfig/cert); Deployments not creating ReplicaSets → controller-manager; Service traffic not arriving → kube-proxy/CNI; new Pods never get an IP → CNI. <code>kubectl get componentstatuses</code> is deprecated — use <code>kubectl get pods -n kube-system</code> and <code>kubectl get --raw /healthz</code>.</p></div>
+
+<div class="lab"><h3>Hands-on lab (10 min)</h3><p>Needs a cluster — create one on <a href="d08-kind-cluster.html">Day 8</a> and come back, or use a killercoda playground.</p>
+<pre><code class="lang-bash">$ kubectl get nodes -o wide
+$ kubectl get pods -n kube-system -o wide         # find apiserver, etcd, scheduler, controller-manager, kube-proxy, coredns
+$ kubectl create deployment web --image=nginx --replicas=2
+$ kubectl get deploy,rs,pods -o wide             # Deployment → ReplicaSet → Pods, with nodeName
+$ kubectl get events --sort-by=.metadata.creationTimestamp | tail -20   # Scheduled, Pulling, Created, Started
+$ kubectl describe pod -l app=web | grep -A12 Events
+$ docker exec kind-control-plane ls /etc/kubernetes/manifests   # KIND: static pod manifests inside the node container</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Control plane = API server (front door), etcd (memory), scheduler (placement), controller-manager (reconcile loops), cloud-controller-manager (cloud glue).</li>
+<li>Node = kubelet (runs Pods, reports status), container runtime via CRI, kube-proxy (Service rules), CNI (Pod networking).</li>
+<li>Hub and spoke: all components watch/write the API server; only the API server touches etcd.</li>
+<li><code>apply</code> → authn/authz/admission → etcd → Deployment ctrl → RS ctrl → Pods → scheduler binds → kubelet runs → status returns.</li>
+<li>Control-plane components are static Pods from <code>/etc/kubernetes/manifests</code>; the kubelet is the one systemd service.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---- static-ish map with highlight steps ---- */
+  function mapSvg() {
+    let s = S.zone('cp', 20, 20, 680, 150, 'Control plane')
+      + S.box('api', 250, 45, 190, 46, ['kube-apiserver', 'REST · authn · authz · admission'], { subfs: 9, subcls: 'muted' })
+      + S.box('etcd', 540, 45, 130, 46, ['etcd', 'cluster state'], { subfs: 9, subcls: 'muted' })
+      + S.box('sched', 40, 110, 160, 44, ['kube-scheduler', 'picks nodes'], { subfs: 9, subcls: 'muted' })
+      + S.box('cm', 250, 110, 190, 44, ['kube-controller-manager', 'reconcile loops'], { subfs: 9, subcls: 'muted' })
+      + S.box('ccm', 480, 110, 190, 44, ['cloud-controller-manager', 'LBs · disks · nodes'], { subfs: 9, subcls: 'muted' })
+      + S.arrow('a-api-etcd', 440, 68, 538, 68)
+      + S.arrow('a-sched', 200, 132, 248, 110, { d: 'M 200 132 L 248 100' })
+      + S.arrow('a-cm', 345, 110, 345, 93)
+      + S.arrow('a-ccm', 480, 132, 442, 100, { d: 'M 480 132 L 442 96' })
+      + S.icon('kc', 110, 60, 'laptop', { label: 'kubectl', ly: 28 })
+      + S.arrow('a-kc', 140, 68, 248, 68);
+    [0, 1].forEach(i => {
+      const x = 40 + i * 350;
+      s += S.node(`node${i}`, x, 195, 300, 150, `worker-${i + 1}`, {})
+        + S.box(`kubelet${i}`, x + 15, 235, 90, 36, 'kubelet', { fs: 11 })
+        + S.box(`proxy${i}`, x + 115, 235, 90, 36, 'kube-proxy', { fs: 11 })
+        + S.box(`cni${i}`, x + 215, 235, 70, 36, 'CNI', { fs: 11 })
+        + S.box(`rt${i}`, x + 15, 285, 120, 40, ['containerd', 'CRI'], { subfs: 9, subcls: 'muted' })
+        + S.pod(`pd${i}a`, x + 185, 305, 'pod') + S.pod(`pd${i}b`, x + 250, 305, 'pod')
+        + S.arrow(`a-kl${i}`, x + 60, 235, x + 60, 195, { d: `M ${x + 60} 235 L ${x + 60} 172 L 345 172 L 345 93`, cls: 'noarr' })
+        + S.arrow(`a-rt${i}`, x + 60, 271, x + 60, 283);
+    });
+    return s;
+  }
+  Anim.define('arch-map', { w: 720, h: 360, title: 'Cluster components', ms: 2400, svg: mapSvg(), steps: [
+    { c: 'Two planes. The <b>control plane</b> decides; the <b>worker nodes</b> do. In production the control plane is 3+ machines; in KIND it is one container.', on(q){ } },
+    { c: '<b>kube-apiserver</b> is the only thing anyone talks to — kubectl, every controller, every kubelet. It validates and stores.', on(q){ q('#api rect').set('hl'); q('#a-kc').set('hl'); } },
+    { c: '<b>etcd</b> is the only place state lives. Only the API server may read or write it.', on(q){ q('#etcd rect').set('hl'); q('#a-api-etcd').set('hl'); } },
+    { c: '<b>kube-scheduler</b> watches for Pods without a node and writes a decision. <b>kube-controller-manager</b> runs the reconcile loops. <b>cloud-controller-manager</b> talks to your cloud\'s API.', on(q){ q('#sched rect,#cm rect,#ccm rect').set('pur'); q('#a-sched,#a-cm,#a-ccm').set('hl'); } },
+    { c: 'On every node the <b>kubelet</b> watches the API server for its Pods and drives <b>containerd</b> through the CRI. The <b>CNI</b> plugin wires Pods into the network; <b>kube-proxy</b> programs Service routing.', on(q){ q('#kubelet0 rect,#kubelet1 rect').set('ok'); q('#a-kl0,#a-kl1,#a-rt0,#a-rt1').set('ok'); q('#rt0 rect,#rt1 rect').set('ok'); q('#cni0 rect,#cni1 rect,#proxy0 rect,#proxy1 rect').set('cy'); } },
+    { c: 'Notice there is no arrow from scheduler to kubelet, or controller to node. Everything is <b>watch the API, write the API</b>. That is the whole architecture.', on(q){ q.clear(); q('#api rect').set('hl'); } },
+  ]});
+
+  /* ---- deployment creation workflow ---- */
+  let d = S.zone('cp2', 20, 20, 680, 130, 'Control plane')
+    + S.box('api2', 250, 40, 190, 44, ['kube-apiserver'], { fs: 12 })
+    + S.box('etcd2', 540, 40, 130, 44, ['etcd'], { fs: 12 })
+    + S.box('sched2', 40, 100, 160, 40, ['scheduler'], { fs: 11 })
+    + S.box('cm2', 250, 100, 190, 40, ['controller-manager', 'Deployment · ReplicaSet ctrls'], { subfs: 8, subcls: 'muted' })
+    + S.icon('kc2', 110, 55, 'laptop', { label: 'kubectl apply -f deploy.yaml', ly: 28 })
+    + S.arrow('f1', 140, 62, 248, 62, { cls: 'hid' })
+    + S.arrow('f2', 440, 62, 538, 62, { cls: 'hid' })
+    + S.arrow('f3', 345, 100, 345, 86, { cls: 'hid' })
+    + S.arrow('f4', 200, 120, 248, 86, { d: 'M 200 118 L 250 84', cls: 'hid' })
+    + S.node('wn', 40, 175, 640, 160, 'worker-2', { sub: 'kubelet watching for pods with nodeName=worker-2' })
+    + S.box('kl2', 60, 225, 110, 40, ['kubelet'], { fs: 12 })
+    + S.box('rt2', 60, 280, 110, 40, ['containerd'], { fs: 12 })
+    + S.box('cni2', 200, 280, 90, 40, ['CNI → IP'], { fs: 11, hidden: true })
+    + S.arrow('f5', 115, 225, 115, 150, { d: 'M 115 225 L 115 160 L 345 160 L 345 86', cls: 'hid noarr' })
+    + S.arrow('f6', 115, 265, 115, 278, { cls: 'hid' })
+    + S.arrow('f7', 170, 300, 198, 300, { cls: 'hid' })
+    + S.dot('pk', 140, 62, { hidden: true, label: 'Deployment' })
+    + S.term('obj', 330, 190, 340, 130, ['objects in etcd:', '', '', '', '', ''], { fs: 10 });
+  // pods drawn as pods on node
+  d += S.pod('rp0', 420, 300, 'web-1', { cls: 'gray', hidden: true, w: 64 }) + S.pod('rp1', 500, 300, 'web-2', { cls: 'gray', hidden: true, w: 64 }) + S.pod('rp2', 580, 300, 'web-3', { cls: 'gray', hidden: true, w: 64 });
+  Anim.define('deploy-flow', { w: 720, h: 345, title: 'kubectl apply → running container', ms: 3000, svg: d, steps: [
+    { c: '<b>1.</b> kubectl converts the YAML to JSON and POSTs it to the API server over TLS, using the credentials from your kubeconfig.', on(q){ q('#pk').show().to(200, 62); q('#f1').show().set('hl'); } },
+    { c: '<b>2.</b> The API server <b>authenticates</b> you, checks <b>RBAC</b> for <code>create deployments</code>, runs <b>admission</b> plugins, validates the schema.', on(q){ q('#pk').to(345, 62); q('#api2 rect').set('hl'); } },
+    { c: '<b>3.</b> The Deployment is <b>persisted in etcd</b> and kubectl gets <code>deployment.apps/web created</code>. Nothing is running yet — only a record exists.', on(q){ q('#pk').to(600, 62); q('#f2').show().set('hl'); q('#etcd2 rect').set('hl'); q('#obj-l1').text('Deployment web  replicas=3').style('fill', 'var(--green)'); } },
+    { c: '<b>4.</b> The <b>Deployment controller</b> was watching. New Deployment, no ReplicaSet → it creates one with the Pod template.', on(q){ q('#pk').hide(); q('#etcd2 rect,#f2,#f1').set(); q('#cm2 rect').set('pur'); q('#f3').show().set('hl'); q('#obj-l2').text('  └ ReplicaSet web-7d9f  desired=3 current=0').style('fill', 'var(--purple)'); } },
+    { c: '<b>5.</b> The <b>ReplicaSet controller</b> sees 0 of 3 → creates three Pod objects. They have no <code>nodeName</code>; phase <code>Pending</code>.', on(q){ q('#obj-l3').text('      └ Pod web-7d9f-abc  nodeName: <none>  Pending').style('fill', 'var(--amber)'); q('#obj-l4').text('      └ Pod web-7d9f-def  nodeName: <none>  Pending').style('fill', 'var(--amber)'); q('#obj-l5').text('      └ Pod web-7d9f-ghi  nodeName: <none>  Pending').style('fill', 'var(--amber)'); } },
+    { c: '<b>6.</b> The <b>scheduler</b> sees unscheduled Pods, filters and scores nodes, and writes a Binding: <code>nodeName: worker-2</code>. Still Pending — the scheduler never touches the node.', on(q){ q('#cm2 rect').set(); q('#f3').set(); q('#sched2 rect').set('pur'); q('#f4').show().set('hl'); ['3','4','5'].forEach((n, i) => q('#obj-l' + n).text(`      └ Pod web-7d9f-${['abc','def','ghi'][i]}  nodeName: worker-2  Pending`)); } },
+    { c: '<b>7.</b> The <b>kubelet</b> on worker-2 sees Pods bound to it. Through the CRI it asks containerd to pull the image and create the sandbox; the <b>CNI</b> plugin assigns each Pod an IP; containers start.', on(q){ q('#sched2 rect,#f4').set(); q('#f5').show().set('ok'); q('#kl2 rect').set('ok'); q('#f6,#f7').show().set('ok'); q('#rt2 rect').set('ok'); q('#cni2').show(); q('#rp0,#rp1,#rp2').show(); } },
+    { c: '<b>8.</b> The kubelet reports status back — IP, phase <code>Running</code>, container states — which the API server stores in etcd. <code>kubectl get pods</code> reads that record; it never asks the node.', on(q){ q('#rp0 rect,#rp1 rect,#rp2 rect').set('ok'); ['3','4','5'].forEach((n, i) => q('#obj-l' + n).text(`      └ Pod web-7d9f-${['abc','def','ghi'][i]}  worker-2  10.244.1.${i+4}  Running`).style('fill', 'var(--green)')); } },
+  ]});
+})();
+</script>
+</body>
+</html>

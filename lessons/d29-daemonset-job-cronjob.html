@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 29 · DaemonSet, Job & CronJob · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d29" data-root="../" data-linux="l07" data-related="d10,d16,d22">
+<article class="lesson">
+<p class="lead">A Deployment answers "keep N copies running". Two other questions need their own controllers: "run <em>one copy on every node</em>" (a <strong>DaemonSet</strong> — agents, CNI, kube-proxy, log shippers) and "run this <em>until it finishes</em>, retrying if it fails" (a <strong>Job</strong>, and on a schedule, a <strong>CronJob</strong>). They share the Pod template and label-selector machinery you already know; what differs is what "desired state" means.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>DaemonSet: one Pod per (matching) node, tolerations, update strategy, and how it differs from a Deployment</li>
+<li>Job: completions, parallelism, backoffLimit, restartPolicy, activeDeadlineSeconds, TTL, indexed jobs</li>
+<li>CronJob: schedule syntax, concurrencyPolicy, startingDeadlineSeconds, history limits, suspend</li>
+<li>Running a CronJob by hand and the common failure modes</li>
+</ul></div>
+
+<h2>DaemonSet</h2>
+<figure data-anim="daemonset"></figure>
+<pre><code class="lang-yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels: {app: node-exporter}
+  updateStrategy:
+    type: RollingUpdate            # or OnDelete (new pods only when you delete old ones)
+    rollingUpdate:
+      maxUnavailable: 1            # nodes updated at a time (maxSurge also allowed)
+  template:
+    metadata:
+      labels: {app: node-exporter}
+    spec:
+      tolerations:                 # run on control-plane nodes too
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      nodeSelector:                # optional: only a subset of nodes
+        kubernetes.io/os: linux
+      hostNetwork: true            # agents often need the node's network/PID/paths
+      hostPID: true
+      containers:
+      - name: exporter
+        image: prom/node-exporter
+        ports: [{containerPort: 9100, hostPort: 9100}]
+        volumeMounts:
+        - {name: proc, mountPath: /host/proc, readOnly: true}
+      volumes:
+      - name: proc
+        hostPath: {path: /proc}</code></pre>
+<ul>
+<li>No <code>replicas</code>: the count is "number of nodes that match <code>nodeSelector</code>/affinity and whose taints are tolerated". Add a node → a Pod appears; remove it → gone.</li>
+<li>Since 1.12 the <em>default scheduler</em> places DaemonSet Pods (via node affinity injected by the controller), so they respect resources and can be Pending like anything else. They also get automatic tolerations for <code>not-ready</code>, <code>unreachable</code>, <code>disk-pressure</code>, <code>memory-pressure</code>, <code>pid-pressure</code>, <code>unschedulable</code> — so they run even on cordoned or pressured nodes.</li>
+<li>Rolling updates go node by node; <code>kubectl rollout status/history/undo ds/…</code> work.</li>
+<li>Typical residents of <code>kube-system</code>: kube-proxy, the CNI agent, CSI node plugin, node-exporter, Fluent Bit, security agents.</li>
+</ul>
+<pre><code class="lang-bash">$ kubectl get ds -A                     # DESIRED CURRENT READY UP-TO-DATE AVAILABLE NODE SELECTOR
+$ kubectl create deploy x --image=busybox $do | sed 's/Deployment/DaemonSet/;/replicas/d;/strategy/d' | kubectl apply -f -   # no "create ds"; convert a deployment
+$ kubectl rollout restart ds/node-exporter -n monitoring</code></pre>
+
+<h2>Job</h2>
+<pre><code class="lang-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: import
+spec:
+  completions: 5              # total successful pods needed (default 1)
+  parallelism: 2              # how many may run at once (default 1)
+  backoffLimit: 4             # failed pods before the Job is marked Failed (default 6)
+  activeDeadlineSeconds: 600  # kill everything after 10 min regardless
+  ttlSecondsAfterFinished: 3600   # garbage-collect the Job (and its pods) 1 h after it finishes
+  completionMode: Indexed     # optional: each pod gets JOB_COMPLETION_INDEX 0..N-1
+  template:
+    spec:
+      restartPolicy: OnFailure    # REQUIRED: OnFailure or Never (never Always)
+      containers:
+      - name: import
+        image: myimporter:1.4
+        command: ["./import", "--shard=$(JOB_COMPLETION_INDEX)"]</code></pre>
+<figure data-anim="job-run"></figure>
+<dl class="kv">
+<dt>restartPolicy: OnFailure</dt><dd>The kubelet restarts the failed container <em>in the same Pod</em> (back-off applies). Each restart counts toward <code>backoffLimit</code>.</dd>
+<dt>restartPolicy: Never</dt><dd>A failed Pod stays (for its logs) and the Job controller creates a <em>new</em> Pod. Easier to debug; more Pods lying around.</dd>
+<dt>completions / parallelism</dt><dd>Omit both → run one Pod to success. <code>completions: N</code> → N successes (queue-style). <code>parallelism: P</code> alone with no completions → "work queue" mode: Pods run until <em>any one</em> succeeds… actually until all running Pods exit successfully once one has — use with apps that pull from a queue.</dd>
+<dt>Indexed</dt><dd>Static sharding: each Pod knows its index (env var and annotation) and processes its slice; a failed index is retried with the same index.</dd>
+<dt>podFailurePolicy</dt><dd>Fine-grained: "exit code 42 → fail the Job immediately", "evicted by node drain → do not count against backoffLimit".</dd>
+<dt>suspend: true</dt><dd>Create the Job without starting it; flip to false to launch (used by queueing systems like Kueue).</dd>
+</dl>
+<pre><code class="lang-bash">$ kubectl create job hello --image=busybox -- echo hello
+$ kubectl get jobs -w                     # COMPLETIONS 0/1 → 1/1, DURATION
+$ kubectl get pods -l job-name=hello      # Completed
+$ kubectl logs job/hello
+$ kubectl describe job hello | grep -E 'Pods Statuses|Events' -A3
+$ kubectl delete job hello                # deletes its pods too (cascade)</code></pre>
+
+<h2>CronJob</h2>
+<pre><code class="lang-yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-report
+spec:
+  schedule: "30 2 * * *"            # 02:30 every day, in the controller-manager's timezone (UTC usually)
+  timeZone: "Europe/Berlin"         # 1.27+: explicit zone
+  concurrencyPolicy: Forbid         # Allow (default) · Forbid (skip if previous still running) · Replace (kill previous)
+  startingDeadlineSeconds: 300      # if it could not start within 5 min of schedule, skip this run
+  successfulJobsHistoryLimit: 3     # keep last 3 successful Jobs (default 3)
+  failedJobsHistoryLimit: 1         # default 1
+  suspend: false                    # true pauses scheduling
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: report
+            image: myreporter:2.0</code></pre>
+<pre data-title="cron syntax"><code>┌───────────── minute (0–59)
+│ ┌─────────── hour (0–23)
+│ │ ┌───────── day of month (1–31)
+│ │ │ ┌─────── month (1–12)
+│ │ │ │ ┌───── day of week (0–6, Sunday=0)
+* * * * *
+*/15 * * * *      every 15 minutes
+0 */6 * * *       every 6 hours
+0 9 * * 1-5       09:00 on weekdays
+@hourly @daily @weekly @monthly     also accepted</code></pre>
+<pre><code class="lang-bash">$ kubectl create cronjob backup --image=busybox --schedule="*/5 * * * *" -- sh -c 'date; echo backup'
+$ kubectl get cj                                   # SCHEDULE SUSPEND ACTIVE LAST SCHEDULE
+$ kubectl create job backup-now --from=cronjob/backup   # run it immediately
+$ kubectl get jobs -l ... ; kubectl logs job/backup-now
+$ kubectl patch cj backup -p '{"spec":{"suspend":true}}'   # pause</code></pre>
+<div class="callout warn"><div class="ct">CronJob gotchas</div><ul>
+<li>The CronJob controller checks every 10 s; a Job is created at most <em>once per schedule slot</em>. If a run is missed more than 100 times in a row (controller down, <code>startingDeadlineSeconds</code> unset), the CronJob stops scheduling and logs an error — set <code>startingDeadlineSeconds</code>.</li>
+<li>Jobs may occasionally run twice (at-least-once semantics). Make them idempotent.</li>
+<li><code>concurrencyPolicy: Forbid</code> is what you want for "the 2 a.m. job must not overlap yesterday's slow one".</li>
+<li>A Job's Pod template is <em>immutable</em>; changing the CronJob only affects future Jobs.</li>
+</ul></div>
+
+<div class="callout linux" data-ref="l07"><div class="ct">Under the hood · Linux</div><p>A DaemonSet is the cluster-wide equivalent of a systemd unit enabled on every host — and the node components that are <em>not</em> DaemonSets (kubelet, containerd) are precisely the ones systemd must start before any Pod can exist. Jobs and CronJobs are the successor to <code>cron</code>: instead of a crontab line on one machine (single point of failure, no retries, logs in local mail), you get a scheduled controller, retries with back-off, history, and logs in <code>kubectl logs</code>. The exit-code convention is the same one the shell uses — 0 is success, anything else counts as a failure toward <code>backoffLimit</code>.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>There is no <code>kubectl create daemonset</code>. Generate a Deployment, change <code>kind</code>, delete <code>replicas</code> and <code>strategy</code>.</li>
+<li><code>kubectl create job/cronjob</code> exist; add <code>completions</code>, <code>parallelism</code>, <code>backoffLimit</code> by editing the YAML. Remember <code>restartPolicy</code> must be <code>Never</code> or <code>OnFailure</code>.</li>
+<li>DaemonSet Pod missing on one node → check that node's taints vs the DaemonSet's tolerations, and <code>nodeSelector</code>.</li>
+<li>"Run the CronJob now" → <code>kubectl create job x --from=cronjob/y</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash"># DaemonSet
+$ kubectl create deploy agent --image=busybox $do -- sleep 3600 | sed 's/Deployment/DaemonSet/;/replicas/d;/strategy/d' | kubectl apply -f -
+$ kubectl get ds agent; kubectl get pods -l app=agent -o wide      # one per worker (control-plane tainted)
+$ kubectl patch ds agent --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists"}]}]'
+$ kubectl get pods -l app=agent -o wide                             # now on the control plane too
+# Job with retries
+$ kubectl create job flaky --image=busybox $do -- sh -c 'exit 1' | sed '/spec:/a\  backoffLimit: 2' | kubectl apply -f -
+$ kubectl get pods -l job-name=flaky -w                             # a few pods, then Job Failed
+$ kubectl describe job flaky | grep -A2 -E 'Conditions|BackoffLimitExceeded'
+# parallel indexed job
+$ kubectl create job shards --image=busybox $do -- sh -c 'echo shard $JOB_COMPLETION_INDEX; sleep 5' | sed '/spec:/a\  completions: 4\n  parallelism: 2\n  completionMode: Indexed' | kubectl apply -f -
+$ kubectl get pods -l job-name=shards -w; kubectl logs -l job-name=shards --prefix
+# CronJob
+$ kubectl create cronjob tick --image=busybox --schedule="*/1 * * * *" -- date
+$ sleep 70; kubectl get jobs; kubectl logs -l job-name --tail=1
+$ kubectl create job tick-now --from=cronjob/tick && kubectl logs job/tick-now
+$ kubectl delete ds agent; kubectl delete job flaky shards tick-now; kubectl delete cj tick</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>DaemonSet = one Pod per matching node; tolerate the control-plane taint to include masters; updates roll node by node.</li>
+<li>Job = run to completion with <code>completions</code>/<code>parallelism</code>/<code>backoffLimit</code>; <code>restartPolicy</code> must be OnFailure or Never; <code>ttlSecondsAfterFinished</code> cleans up.</li>
+<li>CronJob = Jobs on a cron schedule; set <code>concurrencyPolicy</code> and <code>startingDeadlineSeconds</code>; runs are at-least-once.</li>
+<li><code>kubectl create job --from=cronjob/x</code> to trigger manually; <code>suspend</code> to pause.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.box('ds', 20, 20, 240, 50, ['DaemonSet log-agent', 'tolerates control-plane taint'], { subfs: 9, subcls: 'muted' })
+    + S.text('cnt', 500, 48, 'desired 3 · current 3', { cls: 'sm mono muted' });
+  ['control-plane', 'worker-1', 'worker-2', 'worker-3 (new)'].forEach((n, i) => s1 += S.node(`n${i}`, 20 + i * 172, 100, 160, 150, n, { sub: i === 0 ? 'taint: NoSchedule' : '', gcls: i === 3 ? 'hid' : '' }) + S.pod(`p${i}`, 100 + i * 172, 190, 'agent', { cls: 'ok', hidden: i === 3 }));
+  s1 += S.text('m', 360, 280, '', { cls: 'sm b' });
+  Anim.define('daemonset', { w: 720, h: 295, title: 'DaemonSet: one per node', ms: 2600, svg: s1, steps: [
+    { c: 'A DaemonSet with three nodes: one Pod on each, including the control plane because the template tolerates its taint. No <code>replicas</code> field exists.', on(q){} },
+    { c: 'A fourth node joins the cluster. The DaemonSet controller sees a node with no matching Pod and creates one — no human action, no scaling.', on(q){ q('#n3').show(); q('#p3').show(); q('#cnt').text('desired 4 · current 4'); q('#m').text('node added → pod added'); } },
+    { c: 'The Pod on worker-2 is deleted (or crashes for good). Desired is still "one per node", so it is re-created there — never elsewhere.', on(q){ q('#p2').add('hid'); q('#cnt').text('desired 4 · current 3'); q('#m').text('pod lost → recreated on the same node'); } },
+    { c: 'Back to four.', on(q){ q('#p2').show(); q('#cnt').text('desired 4 · current 4'); q('#m').text(''); } },
+    { c: 'worker-1 is removed from the cluster. Its Pod is simply gone; nothing is rescheduled, because there is no node for it to belong to.', on(q){ q('#n1').add('hid'); q('#p1').add('hid'); q('#cnt').text('desired 3 · current 3'); q('#m').text('node removed → nothing to replace'); } },
+    { c: 'An image update rolls one node at a time (<code>maxUnavailable: 1</code>): delete old, create new, wait Ready, next node.', on(q){ q('#p0 rect').set('pur'); q('#m').text('rolling update: node by node'); } },
+  ]});
+
+  let s2 = S.box('job', 20, 20, 300, 60, ['Job import', 'completions: 5 · parallelism: 2 · backoffLimit: 4'], { subfs: 9, subcls: 'mono muted' })
+    + S.text('st', 520, 40, 'succeeded 0/5 · failed 0', { cls: 'sm mono muted' }) + S.text('st2', 520, 60, 'active 0', { cls: 'sm mono muted' })
+    + S.zone('run', 20, 100, 680, 120, 'running (≤ parallelism)')
+    + S.zone('done', 20, 235, 680, 60, 'finished pods');
+  for (let i = 0; i < 7; i++) s2 += S.pod(`p${i}`, 100 + (i % 2) * 120, 160, `pod-${i}`, { cls: 'hl', w: 64, hidden: true });
+  s2 += S.text('m', 360, 305, '', { cls: 'sm b' });
+  Anim.define('job-run', { w: 720, h: 315, title: 'Job: completions & parallelism', ms: 2500, svg: s2, steps: [
+    { c: 'The Job needs 5 successful completions and may run 2 Pods at once. The controller creates the first two.', on(q){ q('#p0,#p1').show(); q('#st2').text('active 2'); } },
+    { c: 'pod-0 exits 0 → succeeded 1/5. It is moved to "finished" (kept for logs) and a new Pod is created to keep 2 active.', on(q){ q('#p0 rect').set('ok'); q('#p0').to(80, 272); q('#p2').show(); q('#st').text('succeeded 1/5 · failed 0'); } },
+    { c: 'pod-1 <b>fails</b> (exit 1). With <code>restartPolicy: Never</code> it stays for inspection; failed = 1, counted against backoffLimit (4). A replacement starts after a back-off.', on(q){ q('#p1 rect').set('bad'); q('#p1').to(170, 272); q('#p3').show().to(220, 160); q('#st').text('succeeded 1/5 · failed 1'); q('#m').text('failures count toward backoffLimit'); } },
+    { c: 'The work continues two at a time. Each success increments the counter.', on(q){ q('#p2 rect,#p3 rect').set('ok'); q('#p2').to(260, 272); q('#p3').to(350, 272); q('#p4,#p5').show(); q('#p5').to(220, 160); q('#st').text('succeeded 3/5 · failed 1'); q('#m').text(''); } },
+    { c: 'Five successes reached → the Job condition <b>Complete</b> is set, remaining Pods (if any) are not created, and <code>ttlSecondsAfterFinished</code> starts its timer.', on(q){ q('#p4 rect,#p5 rect').set('ok'); q('#p4').to(440, 272); q('#p5').to(530, 272); q('#st').text('succeeded 5/5 · failed 1'); q('#st2').text('active 0 · Complete'); q('#job rect').set('ok'); q('#m').text('Complete → cleanup after TTL'); } },
+    { c: 'Had failures reached 4 first, the Job would be marked <b>Failed</b> (reason BackoffLimitExceeded), running Pods killed, and a CronJob would count it as a failed run.', on(q){ q('#m').text('alternative ending: backoffLimit exceeded → Failed'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 46 · Pod Priority, PriorityClass & Preemption · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d46" data-root="../" data-related="d18,d19,d20">
+<article class="lesson">
+<p class="lead">When a cluster is full, which Pod waits and which one runs? By default: whoever asked first. <strong>Priority</strong> lets you say that the payment API matters more than the nightly report — so the scheduler orders the queue by priority, and if a high-priority Pod cannot fit, it <strong>preempts</strong> (evicts) lower-priority Pods to make room. The same number also decides who is evicted first when a node runs out of memory. It is a small feature with sharp edges; the animation shows both.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>PriorityClass: value, globalDefault, preemptionPolicy, description</li>
+<li>How priority affects the scheduling queue, preemption, and kubelet eviction</li>
+<li>Preemption step by step, including graceful termination and <code>nominatedNodeName</code></li>
+<li>The built-in <code>system-cluster-critical</code> / <code>system-node-critical</code> classes</li>
+<li>Guardrails: PodDisruptionBudgets, non-preempting classes, and quotas per class</li>
+</ul></div>
+
+<h2>PriorityClass</h2>
+<pre><code class="lang-yaml">apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high                      # cluster-scoped
+value: 100000                     # higher = more important; user classes ≤ 1 000 000 000
+globalDefault: false              # true = applied to Pods with no priorityClassName (only one class may be default)
+preemptionPolicy: PreemptLowerPriority   # or Never (queue-jump only, no eviction)
+description: "Customer-facing services"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch
+value: -1000                      # negative is allowed
+preemptionPolicy: Never
+globalDefault: true</code></pre>
+<pre><code class="lang-yaml"># in a Pod / template
+spec:
+  priorityClassName: high         # admission resolves it to spec.priority: 100000
+  containers: [...]</code></pre>
+<pre><code class="lang-bash">$ kubectl get priorityclasses
+NAME                      VALUE        GLOBAL-DEFAULT   AGE
+system-cluster-critical   2000000000   false            30d
+system-node-critical      2000001000   false            30d
+$ kubectl get pod api-xyz -o jsonpath='{.spec.priority}{" "}{.spec.priorityClassName}{"\n"}'
+$ kubectl create priorityclass high --value=100000 --description="customer facing"</code></pre>
+<p>The two <code>system-*</code> classes are reserved for cluster components (CoreDNS, kube-proxy, CNI, metrics-server use <code>system-cluster-critical</code>; static control-plane Pods and the CNI DaemonSet use <code>system-node-critical</code>). Pods with no class and no global default get priority <strong>0</strong>. The <code>Priority</code> admission plugin resolves the name to a number at creation; changing the class later does not change existing Pods.</p>
+
+<h2>What priority changes</h2>
+<div class="grid-3">
+<div class="card"><h4>1 · Queue order</h4><p>The scheduling queue is sorted by priority, then arrival time. A high-priority Pod that arrives while 50 batch Pods are Pending is scheduled next.</p></div>
+<div class="card"><h4>2 · Preemption</h4><p>If no node fits, the scheduler looks for a node where evicting some <em>lower-priority</em> Pods would make it fit, evicts them, and reserves the node.</p></div>
+<div class="card"><h4>3 · Kubelet eviction</h4><p>Under node pressure, the kubelet ranks Pods by (usage above request, then priority): among Pods exceeding their requests, lower priority goes first.</p></div>
+</div>
+<figure data-anim="preemption"></figure>
+
+<h2>Preemption, precisely</h2>
+<ol class="steps">
+<li><strong>Trigger.</strong> Pod P (priority 100000) fails filtering on every node (<code>Insufficient cpu</code>). Preemption is only attempted for <em>unschedulable</em> Pods.</li>
+<li><strong>Candidate search.</strong> For each node, the scheduler simulates removing Pods with priority <em>lower</em> than P and checks whether P would fit. Pods with equal or higher priority are never victims. Nodes with a matching taint that P does not tolerate are skipped — preemption does not bypass taints or affinity.</li>
+<li><strong>Victim selection.</strong> Among feasible nodes it prefers: fewest PodDisruptionBudget violations, lowest highest-victim-priority, smallest sum of victim priorities, fewest victims, earliest start times. Then it removes as few Pods as possible from the chosen node.</li>
+<li><strong>Eviction.</strong> Victims are deleted through the API with their normal <code>terminationGracePeriodSeconds</code>. They are not killed instantly. Their ReplicaSets will re-create them elsewhere (or queue them).</li>
+<li><strong>Nomination.</strong> P gets <code>status.nominatedNodeName</code> so other Pods do not grab the freed space during the grace period. P is still <code>Pending</code> until the victims are gone and it is actually scheduled — and if a better node appears meanwhile, it may go there instead.</li>
+</ol>
+<pre><code class="lang-bash">$ kubectl get pod api-xyz -o jsonpath='{.status.nominatedNodeName}{"\n"}'
+$ kubectl get events --field-selector reason=Preempted
+$ kubectl describe pod batch-abc | grep -i preempt        # "Preempted by default/api-xyz on node worker-2"</code></pre>
+<div class="callout warn"><div class="ct">Sharp edges</div><ul>
+<li><strong>PDBs are best-effort here.</strong> Preemption prefers nodes where it does not violate a PodDisruptionBudget, but it <em>will</em> violate one if that is the only way to schedule a higher-priority Pod. Priority outranks PDBs.</li>
+<li><strong>Priority inflation.</strong> If every team sets <code>high</code>, nothing is high. Restrict who may use a class with a ResourceQuota <code>scopeSelector</code> on <code>PriorityClass</code> per namespace.</li>
+<li><strong>Cascades.</strong> A preempted Pod of priority 50 may in turn preempt priority 10 Pods on another node. Fine by design, surprising in practice.</li>
+<li><strong>Non-preempting</strong> (<code>preemptionPolicy: Never</code>) classes jump the queue but never evict — the right choice for batch work that should merely go first when space is free.</li>
+</ul></div>
+
+<h2>Priority vs QoS vs requests — who dies first?</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Situation</th><th>Decided by</th><th>Order</th></tr>
+<tr><td>Scheduler cannot place a Pod</td><td>Priority (preemption)</td><td>Lower-priority Pods on a feasible node are evicted, fewest first</td></tr>
+<tr><td>Node under memory/disk pressure</td><td>Kubelet eviction manager</td><td>Pods using more than their <em>request</em> first, ordered by priority (low first), then by usage-over-request</td></tr>
+<tr><td>Kernel OOM before the kubelet reacts</td><td><code>oom_score_adj</code> from QoS class</td><td>BestEffort (1000) → Burstable (2–999, scaled) → Guaranteed (−997); critical Pods get −997 too</td></tr>
+<tr><td>Node drain</td><td>Eviction API + PodDisruptionBudgets</td><td>Priority is irrelevant; PDBs are respected strictly</td></tr>
+</table></div>
+<p>So a Guaranteed, high-priority Pod is nearly untouchable; a BestEffort, priority-0 Pod is the first to go in every scenario. Set both deliberately for anything that matters (<a href="d19-requests-limits.html">Day 19</a>).</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Create a PriorityClass with value N and use it in a Pod" — <code>kubectl create priorityclass</code>, then <code>priorityClassName</code> in the spec. Verify <code>spec.priority</code> on the Pod.</li>
+<li>Pods being "randomly" evicted with reason <code>Preempted</code> → a higher-priority Pod could not fit. Check <code>get events</code> and the PriorityClasses.</li>
+<li>The system-* classes exist on every cluster; do not create classes above 1e9 — the API refuses.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl create priorityclass low --value=1000 && kubectl create priorityclass high --value=100000
+# fill a node: find allocatable CPU and request nearly all of it with low-priority pods
+$ kubectl describe node cka-worker | grep -A2 'Allocatable' | grep cpu
+$ kubectl create deploy filler --image=busybox --replicas=6 $do -- sleep 3600 | sed '/spec:/{n;s/containers:/priorityClassName: low\n      containers:/}' | sed '/image: busybox/a\        resources: {requests: {cpu: 500m}}' | kubectl apply -f -
+$ kubectl get pods -o wide -l app=filler                             # some Running, maybe some Pending — that is fine
+# now a high-priority pod that needs 1 CPU
+$ kubectl run vip --image=busybox --command --overrides='{"spec":{"priorityClassName":"high","containers":[{"name":"vip","image":"busybox","command":["sleep","3600"],"resources":{"requests":{"cpu":"1"}}}]}}' -- sleep 3600
+$ kubectl get pods -o wide -w                                        # filler pods get Terminating; vip gets nominatedNodeName then Running
+$ kubectl get events --field-selector reason=Preempted
+$ kubectl get pod vip -o jsonpath='{.spec.priority}{"\n"}'
+$ kubectl delete deploy filler; kubectl delete pod vip $now; kubectl delete priorityclass low high</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>PriorityClass = a number attached to Pods via <code>priorityClassName</code>; default 0; <code>system-*</code> reserved for components.</li>
+<li>Priority orders the scheduling queue, drives preemption when nothing fits, and breaks ties in kubelet eviction.</li>
+<li>Preemption evicts only lower-priority Pods, respects taints/affinity, uses grace periods, and nominates the node; PDBs are preferred but not guaranteed.</li>
+<li>Use <code>preemptionPolicy: Never</code> for "go first but never evict"; quota classes per namespace to prevent inflation.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.node('n', 20, 40, 420, 250, 'worker-2 · 4 CPU allocatable', {})
+    + S.bar('cpu', 120, 80, 280, 18, { label: 'requested', v: 280, cls: 'bad' }) + S.text('cpuv', 410, 94, '4/4', { cls: 'xs mono left' })
+    + S.pod('b1', 100, 160, 'batch-a', { w: 70, cls: 'gray', sub: 'prio 0 · 1 CPU' }) + S.pod('b2', 200, 160, 'batch-b', { w: 70, cls: 'gray', sub: 'prio 0 · 1 CPU' }) + S.pod('w1', 300, 160, 'web', { w: 70, cls: 'ok', sub: 'prio 1000 · 1 CPU' }) + S.pod('w2', 400, 160, 'web', { w: 70, cls: 'ok', sub: 'prio 1000 · 1 CPU' })
+    + S.term('q', 470, 40, 230, 120, ['scheduling queue', '  api (prio 100000) 2 CPU  ← head', '  report (prio 0) 1 CPU', '  etl (prio 0) 1 CPU'], { fs: 9 })
+    + S.pod('api', 585, 220, 'api', { w: 70, cls: 'pur', sub: 'prio 100000 · 2 CPU' })
+    + S.text('m', 360, 310, '', { cls: 'sm b' });
+  Anim.define('preemption', { w: 720, h: 325, title: 'Preemption', ms: 3000, svg, steps: [
+    { c: 'worker-2 is full: four Pods requesting 1 CPU each. A new <code>api</code> Pod with priority 100000 and a 2-CPU request sits at the <b>head</b> of the queue — ahead of older, lower-priority Pods.', on(q){ q('#q-l1').style('fill', 'var(--purple)'); } },
+    { c: 'Filtering fails on every node: <code>Insufficient cpu</code>. Because api is unschedulable and has preemption enabled, the scheduler looks for <b>victims</b>.', on(q){ q('#n rect').set('bad'); q('#m').text('0/1 nodes available → try preemption'); } },
+    { c: 'On worker-2, removing the two priority-0 batch Pods frees 2 CPU. The web Pods (prio 1000) are also lower than 100000 but evicting the batch pair is the smaller disruption. Victims chosen: batch-a, batch-b.', on(q){ q('#b1 rect,#b2 rect').set('bad'); q('#m').text('victims: lowest priority, fewest pods, no PDB violation'); } },
+    { c: 'The victims are <b>deleted gracefully</b> (SIGTERM, grace period). api gets <code>nominatedNodeName: worker-2</code> so the queue behind it cannot take the freed space. api is still Pending.', on(q){ q('#b1,#b2').add('hid'); q('#cpu-fill').attr('width', 140).set('warn'); q('#cpuv').text('2/4'); q('#api text:nth-of-type(2)').text('nominated: worker-2'); q('#m').text('grace period running; space reserved'); } },
+    { c: 'Victims gone → api is scheduled to worker-2. The batch Pods\' ReplicaSets re-create them; they go to the back of the queue at priority 0 and wait for room somewhere.', on(q){ q('#api').to(150, 160); q('#api').width(150); q('#api text:nth-of-type(2)').text('prio 100000 · 2 CPU · Running'); q('#cpu-fill').attr('width', 280).set('bad'); q('#cpuv').text('4/4'); q('#n rect').set(); q('#q-l1').text('  report (prio 0) 1 CPU').style('fill', 'var(--faint)'); q('#q-l2').text('  etl (prio 0) 1 CPU'); q('#q-l3').text('  batch-a, batch-b (recreated, prio 0)'); q('#m').text('api Running; batch pods Pending until capacity appears'); } },
+    { c: 'With <code>preemptionPolicy: Never</code> on api\'s class, step 3 would not happen: api would sit at the head of the queue and take the first 2 CPU that free up naturally — no evictions.', on(q){ q('#m').text('Never = queue-jump only'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 12 · Services In Depth · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d12" data-root="../" data-linux="l05,l08" data-related="d48,d49">
+<article class="lesson">
+<p class="lead">Pod IPs are ephemeral and Pods are many. A <strong>Service</strong> is a stable virtual IP and DNS name that load-balances to whichever Pods currently match a label selector. Four types build on each other — ClusterIP inside the cluster, NodePort on every node, LoadBalancer in front of the nodes, ExternalName for things outside — and all of them are, underneath, a set of iptables rules that kube-proxy keeps in sync.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>ClusterIP, NodePort, LoadBalancer and ExternalName — what each adds and when to use it</li>
+<li><code>port</code> vs <code>targetPort</code> vs <code>nodePort</code>, named ports, multi-port Services</li>
+<li>Endpoints/EndpointSlices: how a Service knows where its Pods are</li>
+<li>Headless Services and what they return from DNS</li>
+<li>How kube-proxy implements a Service with iptables DNAT and conntrack</li>
+</ul></div>
+
+<h2>The problem a Service solves</h2>
+<p>A Deployment of three <code>api</code> Pods has three IPs from the Pod network, say <code>10.244.1.5</code>, <code>10.244.2.9</code>, <code>10.244.2.10</code>. Tomorrow after a rollout they are different. A client cannot hard-code them, and even if it could, it would have to do its own load balancing and health checking. A Service gives the client one address — <code>10.96.0.42</code>, and the name <code>api</code> — that stays fixed for the Service's lifetime, and the cluster does the rest.</p>
+
+<h2>Four types, one layered picture</h2>
+<figure data-anim="service-types"></figure>
+
+<h3>ClusterIP (default) — reachable inside the cluster</h3>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080        # the Service's port (what clients use)
+    targetPort: 8080  # the container's port (what Pods listen on)</code></pre>
+<ul class="notes">
+<li><b>selector</b> — Pods with these labels (in the same namespace) become endpoints. A Service without a selector has no automatic endpoints — you can create them by hand to point at external IPs.</li>
+<li><b>port</b> — exposed on the ClusterIP. Clients connect to <code>api:8080</code>.</li>
+<li><b>targetPort</b> — the port in the Pod. Defaults to <code>port</code>. May be a <em>name</em> (<code>targetPort: http</code>) that matches a <code>containerPort</code> name — then Pods can listen on different numbers.</li>
+<li>The ClusterIP is allocated from the service CIDR (e.g. <code>10.96.0.0/12</code>) and is <strong>virtual</strong>: no interface has it. It only exists in iptables rules.</li>
+</ul>
+</div>
+<pre><code class="lang-bash">$ kubectl expose deployment api --port=8080 --target-port=8080 --name=api     # imperative equivalent
+$ kubectl get svc api
+NAME   TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)    AGE
+api    ClusterIP   10.96.0.42    &lt;none&gt;        8080/TCP   5s
+$ kubectl get endpointslices -l kubernetes.io/service-name=api   # the Pod IPs behind it
+$ kubectl run tmp --rm -it --image=busybox -- wget -qO- http://api:8080/health   # test from inside</code></pre>
+
+<h3>NodePort — reachable on every node's IP</h3>
+<pre><code class="lang-yaml">spec:
+  type: NodePort
+  selector: {app: web}
+  ports:
+  - port: 80          # ClusterIP port (still created)
+    targetPort: 8080  # container port
+    nodePort: 30080   # 30000–32767; omit to auto-allocate</code></pre>
+<p>A NodePort Service is a ClusterIP Service <em>plus</em> a rule on <strong>every node</strong>: traffic to <code>&lt;any-node-IP&gt;:30080</code> is forwarded to the Service, and from there to a Pod — which may be on a different node. Useful for dev clusters (KIND's <code>extraPortMappings</code> from <a href="d08-kind-cluster.html">Day 8</a>) and as the building block for LoadBalancer. Rarely exposed directly in production: awkward port numbers, no TLS, and clients must know node IPs.</p>
+
+<h3>LoadBalancer — a cloud load balancer in front</h3>
+<pre><code class="lang-yaml">spec:
+  type: LoadBalancer
+  selector: {app: web}
+  ports:
+  - port: 443
+    targetPort: 8443</code></pre>
+<p>On a cloud, the cloud-controller-manager sees this and provisions an external load balancer (AWS NLB/ELB, GCP forwarding rule, Azure LB) whose targets are the nodes on an automatically allocated NodePort. The LB's public IP appears in <code>EXTERNAL-IP</code>. On bare metal there is no cloud — <code>EXTERNAL-IP</code> stays <code>&lt;pending&gt;</code> forever unless you install MetalLB or similar. One LB per Service is expensive, which is why HTTP traffic usually goes through a single <a href="d49-ingress-part1.html">Ingress</a> instead.</p>
+
+<h3>ExternalName — a DNS alias, no proxying</h3>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: orders-db
+spec:
+  type: ExternalName
+  externalName: prod-db.abc123.eu-west-1.rds.amazonaws.com</code></pre>
+<p>No selector, no ClusterIP, no iptables. CoreDNS simply returns a <strong>CNAME</strong>: <code>orders-db.default.svc.cluster.local → prod-db.…rds.amazonaws.com</code>. Lets you refer to an external system by a cluster-local name and swap it later without touching applications. (Only works for hostnames; for a bare IP, create a selector-less Service and a manual EndpointSlice.)</p>
+
+<h2>Headless Services</h2>
+<pre><code class="lang-yaml">spec:
+  clusterIP: None      # headless
+  selector: {app: postgres}
+  ports: [{port: 5432}]</code></pre>
+<p>Set <code>clusterIP: None</code> and there is no virtual IP and no load balancing. A DNS lookup of the Service name returns <strong>all the Pod IPs</strong> as A records, and each Pod of a StatefulSet additionally gets its own stable name, <code>postgres-0.postgres.default.svc.cluster.local</code>. Use it when clients need to talk to <em>specific</em> replicas (database primaries, peer discovery in clustered systems) — <a href="d44-statefulsets.html">Day 44</a>.</p>
+
+<h2>Endpoints and EndpointSlices</h2>
+<p>A Service does not track Pods itself. The <strong>EndpointSlice controller</strong> watches Pods matching the selector and writes their IPs and readiness into EndpointSlice objects (max 100 endpoints each; the older <code>Endpoints</code> object still exists for compatibility). kube-proxy watches EndpointSlices, not Pods. A Pod that fails its <a href="d23-health-probes.html">readiness probe</a> is marked not-ready in the slice and stops receiving traffic — without being restarted.</p>
+<pre><code class="lang-bash">$ kubectl get endpointslices
+$ kubectl describe svc api | grep -E 'Endpoints|TargetPort'
+# "Endpoints: &lt;none&gt;" means: selector matches no Pods, or none are Ready, or the port name is wrong</code></pre>
+
+<h2>How kube-proxy makes a virtual IP work</h2>
+<figure data-anim="kube-proxy"></figure>
+<div class="callout linux" data-ref="l05"><div class="ct">Under the hood · Linux</div>
+<p>In iptables mode, kube-proxy writes a chain per Service (<code>KUBE-SVC-…</code>) in the <code>nat</code> table, hooked from <code>KUBE-SERVICES</code> in PREROUTING and OUTPUT. The Service chain has one rule per endpoint using the <code>statistic</code> module: with 3 endpoints, rule 1 matches with probability 1/3, rule 2 with 1/2 of the rest, rule 3 always — a random pick. Each endpoint chain (<code>KUBE-SEP-…</code>) does the actual <code>DNAT --to-destination 10.244.2.9:8080</code>. conntrack records the choice so every packet of that TCP connection goes to the same Pod, and replies are un-NATed on the way back. NodePorts are just an extra <code>KUBE-NODEPORTS</code> chain matching <code>dport 30080</code> that jumps to the same Service chain. IPVS mode replaces the rule list with a kernel hash table (better at thousands of Services); Cilium replaces it all with eBPF.</p>
+<pre><code class="lang-bash">$ sudo iptables -t nat -L KUBE-SERVICES -n | grep api
+$ sudo iptables -t nat -L KUBE-SVC-XXXX -n           # the statistic rules
+$ sudo conntrack -L | grep 10.96.0.42                # live NAT mappings
+$ kubectl -n kube-system logs ds/kube-proxy | head   # "Using iptables Proxier"</code></pre></div>
+
+<h2>Useful fields</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Field</th><th>Purpose</th></tr>
+<tr><td><code>sessionAffinity: ClientIP</code></td><td>Pin a client IP to one Pod (uses conntrack + timeout, default 3 h). Only tool for stickiness at L4.</td></tr>
+<tr><td><code>externalTrafficPolicy: Local</code></td><td>NodePort/LB: only route to Pods on the node that received the packet — preserves the client source IP and avoids an extra hop, but nodes without a Pod drop traffic (the LB health check handles that).</td></tr>
+<tr><td><code>internalTrafficPolicy: Local</code></td><td>Same idea for ClusterIP traffic (keep it on-node, e.g. for node-local caches).</td></tr>
+<tr><td><code>publishNotReadyAddresses: true</code></td><td>Include not-ready Pods in DNS — used by StatefulSets during bootstrap.</td></tr>
+<tr><td><code>ipFamilyPolicy / ipFamilies</code></td><td>Dual-stack IPv4/IPv6.</td></tr>
+<tr><td><code>loadBalancerClass</code>, annotations</td><td>Select which LB implementation; cloud-specific options (internal LB, NLB vs ALB, etc.).</td></tr>
+</table></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li><code>kubectl expose deploy web --port=80 --target-port=8080 --type=NodePort</code> then edit the <code>nodePort</code> if a specific one is required (expose cannot set it).</li>
+<li>"Service has no endpoints": compare <code>kubectl get svc -o yaml | grep -A3 selector</code> with <code>kubectl get pods --show-labels</code>; then check <code>targetPort</code> against <code>containerPort</code>; then Pod readiness.</li>
+<li>Test from inside with a throwaway Pod: <code>kubectl run t --rm -it --image=busybox:1.36 -- sh</code>, then <code>wget -qO- http://svc:port</code> or <code>nc -zv svc port</code>.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (20 min)</h3>
+<pre><code class="lang-bash">$ kubectl create deploy web --image=nginx --replicas=3 --port=80
+$ kubectl expose deploy web --port=80 --name=web
+$ kubectl get svc web -o wide && kubectl get endpointslices -l kubernetes.io/service-name=web
+$ kubectl run t --rm -it --image=busybox:1.36 -- sh -c 'for i in 1 2 3 4 5; do wget -qO- http://web | grep -o "nginx/[0-9.]*"; done; nslookup web'
+# NodePort
+$ kubectl patch svc web -p '{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":30080}]}}'
+$ curl localhost:30080                    # via KIND extraPortMappings from Day 8
+# readiness removes an endpoint without killing the pod
+$ kubectl exec deploy/web -- rm /usr/share/nginx/html/index.html   # (only one pod affected)
+# headless
+$ kubectl create svc clusterip web-headless --clusterip=None --tcp=80:80 --dry-run=client -o yaml | sed 's/app: web-headless/app: web/' | kubectl apply -f -
+$ kubectl run t --rm -it --image=busybox:1.36 -- nslookup web-headless   # three A records
+# under the hood (KIND node)
+$ docker exec cka-control-plane iptables -t nat -L KUBE-SERVICES -n | grep -E 'web'</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A Service = stable virtual IP + DNS name + label selector → EndpointSlices of ready Pod IPs.</li>
+<li>ClusterIP (inside) ⊂ NodePort (every node, 30000–32767) ⊂ LoadBalancer (cloud LB → NodePorts). ExternalName is just a CNAME.</li>
+<li><code>port</code> is the Service's, <code>targetPort</code> is the Pod's, <code>nodePort</code> is the node's.</li>
+<li>Headless (<code>clusterIP: None</code>) skips the VIP and returns Pod IPs from DNS — for StatefulSets and peer discovery.</li>
+<li>kube-proxy implements all of it with iptables DNAT + random endpoint selection + conntrack. No proxy process in the data path.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---- service types ---- */
+  let s1 = S.zone('cl', 20, 60, 680, 250, 'cluster')
+    + S.node('n1', 40, 100, 300, 190, 'node-1', { sub: '192.168.1.10' }) + S.node('n2', 380, 100, 300, 190, 'node-2', { sub: '192.168.1.11' })
+    + S.pod('p1', 100, 250, 'web', { cls: 'ok' }) + S.pod('p2', 190, 250, 'web', { cls: 'ok' }) + S.pod('p3', 440, 250, 'web', { cls: 'ok' })
+    + S.box('cip', 240, 150, 240, 44, ['ClusterIP 10.96.0.42:80', 'virtual — only in iptables'], { subfs: 9, subcls: 'muted', cls: 'hl', hidden: true })
+    + S.pod('cl1', 560, 250, 'client', { cls: 'gray', w: 60 })
+    + S.arrow('c1', 560, 235, 480, 175, { d: 'M 560 235 L 470 194', cls: 'hid' })
+    + S.arrow('c2', 300, 194, 190, 235, { d: 'M 300 194 L 195 235', cls: 'hid' })
+    + S.box('np1', 60, 128, 130, 30, 'nodePort :30080', { fs: 10, cls: 'cy', hidden: true }) + S.box('np2', 400, 128, 130, 30, 'nodePort :30080', { fs: 10, cls: 'cy', hidden: true })
+    + S.icon('ext', 120, 30, 'user', { label: 'external client', ly: -18, lcls: 'muted', hidden: true })
+    + S.arrow('e1', 145, 40, 125, 126, { d: 'M 150 35 L 125 126', cls: 'hid' })
+    + S.box('lb', 260, 14, 200, 36, ['LoadBalancer 203.0.113.7:80'], { fs: 10, cls: 'pur', hidden: true })
+    + S.arrow('l1', 330, 50, 200, 128, { d: 'M 320 50 L 190 128', cls: 'hid' }) + S.arrow('l2', 400, 50, 470, 128, { d: 'M 400 50 L 460 128', cls: 'hid' })
+    + S.arrow('l0', 152, 30, 258, 30, { cls: 'hid' });
+  Anim.define('service-types', { w: 720, h: 320, title: 'ClusterIP → NodePort → LoadBalancer', ms: 2800, svg: s1, steps: [
+    { c: 'Three <code>web</code> Pods on two nodes, each with its own Pod IP. Nothing stable to point at yet.', on(q){} },
+    { c: '<b>ClusterIP</b>: a virtual IP (10.96.0.42) that every node knows how to reach via iptables. Any Pod in the cluster can call <code>web:80</code>.', on(q){ q('#cip').show(); } },
+    { c: 'A client Pod connects to the ClusterIP; iptables on <i>its</i> node picks one endpoint — possibly on another node — and DNATs to it.', on(q){ q('#c1,#c2').show().set('hl'); } },
+    { c: '<b>NodePort</b> adds a listener on port 30080 on <b>every</b> node. External clients can hit any node IP; the packet is forwarded into the same ClusterIP machinery.', on(q){ q('#np1,#np2,#ext').show(); q('#e1').show().set('hl'); q('#c1,#c2').set(); } },
+    { c: '<b>LoadBalancer</b> asks the cloud for an external LB with a public IP whose backends are the nodes\' NodePort. Clients use one address; the LB spreads across nodes; nodes spread across Pods.', on(q){ q('#lb').show(); q('#l1,#l2').show().set('hl'); q('#e1').set(); q('#e1').add('hid'); q('#l0').show().set('hl'); q('#ext').to(120, 30); } },
+    { c: 'Each type <b>includes</b> the ones below it: a LoadBalancer Service still has a NodePort and a ClusterIP. <code>kubectl get svc</code> shows all three columns.', on(q){ q('#cip rect,#np1 rect,#np2 rect,#lb rect').set('ok'); } },
+  ]});
+
+  /* ---- kube-proxy ---- */
+  let s2 = S.node('nd', 20, 20, 680, 300, 'node-1 — network namespace of the host', {})
+    + S.pod('cli', 90, 120, 'client', { cls: 'gray', w: 64, sub: '10.244.1.3' })
+    + S.term('rules', 200, 60, 300, 130, ['iptables -t nat  (written by kube-proxy)', 'KUBE-SERVICES:', ' dst 10.96.0.42:80 → KUBE-SVC-API', 'KUBE-SVC-API:', ' statistic p=0.33 → SEP-1 (10.244.1.5)', ' statistic p=0.50 → SEP-2 (10.244.2.9)', '              → SEP-3 (10.244.2.10)'], { fs: 9.5 })
+    + S.box('ct', 200, 210, 300, 40, ['conntrack: 10.244.1.3:51234 → 10.96.0.42:80  ⇒  10.244.2.9:8080'], { fs: 9, lcls: 'mono', hidden: true })
+    + S.pod('e1', 580, 90, 'api', { cls: 'ok', sub: '10.244.1.5' }) + S.pod('e2', 580, 170, 'api', { cls: 'ok', sub: '10.244.2.9' }) + S.pod('e3', 580, 250, 'api', { cls: 'ok', sub: '10.244.2.10' })
+    + S.dot('pk', 90, 100, { hidden: true, label: 'dst 10.96.0.42:80' })
+    + S.arrow('a1', 125, 120, 198, 120, { cls: 'hid' }) + S.arrow('a2', 500, 150, 548, 170, { cls: 'hid' })
+    + S.arrow('a3', 548, 190, 500, 215, { d: 'M 548 185 L 500 222', cls: 'hid' })
+    + S.arrow('a4', 198, 230, 130, 140, { d: 'M 198 230 L 128 140', cls: 'hid' });
+  Anim.define('kube-proxy', { w: 720, h: 330, title: 'kube-proxy (iptables mode)', ms: 3000, svg: s2, steps: [
+    { c: 'kube-proxy has already written the rules: one chain per Service, one per endpoint. It does <b>not</b> sit in the data path — the kernel does the work.', on(q){ q('#rules-l0').style('fill', 'var(--accent)'); } },
+    { c: 'The client sends a SYN to the Service VIP <code>10.96.0.42:80</code>. No interface has this IP; the packet enters netfilter\'s OUTPUT hook on the client\'s own node.', on(q){ q('#pk').show().to(160, 100); q('#a1').show().set('hl'); } },
+    { c: '<code>KUBE-SERVICES</code> matches the destination and jumps to the Service chain. The <code>statistic</code> rules make a weighted random choice: this time endpoint 2.', on(q){ q('#pk').to(350, 100); q('#rules-l2,#rules-l3,#rules-l5').style('fill', 'var(--green)'); } },
+    { c: 'The endpoint chain does <b>DNAT</b>: destination becomes <code>10.244.2.9:8080</code>. The packet is routed over the Pod network (CNI) to node-2 and delivered to the Pod.', on(q){ q('#pk').to(560, 150).text('dst 10.244.2.9:8080'); q('#a2').show().set('ok'); q('#e2 rect').set('hl'); } },
+    { c: '<b>conntrack</b> records the translation. Every later packet on this connection skips the rules and goes to the same Pod; replies are reverse-NATed so the client sees the VIP as the source.', on(q){ q('#ct').show(); q('#a3').show().set('hl'); q('#a4').show().set('hl'); q('#pk').to(120, 100).text('src 10.96.0.42:80'); } },
+    { c: 'When a Pod becomes not-ready or is deleted, the EndpointSlice changes and kube-proxy rewrites the chain within about a second. No connections to remaining Pods are touched.', on(q){ q('#e3 rect').set('bad'); q('#rules-l6').text('              (removed)').style('fill', 'var(--red)'); q('#rules-l4').text(' statistic p=0.50 → SEP-1 (10.244.1.5)'); q('#rules-l5').text('              → SEP-2 (10.244.2.9)'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

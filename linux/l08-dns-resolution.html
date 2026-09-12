@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L8 · DNS Resolution on Linux · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="l08" data-root="../" data-related="d14,d48,d12">
+<article class="lesson">
+<p class="lead">CoreDNS answers queries; it does not decide <em>which</em> queries get asked. That is decided inside each container by the C library, following <code>/etc/nsswitch.conf</code>, <code>/etc/hosts</code> and <code>/etc/resolv.conf</code> — three files the kubelet writes for every Pod. Understanding the resolver explains short names, the ndots tax, why Alpine behaves differently, and how to debug "cannot resolve" with the right tool.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The resolution pipeline: <code>getaddrinfo</code> → nsswitch → hosts file → resolv.conf → nameserver</li>
+<li><code>resolv.conf</code> fields: nameserver, search, options (ndots, timeout, attempts, rotate)</li>
+<li>systemd-resolved and the stub resolver; what the node's resolv.conf really is</li>
+<li>Tools and their differences: <code>getent</code>, <code>dig</code>, <code>nslookup</code>, <code>host</code>, <code>resolvectl</code></li>
+<li>Record types you will query and how caching/TTL behave</li>
+</ul></div>
+
+<h2>The pipeline</h2>
+<figure data-anim="resolver"></figure>
+<pre><code class="lang-bash">$ cat /etc/nsswitch.conf | grep hosts
+hosts: files dns                                # order of sources: /etc/hosts first, then DNS (systemd: "files resolve dns", "mymachines", "myhostname")
+$ cat /etc/hosts
+127.0.0.1 localhost
+10.244.1.9 api-7f9c                              # the kubelet writes the Pod's own name here (+ hostAliases)
+$ cat /etc/resolv.conf
+nameserver 10.96.0.10
+search shop.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</code></pre>
+<p>Every program that calls <code>getaddrinfo("api")</code> (curl, python, Go's resolver in cgo mode, java) goes through this. <strong>Go's pure-Go resolver</strong> and <strong>musl</strong> (Alpine) reimplement it with small differences; <strong>dig</strong> bypasses it entirely and talks DNS directly — which is why <code>dig api</code> fails while <code>curl api</code> works: dig does not use the search list unless you pass <code>+search</code>.</p>
+
+<h2>resolv.conf</h2>
+<dl class="kv">
+<dt>nameserver</dt><dd>Up to 3 servers, tried in order (unless <code>options rotate</code>); each gets <code>timeout</code> seconds × <code>attempts</code> tries. In a Pod: the CoreDNS Service IP.</dd>
+<dt>search</dt><dd>Domains appended to names that are not fully qualified. Up to 6 domains / 256 chars (glibc). The kubelet writes the Pod's namespace domain first.</dd>
+<dt>options ndots:N</dt><dd>A name with fewer than N dots is tried with each search domain <em>first</em>, then as-is. Default 1; Kubernetes sets 5 so <code>svc.ns.svc</code> (2 dots) still searches. A trailing dot (<code>example.com.</code>) marks a name absolute and skips the search list.</dd>
+<dt>options timeout:T attempts:A</dt><dd>Per-server timeout (default 5 s) and retries (2). With 3 search domains failing and one slow server, a single lookup can take 30+ seconds — the "DNS is slow" symptom.</dd>
+<dt>options single-request-reopen / use-vc</dt><dd>Workarounds for conntrack races on parallel A/AAAA UDP queries (glibc sends both at once; some setups lose one). <code>use-vc</code> forces TCP.</dd>
+</dl>
+<pre><code class="lang-bash">$ resolvectl status                       # on systemd-resolved hosts: the REAL upstream servers per interface
+$ ls -l /etc/resolv.conf                  # → ../run/systemd/resolve/stub-resolv.conf (nameserver 127.0.0.53) on Ubuntu
+$ cat /run/systemd/resolve/resolv.conf     # the actual upstream servers — what the kubelet's --resolv-conf should point at (kubeadm handles this)</code></pre>
+<p>That last point matters for CoreDNS: its Pod runs with <code>dnsPolicy: Default</code>, so it inherits the node's resolv.conf. If that says <code>127.0.0.53</code> (the resolved stub), CoreDNS would forward to itself → the <code>loop</code> plugin detects it and crashes. kubeadm sets the kubelet's <code>resolvConf</code> to the real file; on custom setups this is a classic CoreDNS CrashLoopBackOff.</p>
+
+<h2>Tools</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<tr><th>Command</th><th>Goes through</th><th>Use it for</th></tr>
+<tr><td>getent hosts api</td><td>libc (nsswitch, hosts, search list) — exactly what apps do</td><td>"Would my application resolve this?" The most honest test.</td></tr>
+<tr><td>getent ahosts api</td><td>libc, all addresses</td><td>IPv4 + IPv6 as the app sees them</td></tr>
+<tr><td>nslookup api.shop</td><td>DNS directly, but applies the search list</td><td>busybox has it; fine for Pods</td></tr>
+<tr><td>dig api.shop.svc.cluster.local · dig +search api · dig @10.96.0.10 x · dig +trace · dig -x IP</td><td>DNS directly (no nsswitch, no hosts, no search unless +search)</td><td>Precise answers, flags, TTLs, specific servers. In netshoot, not busybox.</td></tr>
+<tr><td>host name</td><td>DNS directly</td><td>Terse output</td></tr>
+<tr><td>resolvectl query name</td><td>systemd-resolved</td><td>On nodes with resolved</td></tr>
+<tr><td>tcpdump -i any port 53 -nn</td><td>—</td><td>See the actual queries (and the ndots retries) leaving the Pod/node</td></tr>
+</table></div>
+<pre><code class="lang-bash">$ dig +short api.shop.svc.cluster.local              # 10.96.4.7
+$ dig api.shop.svc.cluster.local | grep -E 'status|ANSWER|^api'   # NOERROR / NXDOMAIN, TTL 30
+$ dig +search +short api                            # honours resolv.conf search — like an app would
+$ dig -t SRV _http._tcp.api.shop.svc.cluster.local  # SRV: port + target
+$ dig -x 10.96.4.7 +short                           # PTR: api.shop.svc.cluster.local.
+$ dig +norecurse @10.96.0.10 api.shop.svc.cluster.local    # authoritative answer flag (aa) from CoreDNS
+$ getent hosts api || echo "libc cannot resolve api here"</code></pre>
+
+<h2>Records and caching</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Type</th><th>Maps</th><th>In Kubernetes</th></tr>
+<tr><td>A / AAAA</td><td>name → IPv4 / IPv6</td><td>Services, Pods, headless endpoints</td></tr>
+<tr><td>CNAME</td><td>alias → canonical name</td><td>ExternalName Services</td></tr>
+<tr><td>SRV</td><td>service → priority, weight, port, target</td><td>Named ports: <code>_port._proto.svc.ns.svc.cluster.local</code></td></tr>
+<tr><td>PTR</td><td>IP → name (reverse)</td><td>Service and Pod IPs (<code>in-addr.arpa</code> zone handled by CoreDNS)</td></tr>
+<tr><td>NS / SOA</td><td>Zone delegation / authority</td><td><code>cluster.local</code> SOA from CoreDNS</td></tr>
+<tr><td>TXT</td><td>Text</td><td>ACME DNS-01 challenges, external-dns ownership records</td></tr>
+</table></div>
+<p>Every record carries a <strong>TTL</strong>; resolvers cache for that long. CoreDNS uses 30 s for cluster records and caches upstream answers (<code>cache 30</code>). glibc itself does <em>not</em> cache (nscd/sssd do, if installed); Java's JVM caches forever by default (<code>networkaddress.cache.ttl</code>) — an old gotcha when Service IPs change. Node-local caches (NodeLocal DNSCache, systemd-resolved) add another layer. When a name "still resolves to the old IP", walk the layers.</p>
+
+<h2>Debugging "cannot resolve"</h2>
+<ol class="steps">
+<li><strong>Which resolver?</strong> <code>cat /etc/resolv.conf</code> in the Pod. Wrong nameserver → dnsPolicy/hostNetwork issue (<a href="../lessons/d48-dns-coredns.html">Day 48</a>).</li>
+<li><strong>Is it reachable?</strong> <code>nc -zu 10.96.0.10 53</code>, or <code>dig @10.96.0.10 kubernetes.default.svc.cluster.local</code>. Timeout → NetworkPolicy, kube-proxy, CoreDNS Pods down.</li>
+<li><strong>Does the record exist?</strong> <code>dig</code> the FQDN with a trailing dot. NXDOMAIN → wrong name/namespace or Service missing.</li>
+<li><strong>Is it the search list?</strong> <code>getent hosts short-name</code> vs the FQDN. Works FQDN-only → search/ndots problem (<code>dnsConfig</code>, or the app uses a resolver that ignores search).</li>
+<li><strong>Is it slow rather than broken?</strong> <code>time getent hosts x</code>; <code>tcpdump port 53</code> shows retries and which server is not answering.</li>
+<li><strong>External names?</strong> CoreDNS forwarding: <code>kubectl -n kube-system logs -l k8s-app=kube-dns</code>; the node's own resolv.conf; egress firewall on 53.</li>
+</ol>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ grep hosts /etc/nsswitch.conf; cat /etc/resolv.conf; resolvectl status 2&gt;/dev/null | head
+$ getent hosts localhost; getent hosts kubernetes.io; getent hosts nope.invalid || echo "NXDOMAIN via libc"
+$ dig +short kubernetes.io; dig kubernetes.io | grep -E 'status|Query time|SERVER'
+$ dig +trace kubernetes.io | grep -E '^(kubernetes|io\.|\.)' | head
+# see the search list in action (any Linux box): add a search domain and watch the queries
+$ sudo tcpdump -i any port 53 -nn -l 2&gt;/dev/null &amp; sleep 1
+$ RES_OPTIONS="ndots:3" getent hosts www.example.com &gt;/dev/null      # glibc honours RES_OPTIONS: watch extra queries with your search domain appended
+$ kill %1
+# in a Pod (KIND):
+$ kubectl run t --rm -it --image=nicolaka/netshoot -- sh -c 'cat /etc/resolv.conf; getent hosts kubernetes.default; dig +short kubernetes.default.svc.cluster.local; dig kubernetes.default 2&gt;&1 | grep status; dig +search +short kubernetes.default'</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Resolution happens in libc: nsswitch → /etc/hosts → resolv.conf nameservers, with the search list and ndots applied to short names.</li>
+<li>The kubelet writes hosts/resolv.conf per Pod; CoreDNS is just the nameserver they point at.</li>
+<li><code>getent hosts</code> tests what apps see; <code>dig</code> tests DNS itself (no search list unless <code>+search</code>); <code>nslookup</code> is in between.</li>
+<li>ndots:5 + search list = extra queries for external names; trailing dots and lower ndots fix it.</li>
+<li>systemd-resolved's stub (127.0.0.53) must not be what CoreDNS forwards to; TTLs and caches explain stale answers.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.box('app', 20, 30, 120, 44, ['app', 'getaddrinfo("api")'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('libc', 180, 30, 130, 44, ['libc resolver', 'nsswitch: files dns'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('hosts', 180, 110, 130, 44, ['/etc/hosts', 'api? no'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('rc', 350, 30, 170, 60, ['/etc/resolv.conf', 'search shop.svc… svc… cluster.local', 'ndots:5'], { subfs: 8, subcls: 'mono muted' })
+    + S.box('ns', 570, 30, 130, 44, ['nameserver', '10.96.0.10 (CoreDNS)'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.term('q', 20, 180, 680, 90, ['queries sent (UDP 53):', '', '', ''], { fs: 9.5 })
+    + S.arrow('a1', 140, 52, 178, 52) + S.arrow('a2', 245, 74, 245, 108, { cls: 'hid' }) + S.arrow('a3', 310, 52, 348, 52, { cls: 'hid' }) + S.arrow('a4', 520, 52, 568, 52, { cls: 'hid' })
+    + S.text('m', 360, 295, '', { cls: 'sm b' });
+  Anim.define('resolver', { w: 720, h: 310, title: 'What happens on getaddrinfo("api")', ms: 2800, svg, steps: [
+    { c: 'The app calls <code>getaddrinfo("api")</code>. This is a library function, not a syscall; the kernel has no idea what DNS is.', on(q){ q('#a1').set('hl'); } },
+    { c: 'libc reads <code>/etc/nsswitch.conf</code>: <code>hosts: files dns</code>. Source 1, <b>files</b>: scan <code>/etc/hosts</code>. "api" is not there (only the Pod\'s own name).', on(q){ q('#a2').show().set('hl'); q('#hosts rect').set('warn'); } },
+    { c: 'Source 2, <b>dns</b>: read <code>/etc/resolv.conf</code>. "api" has 0 dots &lt; ndots 5 → it is relative: build candidates from the search list.', on(q){ q('#a3').show().set('hl'); q('#rc rect').set('hl'); q('#m').text('candidates: api.shop.svc.cluster.local, api.svc.cluster.local, api.cluster.local, api'); } },
+    { c: 'Send the first candidate to the nameserver (an A and an AAAA query, in parallel, over UDP). CoreDNS answers from its Service watch: <b>10.96.4.7</b>. Done — the remaining candidates are never tried.', on(q){ q('#a4').show().set('ok'); q('#ns rect').set('cy'); q('#q-l1').text('api.shop.svc.cluster.local  A → 10.96.4.7  (TTL 30)').style('fill', 'var(--green)'); q('#q-l2').text('api.shop.svc.cluster.local  AAAA → (none)').style('fill', 'var(--muted)'); q('#m').text('1 round trip for an in-namespace short name'); } },
+    { c: 'Contrast <code>getaddrinfo("api.example.com")</code> (2 dots): the same loop first sends <code>api.example.com.shop.svc.cluster.local</code> → NXDOMAIN, then two more suffixes → NXDOMAIN, then the bare name → answer. Four round trips; visible with tcpdump.', on(q){ q('#q-l1').text('api.example.com.shop.svc.cluster.local  NXDOMAIN').style('fill', 'var(--red)'); q('#q-l2').text('api.example.com.svc.cluster.local  NXDOMAIN · api.example.com.cluster.local  NXDOMAIN').style('fill', 'var(--red)'); q('#q-l3').text('api.example.com  A → 52.1.2.3  (forwarded upstream)').style('fill', 'var(--green)'); q('#m').text('the ndots tax; fix with a trailing dot or dnsConfig ndots:2'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

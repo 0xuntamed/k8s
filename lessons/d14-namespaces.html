@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 14 · Namespaces · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d14" data-root="../" data-linux="l02,l08" data-related="d19,d36,d47">
+<article class="lesson">
+<p class="lead">A Namespace is a named partition of the cluster's <em>API objects</em>: a place to put a team's or an environment's Deployments, Services and Secrets so names do not collide, quotas can be applied and permissions can be scoped. It is <strong>not</strong> a security boundary by itself and it does not isolate networks — those come from RBAC and NetworkPolicies layered on top. Understanding exactly what a Namespace does and does not partition saves a lot of confusion.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>What is namespaced and what is cluster-scoped</li>
+<li>The built-in namespaces and what lives in them</li>
+<li>Cross-namespace DNS: <code>svc.ns.svc.cluster.local</code></li>
+<li>ResourceQuota and LimitRange per namespace</li>
+<li>Working with <code>-n</code>, <code>-A</code>, default namespace, and deleting namespaces safely</li>
+</ul></div>
+
+<h2>What a Namespace partitions</h2>
+<figure data-anim="ns-scope"></figure>
+<pre><code class="lang-bash">$ kubectl api-resources --namespaced=true  | head     # pods, services, deployments, configmaps, secrets, pvc, roles…
+$ kubectl api-resources --namespaced=false | head     # nodes, namespaces, persistentvolumes, storageclasses, clusterroles, crds…</code></pre>
+<div class="tbl-wrap"><table>
+<tr><th>Namespaced (per-namespace names)</th><th>Cluster-scoped (one flat set)</th></tr>
+<tr><td>Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob</td><td>Node, Namespace</td></tr>
+<tr><td>Service, Ingress, NetworkPolicy, EndpointSlice</td><td>PersistentVolume, StorageClass, CSIDriver</td></tr>
+<tr><td>ConfigMap, Secret, ServiceAccount, PersistentVolumeClaim</td><td>ClusterRole, ClusterRoleBinding</td></tr>
+<tr><td>Role, RoleBinding, ResourceQuota, LimitRange, HPA</td><td>CustomResourceDefinition, PriorityClass, IngressClass, RuntimeClass</td></tr>
+</table></div>
+<p>Rule of thumb: things that represent <em>your workload</em> are namespaced; things that represent <em>the cluster's infrastructure</em> are not. A PVC (a request by an app) is namespaced; the PV it binds to (a disk) is not.</p>
+
+<h2>Built-in namespaces</h2>
+<dl class="kv">
+<dt>default</dt><dd>Where things go when you do not say <code>-n</code>. Fine for learning; in real clusters, create your own and leave this empty.</dd>
+<dt>kube-system</dt><dd>Cluster components: CoreDNS, kube-proxy, the CNI, metrics-server, and on kubeadm clusters the static-Pod mirrors for etcd/API server/scheduler/controller-manager. Look here first when the cluster itself misbehaves.</dd>
+<dt>kube-public</dt><dd>Readable by everyone including unauthenticated users. Holds the <code>cluster-info</code> ConfigMap used by <code>kubeadm join</code>. Almost never used otherwise.</dd>
+<dt>kube-node-lease</dt><dd>One <code>Lease</code> object per node, renewed by its kubelet every 10 s — the cheap heartbeat the node controller uses to decide a node is unreachable.</dd>
+</dl>
+
+<h2>Working with namespaces</h2>
+<pre><code class="lang-bash">$ kubectl create namespace dev                         # or: kubectl create ns dev
+$ kubectl get ns
+$ kubectl run web --image=nginx -n dev                 # -n on any command
+$ kubectl get pods -A                                  # --all-namespaces
+$ kubectl config set-context --current --namespace=dev # make dev the default for this context
+$ kubectl config view --minify | grep namespace
+$ kubectl get pods -n kube-system -o wide
+$ kubectl delete ns dev                                # deletes EVERYTHING inside — no confirmation</code></pre>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+  labels:
+    team: payments            # labels on namespaces are what NetworkPolicy namespaceSelector matches
+    pod-security.kubernetes.io/enforce: baseline   # Pod Security Admission (Day 41)</code></pre>
+<p>A manifest can pin its namespace with <code>metadata.namespace</code>; if it does, <code>-n</code> on the command line must agree or the apply is rejected. If it does not, the object goes to the current context's namespace. Most teams leave it out of files and set it at apply time (or with Kustomize) so the same manifests work in <code>dev</code> and <code>prod</code>.</p>
+
+<h2>DNS across namespaces</h2>
+<p>Every Service gets the DNS name <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>. A Pod's <code>/etc/resolv.conf</code> carries a search list for its own namespace, so from a Pod in <code>dev</code>:</p>
+<pre><code class="lang-bash">api                          # → api.dev.svc.cluster.local      (same namespace: short name works)
+api.prod                     # → api.prod.svc.cluster.local     (another namespace: add it)
+api.prod.svc.cluster.local   # fully qualified — always works, fastest (no search-list retries)</code></pre>
+<figure data-anim="ns-dns"></figure>
+<div class="callout linux" data-ref="l08,l02"><div class="ct">Under the hood · Linux</div>
+<p>Inside any Pod, <code>cat /etc/resolv.conf</code> shows something like <code>nameserver 10.96.0.10</code> (the CoreDNS Service), <code>search dev.svc.cluster.local svc.cluster.local cluster.local</code>, <code>options ndots:5</code>. The resolver appends each search domain in turn for any name with fewer than 5 dots — which is why <code>api</code> works and why looking up <code>api.prod</code> costs one failed query (<code>api.prod.dev.svc.cluster.local</code>) before it succeeds. That search list is the <em>only</em> thing that makes a namespace feel "local" to DNS; CoreDNS itself serves every namespace. Details on <a href="d48-dns-coredns.html">Day 48</a>. Note the naming overlap: a Kubernetes Namespace is an API-object partition and has nothing to do with the <a href="../linux/l02-namespaces.html">Linux kernel namespaces</a> that isolate containers.</p></div>
+
+<h2>What a Namespace does NOT do</h2>
+<div class="grid-2">
+<div class="card"><h4>No network isolation</h4><p>By default any Pod can reach any Service in any namespace. Isolation requires <a href="d47-network-policies.html">NetworkPolicies</a>, enforced by the CNI.</p></div>
+<div class="card"><h4>No access control by itself</h4><p>A user with a ClusterRoleBinding sees every namespace. Scoping needs <a href="d36-rbac.html">Roles and RoleBindings</a> in that namespace.</p></div>
+<div class="card"><h4>No node isolation</h4><p>Pods from different namespaces share nodes and kernels. Dedicated nodes need taints/affinity (<a href="d16-taints-tolerations.html">Days 16–18</a>).</p></div>
+<div class="card"><h4>No resource isolation by default</h4><p>One namespace can consume the whole cluster — until you add a ResourceQuota.</p></div>
+</div>
+
+<h2>ResourceQuota and LimitRange</h2>
+<div class="grid-2">
+<div><pre><code class="lang-yaml">apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: dev-quota
+  namespace: dev
+spec:
+  hard:
+    pods: "20"
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    persistentvolumeclaims: "5"
+    services.loadbalancers: "1"
+    count/deployments.apps: "10"</code></pre></div>
+<div><pre><code class="lang-yaml">apiVersion: v1
+kind: LimitRange
+metadata:
+  name: dev-limits
+  namespace: dev
+spec:
+  limits:
+  - type: Container
+    default:            # limit applied if the container sets none
+      cpu: 500m
+      memory: 256Mi
+    defaultRequest:     # request applied if none
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "2"
+      memory: 2Gi</code></pre></div>
+</div>
+<p><strong>ResourceQuota</strong> caps the <em>sum</em> across the namespace; when a request would exceed it, the API server rejects the create with <code>403 Forbidden: exceeded quota</code>. Important gotcha: once a quota on <code>requests.cpu</code> exists, <em>every</em> Pod must declare a CPU request or it is rejected — which is why a <strong>LimitRange</strong> with defaults usually accompanies it. LimitRange applies per object (Container, Pod, PVC): defaults, minimums, maximums. Both are covered in depth with requests/limits on <a href="d19-requests-limits.html">Day 19</a>.</p>
+<pre><code class="lang-bash">$ kubectl describe quota -n dev            # Used vs Hard, live
+$ kubectl describe limitrange -n dev
+$ kubectl create quota dev-q --hard=pods=5 -n dev   # imperative</code></pre>
+
+<h2>Deleting a namespace (and when it hangs)</h2>
+<p><code>kubectl delete ns dev</code> puts the namespace in <code>Terminating</code> and the namespace controller deletes every object inside it. It can hang forever if some object has a <strong>finalizer</strong> whose controller is gone (a CRD's operator was uninstalled first, a webhook is down). Find it with <code>kubectl api-resources --verbs=list --namespaced -o name | xargs -n1 kubectl get -n dev --ignore-not-found</code>, then remove the finalizer from that object (<code>kubectl patch … -p '{"metadata":{"finalizers":[]}}' --type=merge</code>). Removing the finalizer from the Namespace object itself is a last resort that can leak resources.</p>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>Every task names a namespace. Set it as the context default, then verify with <code>kubectl config view --minify</code>.</li>
+<li>"Pod cannot be created: exceeded quota" or "must specify cpu request" → look at <code>describe quota</code> / <code>describe limitrange</code> in that namespace.</li>
+<li>Cross-namespace Service access questions are DNS questions: <code>svc.ns</code> or the FQDN.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl create ns dev && kubectl create ns prod
+$ kubectl create deploy api --image=nginx -n prod && kubectl expose deploy api --port=80 -n prod
+$ kubectl run t --rm -it --image=busybox:1.36 -n dev -- sh -c 'cat /etc/resolv.conf; wget -qO- --timeout=2 http://api || echo FAIL; wget -qO- --timeout=2 http://api.prod | head -1'
+$ kubectl create quota q --hard=pods=2 -n dev
+$ kubectl create deploy many --image=nginx --replicas=5 -n dev
+$ kubectl get deploy,rs -n dev; kubectl describe rs -n dev | grep -A3 Events     # "exceeded quota"
+$ kubectl describe quota q -n dev
+$ kubectl delete ns dev prod</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Namespaces partition <em>names</em> of namespaced objects; nodes, PVs, StorageClasses, ClusterRoles and CRDs are cluster-wide.</li>
+<li><code>default</code>, <code>kube-system</code>, <code>kube-public</code>, <code>kube-node-lease</code> exist from the start; make your own for real work.</li>
+<li>DNS: <code>svc</code> in-namespace, <code>svc.ns</code> across, <code>svc.ns.svc.cluster.local</code> always.</li>
+<li>Isolation of network, access and resources needs NetworkPolicy, RBAC and ResourceQuota/LimitRange respectively.</li>
+<li>Deleting a namespace deletes everything in it; a stuck <code>Terminating</code> namespace means a finalizer nobody is processing.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  let s1 = S.zone('cluster', 10, 10, 700, 300, 'cluster (one API server, one etcd)')
+    + S.zone('nsdev', 30, 40, 200, 180, 'namespace: dev', { cls: 'hl' }) + S.zone('nsprod', 250, 40, 200, 180, 'namespace: prod', { cls: 'hl' }) + S.zone('nssys', 470, 40, 220, 180, 'namespace: kube-system', { cls: 'hl' })
+    + S.pod('d1', 80, 90, 'deploy api', { w: 80, cls: 'ok' }) + S.pod('d2', 175, 90, 'svc api', { w: 70, cls: 'cy' }) + S.pod('d3', 80, 140, 'secret db', { w: 80, cls: 'warn' }) + S.pod('d4', 175, 140, 'role dev', { w: 70, cls: 'pur' })
+    + S.pod('p1', 300, 90, 'deploy api', { w: 80, cls: 'ok' }) + S.pod('p2', 395, 90, 'svc api', { w: 70, cls: 'cy' }) + S.pod('p3', 300, 140, 'secret db', { w: 80, cls: 'warn' }) + S.pod('p4', 395, 140, 'quota', { w: 70, cls: 'pur' })
+    + S.pod('s1', 530, 90, 'coredns', { w: 80, cls: 'ok' }) + S.pod('s2', 630, 90, 'kube-proxy', { w: 80, cls: 'ok' }) + S.pod('s3', 580, 140, 'etcd (static)', { w: 90, cls: 'pur' })
+    + S.zone('cs', 30, 235, 660, 60, 'cluster-scoped — no namespace')
+    + S.pod('c1', 110, 272, 'node-1', { w: 64, cls: 'gray' }) + S.pod('c2', 190, 272, 'node-2', { w: 64, cls: 'gray' }) + S.pod('c3', 290, 272, 'pv-0012', { w: 70, cls: 'gray' }) + S.pod('c4', 390, 272, 'storageclass', { w: 90, cls: 'gray' }) + S.pod('c5', 500, 272, 'clusterrole', { w: 80, cls: 'gray' }) + S.pod('c6', 610, 272, 'crd', { w: 60, cls: 'gray' });
+  Anim.define('ns-scope', { w: 720, h: 320, title: 'Namespaced vs cluster-scoped', svg: s1, steps: [
+    { c: 'Same object <b>names</b> can exist in different namespaces: <code>deploy api</code> and <code>secret db</code> in both <code>dev</code> and <code>prod</code> without conflict.', on(q){ q('#d1 rect,#p1 rect').set('hl'); } },
+    { c: 'Each namespace can carry its own RBAC Roles, quotas and NetworkPolicies — the tools that turn a naming partition into a real boundary.', on(q){ q('#d1 rect,#p1 rect').set('ok'); q('#d4 rect,#p4 rect').set('hl'); } },
+    { c: '<code>kube-system</code> is just another namespace, holding the cluster\'s own components — including mirror Pods for the static control-plane Pods.', on(q){ q('#d4 rect,#p4 rect').set('pur'); q('#nssys rect').set('ok'); } },
+    { c: 'Nodes, PersistentVolumes, StorageClasses, ClusterRoles and CRDs have <b>no namespace</b>. There is exactly one <code>node-1</code> in the cluster, and <code>kubectl get nodes -n dev</code> is meaningless (the flag is ignored).', on(q){ q('#nssys rect').set('hl'); q('#cs rect').set('ok'); } },
+  ]});
+
+  let s2 = S.zone('zdev', 20, 30, 240, 250, 'namespace: dev') + S.zone('zprod', 460, 30, 240, 250, 'namespace: prod')
+    + S.pod('cli', 140, 90, 'pod: web', { w: 80, cls: 'ok' })
+    + S.term('rc', 35, 130, 210, 90, ['/etc/resolv.conf', 'nameserver 10.96.0.10', 'search dev.svc.cluster.local', '  svc.cluster.local cluster.local', 'options ndots:5'], { fs: 9 })
+    + S.box('dns', 300, 120, 120, 50, ['CoreDNS', '10.96.0.10'], { subfs: 9, subcls: 'mono muted', cls: 'cy' })
+    + S.pod('svc', 580, 90, 'svc: api', { w: 80, cls: 'cy', sub: '10.96.4.7' })
+    + S.text('q', 360, 60, '', { cls: 'sm mono acc' }) + S.text('a', 360, 250, '', { cls: 'sm mono' })
+    + S.arrow('a1', 185, 90, 298, 130, { d: 'M 185 90 L 298 135', cls: 'hid' }) + S.arrow('a2', 420, 135, 540, 95, { d: 'M 420 140 L 540 95', cls: 'hid' });
+  Anim.define('ns-dns', { w: 720, h: 290, title: 'Cross-namespace DNS', ms: 3000, svg: s2, steps: [
+    { c: 'A Pod in <code>dev</code> wants <code>api</code>, which lives in <code>prod</code>. Its resolv.conf points at CoreDNS and carries a <b>search list</b> starting with its own namespace.', on(q){ } },
+    { c: 'The app asks for <code>api</code>. Fewer than 5 dots → the resolver tries <code>api.dev.svc.cluster.local</code> first. CoreDNS: <b>NXDOMAIN</b> — there is no api in dev.', on(q){ q('#q').text('api.dev.svc.cluster.local ?'); q('#a1').show().set('hl'); q('#a').text('NXDOMAIN').style('fill', 'var(--red)'); } },
+    { c: 'Next search domain: <code>api.svc.cluster.local</code> — also NXDOMAIN. Then <code>api.cluster.local</code>, then bare <code>api</code>. All fail. Short names only work <b>inside</b> the namespace.', on(q){ q('#q').text('api.svc.cluster.local ?  …  api ?'); q('#a').text('NXDOMAIN × 3'); } },
+    { c: 'The app asks for <code>api.prod</code> instead. First try: <code>api.prod.dev.svc.cluster.local</code> — NXDOMAIN. Second: <code>api.prod.svc.cluster.local</code> — <b>found</b>.', on(q){ q('#q').text('api.prod.svc.cluster.local ?'); q('#a').text('A 10.96.4.7').style('fill', 'var(--green)'); q('#a2').show().set('ok'); q('#svc rect').set('hl'); } },
+    { c: 'Using the FQDN <code>api.prod.svc.cluster.local.</code> (5+ dots, or a trailing dot) skips the search list entirely: one query, one answer. Prefer it in config that crosses namespaces.', on(q){ q('#q').text('api.prod.svc.cluster.local. ? (one query)'); q('#a1').set('ok'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

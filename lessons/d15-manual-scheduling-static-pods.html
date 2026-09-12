@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Day 15 · Manual Scheduling & Static Pods · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="d15" data-root="../" data-linux="l07" data-related="d07,d57">
+<article class="lesson">
+<p class="lead">The scheduler is just another client of the API server: it finds Pods with an empty <code>nodeName</code> and fills it in. That means you can do its job yourself by setting <code>nodeName</code> — and it means that if the scheduler is down, Pods simply wait. Separately, the kubelet can run Pods with <em>no</em> API server at all, from files on disk: <strong>static Pods</strong>, the mechanism that bootstraps every kubeadm control plane. Both are exam favourites.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>What the scheduler actually writes, and what happens when it is not running</li>
+<li>Manual scheduling with <code>spec.nodeName</code> and the Binding API</li>
+<li>Static Pods: the manifests directory, mirror Pods, and how to find the path on any node</li>
+<li>When to use each (and why you rarely should)</li>
+</ul></div>
+
+<h2>What "scheduling" means</h2>
+<p>A Pod object is created with <code>spec.nodeName</code> empty. The scheduler watches for exactly those Pods, picks a node, and creates a <strong>Binding</strong> — which the API server applies by setting <code>nodeName</code>. From that moment the Pod belongs to that node's kubelet. The scheduler never contacts the node and never touches the Pod again. If <code>nodeName</code> is already set when the Pod is created, the scheduler ignores it entirely.</p>
+<pre><code class="lang-bash">$ kubectl get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase
+$ kubectl get pods --field-selector spec.nodeName=""          # everything still waiting for the scheduler
+$ kubectl get events --field-selector reason=Scheduled          # "Successfully assigned default/web to worker-2"</code></pre>
+
+<h2>Manual scheduling</h2>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: pinned
+spec:
+  nodeName: worker-2          # skip the scheduler entirely
+  containers:
+  - name: nginx
+    image: nginx</code></pre>
+<p>With <code>nodeName</code> set, the kubelet on <code>worker-2</code> starts the Pod immediately — even if the node is full, tainted, or does not match any affinity rule. Nothing is checked. If the node does not exist, the Pod sits in <code>Pending</code> forever; if it runs out of resources, the kubelet fails the Pod with <code>OutOfcpu</code>/<code>OutOfmemory</code>. <code>nodeName</code> is immutable: to move a running Pod you delete and re-create it.</p>
+<div class="callout info"><div class="ct">The Binding API (for completeness)</div><p>For an <em>existing</em> Pending Pod you cannot edit <code>nodeName</code>, but you can do what the scheduler does: POST a Binding.</p>
+<pre><code class="lang-bash">$ cat &lt;&lt;EOF | kubectl create -f -
+apiVersion: v1
+kind: Binding
+metadata:
+  name: pinned
+target:
+  apiVersion: v1
+  kind: Node
+  name: worker-2
+EOF</code></pre><p>You will never do this in practice, but it demonstrates that scheduling is "just an API write", and custom schedulers (<code>spec.schedulerName</code>) work exactly this way.</p></div>
+
+<h3>When the scheduler is down</h3>
+<p>Pods stay <code>Pending</code> with <em>no events</em> — not even <code>FailedScheduling</code>, because nothing is looking at them. Existing Pods keep running. On a kubeadm cluster: <code>kubectl get pods -n kube-system | grep scheduler</code>, then check <code>/etc/kubernetes/manifests/kube-scheduler.yaml</code> on the control-plane node (<a href="d57-troubleshoot-control-plane.html">Day 57</a>). Setting <code>nodeName</code> by hand is the workaround that keeps things moving while you fix it.</p>
+
+<h2>Static Pods</h2>
+<p>A static Pod is managed <strong>directly by the kubelet</strong>, not by the API server. The kubelet watches a directory (by default <code>/etc/kubernetes/manifests</code>) and runs every Pod manifest it finds there — creating, updating and deleting as the files change. No scheduler, no controller-manager, no API server required. This is how kubeadm solves the bootstrap problem: the API server itself is a static Pod.</p>
+<figure data-anim="static-pod"></figure>
+<dl class="kv">
+<dt>Mirror Pod</dt><dd>Once the API server is reachable, the kubelet creates a read-only <em>mirror</em> of each static Pod in the API so it shows up in <code>kubectl get pods</code>. Its name is <code>&lt;name&gt;-&lt;nodename&gt;</code>, e.g. <code>kube-apiserver-cka-control-plane</code>. Deleting the mirror through the API does nothing lasting: the kubelet re-creates it.</dd>
+<dt>Removing one</dt><dd>Delete (or move) the file from the manifests directory. The kubelet stops the Pod within seconds.</dd>
+<dt>Where is the directory?</dt><dd>In the kubelet's config file, key <code>staticPodPath</code>. Find the config file from the kubelet's command line.</dd>
+<dt>Limitations</dt><dd>Only Pods — no Deployments, no Services. They cannot reference ConfigMaps or Secrets (there may be no API server). Use <code>hostPath</code> volumes.</dd>
+</dl>
+<pre><code class="lang-bash"># on the node
+$ ps -ef | grep kubelet | grep -o -- '--config=[^ ]*'        # --config=/var/lib/kubelet/config.yaml
+$ grep staticPodPath /var/lib/kubelet/config.yaml            # staticPodPath: /etc/kubernetes/manifests
+$ ls /etc/kubernetes/manifests
+$ cat &lt;&lt;EOF | sudo tee /etc/kubernetes/manifests/static-web.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: static-web
+spec:
+  containers:
+  - name: web
+    image: nginx
+EOF
+$ crictl ps | grep static-web                                # running within seconds, no API involved
+# from anywhere
+$ kubectl get pod static-web-&lt;nodename&gt;                      # the mirror pod
+$ kubectl delete pod static-web-&lt;nodename&gt;                   # comes straight back
+$ sudo rm /etc/kubernetes/manifests/static-web.yaml          # the real way to delete it</code></pre>
+
+<div class="callout linux" data-ref="l07"><div class="ct">Under the hood · Linux</div><p>The kubelet polls the manifests directory (file source, default every 20 s, and reacts faster to inotify events) the same way it consumes Pods from the API (apiserver source). Both feed one internal "pod manager"; static Pods are simply Pods whose source is a file. Because the kubelet is a systemd service that starts at boot, static Pods come up with the machine, before the network, before etcd — which is exactly the property a control plane needs. Change a manifest and the kubelet does a stop/start of that Pod; a syntax error in the YAML is logged in <code>journalctl -u kubelet</code> and the Pod silently does not run — the classic Day 57 failure.</p></div>
+
+<div class="callout exam"><div class="ct">CKA exam tip</div><ul>
+<li>"Create a static Pod on node X" → SSH to the node, find <code>staticPodPath</code>, drop a manifest generated with <code>kubectl run … $do</code>. Verify with <code>kubectl get pods</code> from the control plane (look for the node-name suffix).</li>
+<li>A Pod you cannot delete (it keeps coming back) with a node-name suffix is a static Pod. Remove the file.</li>
+<li>Pods Pending with no events at all → is the scheduler running? <code>kubectl get pods -n kube-system</code>.</li>
+<li>Static-Pod manifests must be valid YAML and cannot use ConfigMap/Secret references.</li>
+</ul></div>
+
+<div class="lab"><h3>Hands-on lab (15 min)</h3>
+<pre><code class="lang-bash">$ kubectl run pinned --image=nginx $do | sed '/spec:/a\  nodeName: cka-worker2' | kubectl apply -f -
+$ kubectl get pod pinned -o wide                   # on cka-worker2, no Scheduled event
+$ kubectl get events --field-selector involvedObject.name=pinned
+# static pod on a KIND worker
+$ docker exec cka-worker sh -c 'grep staticPodPath /var/lib/kubelet/config.yaml'
+$ kubectl run static-web --image=nginx $do | docker exec -i cka-worker tee /etc/kubernetes/manifests/static-web.yaml
+$ sleep 10; kubectl get pods                       # static-web-cka-worker
+$ kubectl delete pod static-web-cka-worker; sleep 5; kubectl get pods    # it is back
+$ docker exec cka-worker rm /etc/kubernetes/manifests/static-web.yaml; sleep 10; kubectl get pods
+# break the scheduler and watch pods wait
+$ docker exec cka-control-plane mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/
+$ kubectl run waiting --image=nginx; sleep 5; kubectl get pod waiting; kubectl describe pod waiting | tail -3   # Pending, no events
+$ docker exec cka-control-plane mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/; sleep 15; kubectl get pod waiting -o wide</code></pre></div>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Scheduling = writing <code>spec.nodeName</code>. Set it yourself and the scheduler (and all its checks) are bypassed.</li>
+<li>Scheduler down → Pods Pending with no events; running Pods are unaffected.</li>
+<li>Static Pods are run by the kubelet from <code>staticPodPath</code> (usually <code>/etc/kubernetes/manifests</code>); the API only holds a read-only mirror named <code>&lt;pod&gt;-&lt;node&gt;</code>.</li>
+<li>Delete a static Pod by deleting its file. The control plane on kubeadm clusters is four static Pods.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+  let svg = S.node('nd', 20, 20, 400, 290, 'control-plane node', { sub: 'kubelet.service (systemd)' })
+    + S.term('dir', 40, 70, 200, 110, ['/etc/kubernetes/manifests/', 'etcd.yaml', 'kube-apiserver.yaml', 'kube-scheduler.yaml', 'kube-controller-manager.yaml', ''], { fs: 9.5 })
+    + S.box('kl', 270, 90, 130, 44, ['kubelet', 'staticPodPath ↑'], { subfs: 9, subcls: 'muted', cls: 'hl' })
+    + S.arrow('a1', 240, 110, 268, 110, { cls: 'dashed', label: 'watch', ly: 100 })
+    + S.pod('sp1', 80, 230, 'etcd', { w: 56, cls: 'pur' }) + S.pod('sp2', 160, 230, 'apiserver', { w: 70, cls: 'pur' }) + S.pod('sp3', 250, 230, 'scheduler', { w: 70, cls: 'pur' }) + S.pod('sp4', 340, 230, 'ctrl-mgr', { w: 66, cls: 'pur' })
+    + S.pod('sp5', 200, 280, 'static-web', { w: 80, cls: 'ok', hidden: true })
+    + S.arrow('a2', 335, 134, 335, 150, { d: 'M 335 134 L 335 160 L 100 160 L 100 212', cls: 'noarr' })
+    + S.box('api', 480, 40, 200, 50, ['kube-apiserver (API)', 'kubectl get pods'], { subfs: 9, subcls: 'mono muted' })
+    + S.term('mir', 470, 110, 230, 120, ['mirror pods in kube-system:', 'etcd-cp', 'kube-apiserver-cp', 'kube-scheduler-cp', 'kube-controller-manager-cp', ''], { fs: 9.5 })
+    + S.arrow('a3', 400, 112, 468, 112, { cls: 'dashed hid', label: 'mirror', ly: 102 })
+    + S.text('note', 585, 275, '', { cls: 'sm b' });
+  Anim.define('static-pod', { w: 720, h: 320, title: 'Static Pods & mirror Pods', ms: 3000, svg, steps: [
+    { c: 'At boot, systemd starts the kubelet. It reads <code>staticPodPath</code> from its config and finds four manifests. No API server exists yet.', on(q){ } },
+    { c: 'The kubelet runs them directly through containerd: etcd, the API server, scheduler and controller-manager become containers. The control plane is now up — built by the kubelet alone.', on(q){ q('#sp1 rect,#sp2 rect,#sp3 rect,#sp4 rect').set('hl'); } },
+    { c: 'Now that an API server answers, the kubelet registers <b>mirror Pods</b> so the static Pods are visible to kubectl. Their names carry the node name as a suffix.', on(q){ q('#a3').show().set('hl'); q('#api rect').set('ok'); } },
+    { c: 'You drop <code>static-web.yaml</code> into the directory. Within seconds the kubelet starts it and creates its mirror <code>static-web-cp</code>. No scheduler was involved.', on(q){ q('#dir-l5').text('static-web.yaml').style('fill', 'var(--green)'); q('#sp5').show(); q('#mir-l5').text('static-web-cp').style('fill', 'var(--green)'); } },
+    { c: '<code>kubectl delete pod static-web-cp</code> removes only the mirror. The kubelet still sees the file, so the Pod keeps running and the mirror is re-created.', on(q){ q('#mir-l5').text('(deleted → re-created)').style('fill', 'var(--amber)'); q('#note').text('kubectl delete has no lasting effect'); } },
+    { c: 'Remove the <b>file</b> and the kubelet stops the container and deletes the mirror. Files are the source of truth for static Pods.', on(q){ q('#dir-l5').text('').style('fill', 'var(--faint)'); q('#sp5').add('hid'); q('#mir-l5').text('').style('fill', 'var(--faint)'); q('#note').text('rm the manifest = delete the pod'); } },
+  ]});
+})();
+</script>
+</body>
+</html>
