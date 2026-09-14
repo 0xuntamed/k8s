@@ -175,8 +175,8 @@ $ sudo kubeadm reset -f    # on a worker: undo the join (then rejoin) — do thi
     { c: '<b>Ready</b>. Every later troubleshooting step is: which of these layers is broken?', on(q){ q('#l5').show(); q('#m').text('six layers, six places to look'); } },
   ]});
 
-  let s2 = S.box('cp', 20, 30, 220, 70, ['cp-1 · kube-apiserver :6443', 'bootstrap token abcdef.0123…', 'CA hash sha256:1234…'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
-    + S.box('w', 480, 30, 220, 70, ['worker-1 · kubeadm join', 'has: token + CA hash', 'wants: kubelet cert'], { subfs: 8.5, subcls: 'mono muted' })
+  let s2 = S.box('cp', 20, 30, 220, 70, ['cp-1 · kube-apiserver :6443', 'bootstrap token abcdef.0123…', 'CA hash sha256:1234…'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('w', 480, 30, 220, 70, ['worker-1 · kubeadm join', 'has: token + CA hash', 'wants: kubelet cert'], { subfs: 9, subcls: 'mono muted' })
     + S.term('log', 20, 120, 680, 130, ['join steps:', '', '', '', '', ''], { fs: 9.5 })
     + S.arrow('a1', 480, 55, 242, 55, { cls: 'hid', label: 'GET cluster-info (kube-public), token auth', ly: 45 })
     + S.arrow('a2', 242, 75, 478, 75, { cls: 'hid', label: 'cluster-info: CA cert + server', ly: 92 })

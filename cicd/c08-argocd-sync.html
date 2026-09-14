@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C8 · Argo CD Sync: Status, Health, Hooks, Waves, Diff & Rollback · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c08" data-root="../" data-linux="l01,l10" data-related="d09,d10,d20,d22,d23,d27,d29,d38,d49,d56,c07">
+<article class="lesson">
+<p class="lead">"Synced" and "Healthy" are two different questions, and most Argo CD confusion comes from mixing them up. <em>Synced</em> means the cluster matches git. <em>Healthy</em> means what is running actually works — which Argo CD decides using the same signals the course taught you: rollout conditions, readiness probes, bound PVCs, load-balancer addresses. This page explains both, then the mechanics of a sync operation — phases, hooks, waves, options — how to stop diffs from lying, and how to go back.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Sync status vs health status; how health is computed per kind, and custom health checks</li>
+<li>The sync operation: PreSync → Sync → PostSync, hooks, delete policies, sync waves</li>
+<li>Sync options and per-resource annotations; automated sync semantics and retries</li>
+<li>Diffing: <code>ignoreDifferences</code>, managed fields, server-side apply, refresh vs hard refresh</li>
+<li>History, <code>rollback</code> vs <code>git revert</code></li>
+<li>Reading a stuck or failed sync</li>
+</ul></div>
+
+<h2>Two statuses</h2>
+<figure data-anim="sync-health"></figure>
+<div class="grid-2">
+<div class="card"><h4>Sync status — "does live match git?"</h4><ul>
+<li><strong>Synced</strong> — every rendered object exists and its relevant fields match.</li>
+<li><strong>OutOfSync</strong> — something differs: a new commit (expected), a manual change (drift), or an object is <em>Missing</em>. <code>argocd app diff</code> shows what.</li>
+<li><strong>Unknown</strong> — comparison could not run (repo error, invalid manifests). See <code>status.conditions</code>.</li>
+</ul></div>
+<div class="card"><h4>Health status — "is it working?"</h4><ul>
+<li><strong>Healthy</strong> — all resources report good.</li>
+<li><strong>Progressing</strong> — something is still converging (a rollout, a pending LB).</li>
+<li><strong>Degraded</strong> — something failed (rollout deadline exceeded, CrashLoopBackOff, Job failed).</li>
+<li><strong>Suspended</strong> — paused on purpose (a suspended CronJob, a paused Rollout).</li>
+<li><strong>Missing</strong> — in git, not in the cluster.</li>
+<li>The app's health is the <em>worst</em> of its resources.</li>
+</ul></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>Kind</th><th>Healthy when</th><th>Course lesson</th></tr></thead>
+<tbody>
+<tr><td>Deployment</td><td><code>observedGeneration</code> current, <code>updatedReplicas == replicas</code>, all available, no <code>ProgressDeadlineExceeded</code> → otherwise Progressing/Degraded</td><td><a href="../lessons/d10-replicasets-deployments.html">Day 10</a></td></tr>
+<tr><td>Pod</td><td>Running and Ready (probes), or Succeeded; CrashLoopBackOff/ImagePullBackOff → Degraded</td><td><a href="../lessons/d22-pod-lifecycle.html">Day 22</a>, <a href="../lessons/d23-health-probes.html">Day 23</a></td></tr>
+<tr><td>StatefulSet / DaemonSet</td><td>Updated and ready counts match</td><td><a href="../lessons/d44-statefulsets.html">Day 44</a>, <a href="../lessons/d29-daemonset-job-cronjob.html">Day 29</a></td></tr>
+<tr><td>Job</td><td>Succeeded; Failed → Degraded (hooks rely on this)</td><td><a href="../lessons/d29-daemonset-job-cronjob.html">Day 29</a></td></tr>
+<tr><td>PersistentVolumeClaim</td><td>Bound; Pending → Progressing</td><td><a href="../lessons/d27-persistent-volumes.html">Day 27</a></td></tr>
+<tr><td>Service (LoadBalancer) / Ingress</td><td><code>status.loadBalancer.ingress</code> populated</td><td><a href="../lessons/d12-services.html">Day 12</a>, <a href="../lessons/d49-ingress-part1.html">Day 49</a></td></tr>
+<tr><td>ConfigMap, Secret, RBAC…</td><td>Always Healthy once they exist</td><td>—</td></tr>
+<tr><td>Custom resources</td><td>Unknown → Healthy unless a health check is defined (Lua in <code>argocd-cm</code>, e.g. for cert-manager Certificates, Argo Rollouts); many are built in</td><td><a href="../lessons/d39-crds.html">Day 39</a></td></tr>
+</tbody></table></div>
+<pre><code class="lang-yaml"># argocd-cm: a custom health check for a CRD (Lua)
+data:
+  resource.customizations.health.cert-manager.io_Certificate: |
+    hs = {}
+    if obj.status ~= nil and obj.status.conditions ~= nil then
+      for _, c in ipairs(obj.status.conditions) do
+        if c.type == "Ready" and c.status == "True" then hs.status = "Healthy"; hs.message = "Certificate issued"; return hs end
+      end
+    end
+    hs.status = "Progressing"; hs.message = "Waiting for certificate"
+    return hs</code></pre>
+<div class="callout connect" data-ref="d10,d23"><p>Argo CD does not invent health. For a Deployment it reads the same <code>status.conditions</code> that <code>kubectl rollout status</code> reads (<a href="../lessons/d10-replicasets-deployments.html">Day 10</a>); for Pods it trusts the readiness probes you wrote (<a href="../lessons/d23-health-probes.html">Day 23</a>). A Deployment with no readiness probe goes Healthy the instant its containers start — Argo CD will happily report a broken release as Healthy if you gave it nothing to check.</p></div>
+
+<h2>The sync operation</h2>
+<figure data-anim="sync-waves"></figure>
+<dl class="kv">
+<dt>Phases</dt><dd><strong>PreSync</strong> → <strong>Sync</strong> → <strong>PostSync</strong>, plus <strong>SyncFail</strong> (runs if any phase fails) and <strong>PostDelete</strong>. Ordinary manifests belong to Sync; hooks are manifests annotated into the other phases.</dd>
+<dt>Hooks</dt><dd><code>argocd.argoproj.io/hook: PreSync</code> on a Job (<a href="../lessons/d29-daemonset-job-cronjob.html">Day 29</a>) or any resource. A phase waits for its hooks to be Healthy (a Job: Succeeded) before continuing; a failed hook fails the operation. <code>hook-delete-policy</code>: <code>BeforeHookCreation</code> (default: delete the old one before creating the new), <code>HookSucceeded</code>, <code>HookFailed</code>. Use <code>generateName</code> so each sync gets a fresh Job.</dd>
+<dt>Waves</dt><dd><code>argocd.argoproj.io/sync-wave: "2"</code> (default 0, negatives allowed). Within a phase, Argo CD applies wave by wave and waits for each wave to be Healthy before starting the next. Inside a wave, the order is by kind (Namespace, then CRDs, RBAC, ConfigMaps/Secrets… Services… workloads) then name.</dd>
+<dt>Prune</dt><dd>Objects with the app's tracking marker that are absent from the render are deleted — at the end (<code>PruneLast=true</code>) or as part of their wave. Individually protect with <code>argocd.argoproj.io/sync-options: Prune=false</code> (a PVC, a namespace).</dd>
+<dt>Automated sync</dt><dd>Fires when the target revision produces a different render (new commit) and, with <code>selfHeal</code>, when live drifts. It will <em>not</em> retry a revision whose sync already failed — fix forward with a new commit or a manual sync, or set <code>retry</code>. Sync windows can block it by schedule.</dd>
+</dl>
+<pre><code class="lang-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: db-migrate-
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: ghcr.io/acme/api:9f2e1c3         # same image as the app; the same tag CI wrote
+        command: ["./manage.py", "migrate"]
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop, annotations: { argocd.argoproj.io/sync-wave: "-2", argocd.argoproj.io/sync-options: Prune=false } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, annotations: { argocd.argoproj.io/sync-wave: "1" } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: api, annotations: { argocd.argoproj.io/sync-wave: "2" } }     # only after the Deployment is Healthy</code></pre>
+<div class="callout connect" data-ref="d29,d22,l01"><p>A hook Job is a Pod with <code>restartPolicy: Never</code> whose exit code (<a href="../linux/l01-processes-signals.html">L1</a>) is the whole verdict: 0 → Succeeded → the sync continues; non-zero → Failed → the sync fails and <code>SyncFail</code> hooks run. <code>backoffLimit: 0</code> so a failed migration is not retried blindly. Read its logs with <code>argocd app logs api --kind Job</code> or <code>kubectl logs job/…</code> — the failure detail is never in Argo CD's UI, it is in the Pod.</p></div>
+
+<h2>Sync options</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<thead><tr><th>Option</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td>CreateNamespace=true</td><td>Create the destination namespace if missing (not tracked/pruned).</td></tr>
+<tr><td>ServerSideApply=true</td><td>Use server-side apply: managed-fields ownership, no 262 KB annotation limit on big CRDs, cooperative with other controllers (<a href="../lessons/d09-yaml-imperative-declarative.html">Day 9</a>).</td></tr>
+<tr><td>PruneLast=true</td><td>Prune after all waves are healthy instead of per wave.</td></tr>
+<tr><td>ApplyOutOfSyncOnly=true</td><td>Apply only the objects that differ — faster for big apps; hooks still run.</td></tr>
+<tr><td>Replace=true</td><td><code>kubectl replace</code> instead of apply: for immutable-field changes (a Job's template, a Service's clusterIP). Destructive; usually per-resource via annotation.</td></tr>
+<tr><td>Validate=false</td><td>Skip schema validation (CRDs whose schema the cluster does not know yet).</td></tr>
+<tr><td>SkipDryRunOnMissingResource=true</td><td>Let a CR sync in the same operation as its CRD.</td></tr>
+<tr><td>PrunePropagationPolicy=foreground</td><td>Delete dependents first (<a href="../lessons/d10-replicasets-deployments.html">Day 10</a> owner references) before the owner disappears.</td></tr>
+<tr><td>RespectIgnoreDifferences=true</td><td>Do not overwrite ignored fields when syncing (otherwise ignore only affects the diff).</td></tr>
+</tbody></table></div>
+
+<h2>Diffs that lie, and how to fix them</h2>
+<p>An app that is <em>always</em> OutOfSync with nothing to see is a diff problem. Live objects carry fields the manifest never set: defaults filled by the API server, <code>status</code>, fields other controllers own. Argo CD normalises the common ones; you configure the rest.</p>
+<pre><code class="lang-yaml">spec:
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers: [/spec/replicas]                          # HPA (Day 20) owns replicas
+  - group: admissionregistration.k8s.io
+    kind: MutatingWebhookConfiguration
+    jqPathExpressions: [.webhooks[].clientConfig.caBundle]  # cert-manager injects this
+  - group: apps
+    kind: Deployment
+    managedFieldsManagers: [kube-controller-manager]        # anything that manager wrote (server-side apply metadata)
+  syncPolicy:
+    syncOptions: [RespectIgnoreDifferences=true]            # and don't clobber them on sync</code></pre>
+<pre><code class="lang-yaml"># argocd-cm: globally, for every app
+data:
+  resource.customizations.ignoreDifferences.all: |
+    managedFieldsManagers: [kube-controller-manager]
+  resource.customizations.ignoreDifferences.apps_Deployment: |
+    jsonPointers: [/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt]   # kubectl rollout restart</code></pre>
+<div class="callout connect" data-ref="d20,d38,d09"><p>Every entry here is a second controller writing to the same object: the HPA (<a href="../lessons/d20-autoscaling.html">Day 20</a>), a mutating webhook (<a href="../lessons/d38-admission-controllers.html">Day 38</a>), the Deployment controller itself. Server-side apply's <em>managed fields</em> (<a href="../lessons/d09-yaml-imperative-declarative.html">Day 9</a>) exist precisely to record who owns which field; <code>managedFieldsManagers</code> lets Argo CD use that record instead of a hand-written pointer list. Turn on <code>ServerSideApply=true</code> and most of these entries become unnecessary.</p></div>
+<pre><code class="lang-bash">$ argocd app diff api-prod                          # what OutOfSync means, line by line
+$ argocd app get api-prod --refresh                 # re-compare now (normally every 3 min + webhook)
+$ argocd app get api-prod --hard-refresh            # also drop the cached render (after editing files the cache key misses)
+$ kubectl -n argocd annotate app api-prod argocd.argoproj.io/refresh=hard --overwrite     # the same, declaratively</code></pre>
+
+<h2>History and rollback</h2>
+<pre><code class="lang-bash">$ argocd app history api-prod
+ID  DATE                           REVISION
+41  2025-06-02 10:14:09 +0000 UTC  main (7a1c9e2)
+42  2025-06-02 11:02:51 +0000 UTC  main (e4d5c6b)     ← current, Degraded
+$ argocd app rollback api-prod 41                   # re-applies the manifests rendered at 7a1c9e2
+# ⚠ rollback DISABLES automated sync for the app (otherwise it would immediately sync forward to main again)
+$ argocd app set api-prod --sync-policy automated   # re-enable when git is fixed</code></pre>
+<div class="compare">
+<div><h4><code>argocd app rollback</code></h4><p>Fast, one command, no git involved. But the cluster now disagrees with git on purpose, auto-sync is off, and the next person to look at the repo sees a version that is not running. Use it as a fire extinguisher — then do the git revert and re-enable auto-sync.</p></div>
+<div><h4><code>git revert</code> + sync</h4><p>The GitOps way: the desired state moves back, auto-sync deploys it, history is linear, and reviewers see what happened. Slightly slower (a PR, a webhook). The rollout itself is the same rolling update as <a href="../lessons/d10-replicasets-deployments.html">Day 10</a>'s <code>rollout undo</code>, driven by the manifest.</p></div>
+</div>
+
+<h2>Reading a stuck or failed sync</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<thead><tr><th>Symptom</th><th>Usually</th><th>Look at</th></tr></thead>
+<tbody>
+<tr><td>Sync <em>Running</em> for a long time</td><td>A wave is waiting for health: a Deployment that never becomes available, a PVC Pending, a LoadBalancer with no address, a hook Job still running</td><td><code>argocd app get</code> — the resource still Progressing; then <code>kubectl describe</code> it (Module 12)</td></tr>
+<tr><td>Sync <em>Failed</em>, "one or more objects failed to apply"</td><td>Validation/admission rejected an object (Pod Security, quota, a webhook — <a href="../lessons/d38-admission-controllers.html">Day 38</a>), an immutable field changed, RBAC denied</td><td>The operation message names the object; <code>argocd app sync --dry-run</code> reproduces it</td></tr>
+<tr><td>Hook Job Failed</td><td>The migration/test exited non-zero</td><td><code>argocd app logs APP --kind Job</code> or <code>kubectl logs job/…</code></td></tr>
+<tr><td>Synced but Degraded</td><td>The app is broken, not the sync: CrashLoopBackOff, probes failing, ProgressDeadlineExceeded</td><td><a href="../lessons/d22-pod-lifecycle.html">Day 22</a>/<a href="../lessons/d23-health-probes.html">23</a> playbook; then revert</td></tr>
+<tr><td>Perpetually OutOfSync, empty-looking diff</td><td>A field owned by another controller; or a Helm chart that randomises something each render (a generated password, a timestamp label)</td><td><code>argocd app diff</code>; add <code>ignoreDifferences</code> or fix the chart</td></tr>
+<tr><td>Unknown / ComparisonError</td><td>Repo/render problem</td><td><code>status.conditions</code>; repo-server logs (<a href="c07-argocd-architecture.html">C7</a>)</td></tr>
+<tr><td>Auto-sync "not happening"</td><td>Previous sync of that revision failed; a sync window; the app has an error condition; the change is in an ignored field</td><td><code>argocd app get</code> → OPERATION and CONDITIONS</td></tr>
+</tbody></table></div>
+<pre><code class="lang-bash">$ argocd app terminate-op api-prod                  # abort a stuck operation
+$ argocd app sync api-prod --resource apps:Deployment:api   # sync one resource
+$ argocd app sync api-prod --replace --force        # last resort for immutable-field conflicts (recreates objects!)
+$ kubectl -n argocd logs sts/argocd-application-controller | grep api-prod | tail</code></pre>
+
+<div class="lab"><h3>Hands-on lab (30 min) — hooks, waves, a broken release, a revert</h3>
+<ol class="steps">
+<li><strong>Add a PreSync hook</strong> to your C7 app's overlay: the migrate Job above, with <code>command: ["sh", "-c", "echo migrating; sleep 10"]</code>. Commit. Watch the sync in the UI: the Job runs first, the Deployment waits.</li>
+<li><strong>Waves</strong>: annotate the Deployment with wave 1 and the Service with wave 2; add a readiness probe with <code>initialDelaySeconds: 20</code>. Commit; watch wave 2 wait until the Deployment is Healthy.</li>
+<li><strong>Fail the hook</strong>: change the command to <code>exit 1</code>. Commit. The sync fails; the Deployment is untouched; <code>argocd app logs --kind Job</code> shows why. Fix and commit — note auto-sync did not retry the failed revision until the new commit.</li>
+<li><strong>Break the release</strong>: set the image tag to one that does not exist. Sync succeeds (the manifest applied fine); health goes Progressing then Degraded (ImagePullBackOff, <a href="../lessons/d22-pod-lifecycle.html">Day 22</a>). Read it in <code>argocd app get</code>.</li>
+<li><strong>Two rollbacks</strong>: first <code>argocd app rollback</code> to the previous ID — observe auto-sync got disabled. Then <code>git revert</code> the bad commit, re-enable auto-sync, and see it converge the GitOps way.</li>
+<li><strong>A lying diff</strong>: add an HPA to the overlay (<a href="../lessons/d20-autoscaling.html">Day 20</a>) while keeping <code>replicas: 2</code> in the Deployment. Watch OutOfSync appear whenever the HPA scales. Add the <code>ignoreDifferences</code> entry and <code>RespectIgnoreDifferences=true</code>; confirm it stays Synced.</li>
+</ol></div>
+
+<details class="quiz"><summary>An app shows <em>Synced · Degraded</em>. Is the problem in git, in Argo CD, or in the workload? What is the first command?</summary><div><p>The workload. Synced means the manifests applied exactly as written; Degraded means the resulting objects are unhealthy. <code>argocd app get</code> to find the Degraded resource, then <code>kubectl describe</code>/<code>logs</code> on it — the manifest that is in git is wrong (bad image, bad config), so the fix is a commit or revert.</p></div></details>
+<details class="quiz"><summary>You need a ConfigMap change to be picked up by Pods that mount it as env vars. Argo CD syncs the ConfigMap; nothing restarts. Why, and what are two fixes?</summary><div><p>Env vars are read at container start (<a href="../lessons/d28-configmaps-secrets.html">Day 28</a>); updating the ConfigMap does not change the Pod template, so no rollout. Fixes: hash the ConfigMap content into a Pod annotation (Kustomize's <code>configMapGenerator</code> does this by appending a hash suffix to the name, which changes the template), or run a controller like Reloader that restarts on ConfigMap changes.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Sync = git vs live; Health = is it working, computed per kind from the same status fields and probes the course taught. An app can be Synced and Degraded.</li>
+<li>A sync runs PreSync → Sync → PostSync; hooks are annotated Jobs; waves order resources and wait for health between them; prune removes what left git.</li>
+<li>Sync options tune apply behaviour — ServerSideApply, CreateNamespace, PruneLast, Replace — globally or per resource via annotation.</li>
+<li>Perpetual OutOfSync is a second controller owning a field: <code>ignoreDifferences</code> (pointers, jq, managed-field managers) + <code>RespectIgnoreDifferences</code>.</li>
+<li><code>app rollback</code> is the fire extinguisher (and disables auto-sync); <code>git revert</code> is the rollback.</li>
+<li>Stuck syncs are waiting for health; failed syncs are rejected objects or failed hooks — the detail is always in the Kubernetes object, not in Argo CD.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- sync-health ---------- */
+  let svg = S.box('git', 15, 30, 200, 60, ['git @ main', 'image: api:9f2e1c3'], { fs: 11, subfs: 9.5, subcls: 'mono muted', cls: 'pur' })
+    + S.box('sync', 250, 30, 220, 60, ['SYNC STATUS', 'Synced'], { fs: 9.5, subfs: 13, subcls: 'b', lcls: 'muted', cls: 'ok' })
+    + S.box('health', 500, 30, 205, 60, ['HEALTH STATUS', 'Healthy'], { fs: 9.5, subfs: 13, subcls: 'b', lcls: 'muted', cls: 'ok' })
+    + S.term('dep', 15, 115, 320, 96, ['Deployment api  (live)', ' image: api:9f2e1c3', ' replicas 3 · updated 3 · available 3', ' condition Progressing: NewReplicaSetAvailable'], { fs: 9.5 })
+    + S.term('pods', 360, 115, 345, 96, ['Pods', ' api-7d9-a  Running  Ready 1/1', ' api-7d9-b  Running  Ready 1/1', ' api-7d9-c  Running  Ready 1/1'], { fs: 9.5 })
+    + S.text('m', 360, 240, '', { cls: 'sm b' }) + S.text('m2', 360, 262, '', { cls: 'xs muted' });
+  const SS = (q, s, cls) => { q('#sync text:nth-of-type(2)').text(s); q('#sync rect').set(cls); };
+  const HS = (q, s, cls) => { q('#health text:nth-of-type(2)').text(s); q('#health rect').set(cls); };
+  const P = (q, lines, color) => lines.forEach((t, i) => { if (t != null) q('#pods-l' + (i + 1)).text(t).style('fill', color || 'var(--faint)'); });
+  Anim.define('sync-health', { w: 720, h: 275, title: 'Synced and Healthy are different questions', ms: 2600, svg, steps: [
+    { c: 'Steady state: the live Deployment matches git (<b>Synced</b>); its conditions say the rollout is complete and every Pod is Ready (<b>Healthy</b>).', on(q){ q('#m').text('live == git  ·  everything Ready'); } },
+    { c: 'CI commits a new tag. Git changed, the cluster has not: <b>OutOfSync</b>. Nothing is broken, so health is still <b>Healthy</b>. <code>argocd app diff</code> shows the image line.', on(q){ q('#git text:nth-of-type(2)').text('image: api:e4d5c6b'); q('#git rect').set('hl'); SS(q, 'OutOfSync', 'warn'); q('#m').text('expected drift: a new revision'); } },
+    { c: 'Sync applies the manifest. Now live matches git again — <b>Synced</b> — but the Deployment is mid-rollout: updated 1 of 3. Health becomes <b>Progressing</b>.', on(q){ SS(q, 'Synced', 'ok'); HS(q, 'Progressing', 'warn'); q('#dep-l1').text(' image: api:e4d5c6b'); q('#dep-l2').text(' replicas 3 · updated 1 · available 3'); q('#dep-l3').text(' condition Progressing: ReplicaSetUpdated'); P(q, [' api-8c1-x  Running  Ready 0/1  (probe)', ' api-7d9-b  Running  Ready 1/1', ' api-7d9-c  Running  Ready 1/1'], 'var(--amber)'); q('#m').text('applied, still converging'); } },
+    { c: 'The new Pods pass their readiness probes, the old ReplicaSet scales to zero, the Deployment reports NewReplicaSetAvailable: <b>Synced · Healthy</b>. The release is done.', on(q){ HS(q, 'Healthy', 'ok'); q('#dep-l2').text(' replicas 3 · updated 3 · available 3'); q('#dep-l3').text(' condition Progressing: NewReplicaSetAvailable'); P(q, [' api-8c1-x  Running  Ready 1/1', ' api-8c1-y  Running  Ready 1/1', ' api-8c1-z  Running  Ready 1/1'], 'var(--green)'); q('#m').text('deployed'); } },
+    { c: 'Next release: the tag exists but the container crashes. The manifest applied perfectly — <b>Synced</b> — yet Pods are in CrashLoopBackOff and the rollout stalls past its deadline: <b>Degraded</b>. Argo CD is telling you the truth about git, and about the app, separately.', on(q){ q('#git text:nth-of-type(2)').text('image: api:c0ffee1'); q('#dep-l1').text(' image: api:c0ffee1'); q('#dep-l2').text(' replicas 3 · updated 1 · available 2'); q('#dep-l3').text(' condition Progressing: ProgressDeadlineExceeded'); HS(q, 'Degraded', 'bad'); P(q, [' api-9ff-q  CrashLoopBackOff  Ready 0/1', null, null], 'var(--red)'); q('#m').text('Synced + Degraded = the manifest is wrong, not the sync'); } },
+    { c: 'Someone runs <code>kubectl scale --replicas=5</code> while an HPA also manages replicas. Without <code>ignoreDifferences</code> the app flips <b>OutOfSync</b> on every scale event, and with selfHeal it fights the HPA. The fix is to ignore <code>/spec/replicas</code> — a diff configuration, not a deployment problem.', on(q){ q('#git text:nth-of-type(2)').text('image: api:e4d5c6b'); q('#dep-l1').text(' image: api:e4d5c6b'); q('#dep-l2').text(' replicas 5 (HPA) · updated 5 · available 5'); q('#dep-l3').text(' condition Progressing: NewReplicaSetAvailable'); HS(q, 'Healthy', 'ok'); SS(q, 'OutOfSync', 'warn'); P(q, [' api-8c1-x  Running  Ready 1/1', ' api-8c1-y  Running  Ready 1/1', ' api-8c1-z … +2  Running  Ready 1/1'], 'var(--green)'); q('#m').text('OutOfSync + Healthy: a field owned by another controller'); q('#m2').text('ignoreDifferences: /spec/replicas'); } },
+  ]});
+
+  /* ---------- sync-waves ---------- */
+  const col = (id, x, w, title) => S.zone(id, x, 15, w, 215, title);
+  const res = (id, x, y, label, sub) => S.box(id, x, y, 118, 34, sub ? [label, sub] : [label], { fs: 10, subfs: 9, subcls: 'mono muted', cls: 'soft' });
+  svg = col('ph1', 15, 135, 'PreSync')
+    + res('mig', 24, 60, 'Job db-migrate', 'hook: PreSync')
+    + col('ph2', 160, 440, 'Sync  (waves, in order)')
+    + S.text('w1', 235, 45, 'wave -2', { cls: 'xs muted' }) + S.text('w2', 380, 45, 'wave 0', { cls: 'xs muted' }) + S.text('w3', 525, 45, 'wave 1 → 2', { cls: 'xs muted' })
+    + res('ns', 176, 60, 'Namespace shop')
+    + res('cm', 321, 60, 'ConfigMap api')
+    + res('sec', 321, 104, 'Secret api')
+    + res('svc', 321, 148, 'Service api')
+    + res('dep', 466, 60, 'Deployment api', 'wave 1')
+    + res('ing', 466, 148, 'Ingress api', 'wave 2')
+    + col('ph3', 610, 135, 'PostSync')
+    + res('smoke', 619, 60, 'Job smoke-test', 'hook: PostSync')
+    + res('fail', 619, 148, 'Job notify', 'hook: SyncFail')
+    + S.arrow('x1', 142, 77, 174, 77, { cls: 'hid' })
+    + S.arrow('x2', 294, 77, 319, 77, { cls: 'hid' })
+    + S.arrow('x3', 439, 77, 464, 77, { cls: 'hid' })
+    + S.arrow('x4', 525, 94, 525, 146, { cls: 'hid', label: 'wait: Healthy', lx: 572, ly: 124 })
+    + S.arrow('x5', 584, 165, 617, 90, { d: 'M 584 165 L 617 90', cls: 'hid' })
+    + S.text('m', 380, 252, '', { cls: 'sm b' }) + S.text('m2', 380, 272, '', { cls: 'xs muted' });
+  const R = (q, id, cls, sub) => { q('#' + id + ' rect').set(cls); if (sub) q('#' + id + ' text:nth-of-type(2)').text(sub); };
+  Anim.define('sync-waves', { w: 760, h: 285, title: 'Phases, hooks and waves', ms: 2600, svg, steps: [
+    { c: 'A sync operation starts. <b>PreSync</b> first: the migration Job (annotated <code>hook: PreSync</code>) is created and Argo CD waits for it to be Healthy — for a Job, <em>Succeeded</em>.', on(q){ R(q, 'mig', 'hl', 'running…'); q('#m').text('PreSync: waiting for Job to succeed'); } },
+    { c: 'Exit code 0 → Succeeded. With <code>hook-delete-policy: HookSucceeded</code> the Job is deleted. Had it failed, the operation stops here, nothing in Sync is touched, and the <b>SyncFail</b> hook runs.', on(q){ R(q, 'mig', 'ok', 'Succeeded'); q('#x1').show().set('ok'); q('#m').text('PreSync done'); } },
+    { c: '<b>Sync</b> phase, lowest wave first: wave −2 holds the Namespace (<code>Prune=false</code> so it is never deleted). Applied; Healthy immediately.', on(q){ R(q, 'ns', 'ok'); q('#x2').show().set('ok'); q('#m').text('wave -2'); } },
+    { c: 'Wave 0: ConfigMap, Secret, Service — ordered by kind inside the wave. All Healthy on creation.', on(q){ R(q, 'cm', 'ok'); R(q, 'sec', 'ok'); R(q, 'svc', 'ok'); q('#x3').show().set('ok'); q('#m').text('wave 0'); } },
+    { c: 'Wave 1: the Deployment. Argo CD applies it and then <b>waits</b>: a wave is complete only when its resources are Healthy — here, when the rollout finishes and Pods are Ready.', on(q){ R(q, 'dep', 'warn', 'Progressing'); q('#x4').show().set('hl'); q('#m').text('wave 1: rollout in progress'); } },
+    { c: 'Deployment Healthy → wave 2: the Ingress is created only now, so traffic is routed to Pods that already pass probes. Then <b>PostSync</b>: the smoke-test Job runs against the live app.', on(q){ R(q, 'dep', 'ok', 'Healthy'); R(q, 'ing', 'ok'); q('#x5').show().set('ok'); R(q, 'smoke', 'hl', 'running…'); q('#m').text('wave 2 · PostSync'); } },
+    { c: 'Smoke test succeeds → operation <b>Succeeded</b>; prune (if enabled) removes anything that left git, last. A failing smoke test marks the operation Failed and runs the SyncFail hook — the objects stay applied, so pair it with a revert or a Rollout (C9).', on(q){ R(q, 'smoke', 'ok', 'Succeeded'); q('#fail rect').set('dim'); q('#m').text('operation Succeeded · prune last'); q('#m2').text('order = phase, then wave, then kind, then name'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

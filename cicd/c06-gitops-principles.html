@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C6 · GitOps: Principles, Push vs Pull & Reconciliation · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c06" data-root="../" data-linux="l10" data-related="d07,d09,d10,d20,d28,d40,d42,d43,c01,c03">
+<article class="lesson">
+<p class="lead">Every controller in this course works the same way: read the desired state, observe the actual state, act on the difference, repeat. <strong>GitOps</strong> applies that loop to deployment itself. The desired state of a whole environment lives in a git repository; a controller running <em>in</em> the cluster continuously makes the cluster match it. Deploying becomes merging. Rollback becomes revert. Drift becomes a status you can see. This page is the idea; <a href="c07-argocd-architecture.html">C7</a> onwards is Argo CD, the implementation.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The four GitOps principles and where you have already met each one</li>
+<li>Push vs pull deployment, compared on security, drift, audit and scale</li>
+<li>The reconciliation loop with git as the source of truth: sync, drift, self-heal, prune</li>
+<li>Repository design: app repo vs config repo, environments as directories, what not to commit</li>
+<li>The CI → git handoff: how the new image tag gets into the config repo</li>
+<li>Argo CD vs Flux, and what GitOps does not solve</li>
+</ul></div>
+
+<h2>The four principles</h2>
+<p>The <a href="https://opengitops.dev">OpenGitOps</a> definition has four parts. None of them is new to you.</p>
+<dl class="kv">
+<dt>1 · Declarative</dt><dd>The desired state is expressed as data, not as steps: manifests, Kustomize overlays, Helm values. You have written nothing else since <a href="../lessons/d09-yaml-imperative-declarative.html">Day 9</a>.</dd>
+<dt>2 · Versioned and immutable</dt><dd>That data is stored in a system that keeps history and never rewrites it: git. Every state the cluster was ever in is a commit with an author and a reviewer. Compare: etcd stores only <em>now</em>.</dd>
+<dt>3 · Pulled automatically</dt><dd>Software agents <em>fetch</em> the desired state from the store. Nothing outside the cluster pushes into it; the cluster reaches out. This is the inversion that changes the security model.</dd>
+<dt>4 · Continuously reconciled</dt><dd>The agents keep comparing and correcting, forever — not once per pipeline run. The control loop from <a href="../lessons/d07-architecture.html">Day 7</a>, with a git repo where the Deployment spec used to be.</dd>
+</dl>
+<div class="callout mental"><p>Kubernetes already <em>is</em> GitOps one level down: you declare a Deployment in etcd, controllers reconcile Pods to it. GitOps adds one more level: you declare the Deployment (and everything else) in git, and a controller reconciles etcd to it. Same loop, one more layer of desired state.</p></div>
+
+<h2>Push vs pull</h2>
+<figure data-anim="push-vs-pull"></figure>
+<div class="tbl-wrap"><table>
+<thead><tr><th></th><th>Push (CI deploys — C3, C5)</th><th>Pull (GitOps — C7+)</th></tr></thead>
+<tbody>
+<tr><td>Who has cluster credentials</td><td>The CI system, for every cluster and environment it deploys to</td><td>Nobody outside the cluster. The agent inside uses its own ServiceAccount; CI needs only git write access</td></tr>
+<tr><td>Network direction</td><td>Inbound to the API server from CI (public endpoint or runners in the network)</td><td>Outbound from the cluster to git and the registry — works behind NAT, air-gapped with a mirror</td></tr>
+<tr><td>After the deploy</td><td>Nothing watches. Manual changes persist until the next run overwrites them (or not)</td><td>Continuous comparison: drift is reported and, if enabled, reverted within minutes</td></tr>
+<tr><td>What is running?</td><td>Ask the cluster</td><td>Read the repo; the agent tells you if the cluster disagrees</td></tr>
+<tr><td>Rollback</td><td>Re-run the pipeline with an old tag, if it still exists</td><td><code>git revert</code>; the agent does the rest</td></tr>
+<tr><td>Many clusters</td><td>N credentials, N deploy steps in CI</td><td>Each cluster pulls the same repo; or one hub agent manages N clusters</td></tr>
+<tr><td>Failure surface</td><td>A compromised pipeline = cluster admin</td><td>A compromised pipeline = a bad commit, visible in history and revertible</td></tr>
+</tbody></table></div>
+<div class="callout connect" data-ref="c03"><p>The push pipeline from <a href="c03-github-actions-kubernetes.html">C3</a> is not wrong — it is how most teams start, and for a single cluster with OIDC it is fine. It becomes wrong the day someone runs <code>kubectl edit</code> in prod to "fix it quickly" and nothing notices, or the day the third cluster arrives. The pull model is the answer to those two days.</p></div>
+
+<h2>The loop, with git as the truth</h2>
+<figure data-anim="drift-reconcile"></figure>
+<dl class="kv">
+<dt>Desired state</dt><dd>A commit in the config repo, rendered (Kustomize/Helm) into plain objects. The agent tracks a branch (<code>main</code>) or a tag/commit for stricter environments.</dd>
+<dt>Live state</dt><dd>What the API server returns for those objects: the same three-way comparison <code>kubectl apply</code> does (<a href="../lessons/d09-yaml-imperative-declarative.html">Day 9</a>), minus fields the agent knows to ignore (status, defaults, fields other controllers own).</dd>
+<dt>Sync</dt><dd>Applying the rendered manifests so live = desired. Manual (a human clicks / runs a command after reviewing the diff) or automated (on every change).</dd>
+<dt>Drift / OutOfSync</dt><dd>Live ≠ desired. Either git moved (a new commit: expected drift, sync forward) or the cluster moved (someone edited an object: unexpected drift). The agent shows the diff either way.</dd>
+<dt>Self-heal</dt><dd>Automated sync also for cluster-side drift: the manual change is reverted. Turn it on when git is truly the only accepted path.</dd>
+<dt>Prune</dt><dd>Delete live objects that were removed from git. Off by default in most tools because it is destructive; on for mature setups so that "delete the file" means delete.</dd>
+<dt>Interval + webhook</dt><dd>The agent polls git every few minutes and also accepts webhooks for immediacy. Reconciliation of live state uses watches, so cluster-side drift is noticed within seconds.</dd>
+</dl>
+<div class="callout connect" data-ref="d20,d10"><p>Not every live change is drift. The HPA (<a href="../lessons/d20-autoscaling.html">Day 20</a>) rewrites <code>spec.replicas</code>; a Deployment's controller stamps annotations; admission webhooks inject sidecars (<a href="../lessons/d38-admission-controllers.html">Day 38</a>). A GitOps agent must be told to ignore those fields or it will fight the other controllers — the same "two controllers owning one field" problem as an HPA plus a hard-coded <code>replicas</code>. <a href="c08-argocd-sync.html">C8</a> covers <code>ignoreDifferences</code>.</p></div>
+
+<h2>Repository design</h2>
+<div class="compare">
+<div><h4>Application repository</h4><p>Source code, Dockerfile, tests, the CI workflow/Jenkinsfile. Produces an <em>image</em>. Changes many times a day; owned by the app team; CI runs on every push.</p></div>
+<div><h4>Configuration (deployment) repository</h4><p>Manifests for one or many apps and environments: Kustomize bases and overlays, Helm values, the GitOps agent's own objects. Produces a <em>cluster state</em>. Changes when a version is promoted or config changes; reviewed by whoever owns the environment; the agent watches it.</p></div>
+</div>
+<p>Why separate them? CI on the app repo should not trigger a redeploy on a README change; deploying should not require rebuilding; the people allowed to merge to <code>prod</code> config are not the people allowed to merge app code; and one config repo can describe apps from twenty app repos.</p>
+<div class="file-tree">platform-config/                      # one config repo, one team (or one per team)
+├── apps/
+│   └── api/
+│       ├── base/                     # Deployment, Service, Ingress, kustomization.yaml
+│       └── overlays/
+│           ├── dev/kustomization.yaml       images: [{name: ghcr.io/acme/api, newTag: 9f2e1c3}]
+│           ├── staging/kustomization.yaml   images: [{name: ghcr.io/acme/api, newTag: 9f2e1c3}]
+│           └── prod/kustomization.yaml      images: [{name: ghcr.io/acme/api, newTag: 4b7d0e9}]   ← behind
+├── infra/                            # cert-manager, ingress controller, monitoring: Helm values per cluster
+│   ├── cert-manager/values-prod.yaml
+│   └── ingress-nginx/values-prod.yaml
+└── argocd/                           # the agent's own config: Applications / ApplicationSets (C7, C9)
+    ├── apps.yaml
+    └── projects.yaml</div>
+<div class="callout warn"><p><strong>Environments are directories, not branches.</strong> A <code>prod</code> branch sounds natural and fails in practice: environment branches diverge, cherry-picks carry unrelated changes, and "merge staging into prod" moves <em>every</em> change at once. With directories, promoting one app is a one-line diff in one file, and a PR shows exactly what changes in that environment. Kustomize overlays (<a href="../lessons/d42-kustomize.html">Day 42</a>) and per-environment values files (<a href="../lessons/d43-helm.html">Day 43</a>) exist for this.</p></div>
+<h3>What does not go in git</h3>
+<ul>
+<li><strong>Secrets in plain text.</strong> Options: encrypt them in git (Sealed Secrets, SOPS + age/KMS) so the controller in the cluster decrypts; or keep only a <em>reference</em> in git (External Secrets Operator, Vault) and let a controller create the Secret from a vault. Either way the Secret object of <a href="../lessons/d28-configmaps-secrets.html">Day 28</a> ends up in the cluster without ever being committed.</li>
+<li><strong>Generated or owned-elsewhere fields.</strong> <code>status</code>, HPA-managed replicas, webhook-injected containers, cloud-assigned load balancer addresses.</li>
+<li><strong>Images.</strong> Only their names and tags. The registry is the artifact store; git holds pointers.</li>
+</ul>
+
+<h2>The handoff: how the tag reaches git</h2>
+<p>The one place CI and CD touch is a commit that changes an image tag in the config repo. Three ways to make it:</p>
+<pre><code class="lang-bash"># 1. CI commits directly (the common pattern; needs a bot identity with write access to the config repo)
+$ git clone https://x-access-token:$CONFIG_REPO_TOKEN@github.com/acme/platform-config && cd platform-config
+$ cd apps/api/overlays/dev && kustomize edit set image ghcr.io/acme/api=ghcr.io/acme/api:$TAG   # or: yq -i '.image.tag = strenv(TAG)' values-dev.yaml
+$ git -c user.name=ci-bot -c user.email=ci@acme.dev commit -am "api: dev → $TAG" && git push
+# on a rejected push (someone else committed first): git pull --rebase && git push   — retry a few times
+
+# 2. CI opens a pull request instead (for environments that need review): gh pr create --title "api: prod → $TAG" --body "$CHANGELOG"
+
+# 3. An image-update controller (Argo CD Image Updater, Flux image automation) watches the registry for new tags matching a pattern
+#    and writes the commit itself. No CI involvement; the tag pattern (semver, sha-*) is the policy.</code></pre>
+<div class="callout linux" data-ref="l10"><p>That handoff is shell: <code>git</code>, <code>kustomize</code>/<code>yq</code>, <code>sed</code>, a retry loop, an exit code. The classic bugs are the classic shell bugs from <a href="../linux/l10-shell-toolkit.html">L10</a> — a <code>yq</code> that rewrote quoting so the diff is noisy, a <code>set -e</code> missing so a failed push is ignored, two pipelines racing on the same branch (fix: <code>pull --rebase</code> + retry, or one queue).</p></div>
+
+<h2>What GitOps does not do</h2>
+<ul>
+<li><strong>Build anything.</strong> CI still builds, tests, scans and pushes images (<a href="c02-github-actions.html">C2</a>–<a href="c05-jenkins-on-kubernetes.html">C5</a>).</li>
+<li><strong>Order arbitrary steps.</strong> "Run the DB migration before the new Pods start" needs hooks and waves (<a href="c08-argocd-sync.html">C8</a>), not a plain apply.</li>
+<li><strong>Decide if a release is good.</strong> Probes (<a href="../lessons/d23-health-probes.html">Day 23</a>) and health checks say whether it is <em>up</em>; canary analysis (<a href="c09-argocd-scale.html">C9</a>, Argo Rollouts) says whether it is <em>better</em>.</li>
+<li><strong>Manage secrets by itself.</strong> See above.</li>
+<li><strong>Remove the need to understand Kubernetes.</strong> When an Application is <em>Degraded</em>, the fix is still <code>kubectl describe</code> and everything from Module 12.</li>
+</ul>
+
+<h2>Argo CD and Flux</h2>
+<div class="tbl-wrap"><table>
+<thead><tr><th></th><th>Argo CD</th><th>Flux</th></tr></thead>
+<tbody>
+<tr><td>Model</td><td><code>Application</code> = one source → one destination; <code>ApplicationSet</code> generates many</td><td><code>GitRepository</code>/<code>HelmRepository</code> sources + <code>Kustomization</code>/<code>HelmRelease</code> reconcilers, composable</td></tr>
+<tr><td>UI</td><td>Rich web UI with resource tree, diffs, logs, sync buttons; CLI; SSO + RBAC</td><td>CLI-first (<code>flux</code>); UI via third parties (Weave GitOps, Headlamp plugin)</td></tr>
+<tr><td>Helm</td><td>Renders with <code>helm template</code>, applies objects itself (no Helm release Secrets)</td><td>Real Helm releases via the helm-controller (<code>helm list</code> works)</td></tr>
+<tr><td>Multi-cluster</td><td>Hub manages spokes via stored credentials; cluster generator</td><td>Typically one Flux per cluster, all pointing at the same repo</td></tr>
+<tr><td>Fit</td><td>Teams that want visibility and a self-service UI</td><td>Platform teams that want small composable controllers and pure Kubernetes-native UX</td></tr>
+</tbody></table></div>
+<p>Both are CNCF graduated, both implement the four principles, both are controllers with CRDs (<a href="../lessons/d40-operators.html">Day 40</a>). This track uses Argo CD because its UI makes the loop visible while you learn it.</p>
+
+<div class="lab"><h3>Hands-on lab (25 min) — GitOps with a shell loop, before any tool</h3>
+<p>Build the reconciler yourself, so Argo CD is never magic. Use the Kustomize layout from <a href="../lessons/d42-kustomize.html">Day 42</a> (or <code>app/</code> from that lab) in a git repo — local is fine.</p>
+<ol class="steps">
+<li><strong>Config repo</strong>: <code>git init config &amp;&amp; cd config</code>; put <code>base/</code> and <code>overlays/dev/</code> there (a Deployment with 2 replicas and a Service); commit.</li>
+<li><strong>The agent</strong> — a loop that pulls and applies:<pre><code class="lang-bash">$ cat &gt; agent.sh &lt;&lt;'EOF'
+#!/bin/bash
+set -u
+cd "$(dirname "$0")"
+while true; do
+  git pull -q --ff-only 2&gt;/dev/null || true                          # desired state: latest commit
+  if ! kubectl diff -k overlays/dev &gt;/dev/null 2&gt;&amp;1; then          # exit 1 = OutOfSync
+    echo "$(date +%T) OutOfSync → syncing"; kubectl apply -k overlays/dev
+  else
+    echo "$(date +%T) Synced"
+  fi
+  sleep 15
+done
+EOF
+$ bash agent.sh</code></pre></li>
+<li><strong>Cluster-side drift</strong>: in another terminal, <code>kubectl scale deploy/web --replicas=5</code>. Within 15 s the agent reports OutOfSync and applies — replicas go back to 2. That is <em>self-heal</em>. Now <code>kubectl delete svc web</code> — recreated. Now edit the Deployment's image by hand — reverted.</li>
+<li><strong>Git-side change</strong>: edit <code>overlays/dev/kustomization.yaml</code> to set a new <code>newTag</code>, commit. Next tick: OutOfSync → sync → a rolling update (<a href="../lessons/d10-replicasets-deployments.html">Day 10</a>). Then <code>git revert HEAD</code> — rollback with no kubectl.</li>
+<li><strong>What the loop cannot do</strong>: delete <code>service.yaml</code> from the base and commit. The Service stays in the cluster — no <em>prune</em>. Add <code>--prune -l app=web</code> to the apply and try again (<code>kubectl apply --prune</code> is the primitive Argo CD builds on).</li>
+<li><strong>Write down what is missing</strong> before reading C7: health (is the rollout done? are Pods Ready?), a diff you can read, ordering, many apps and clusters, permissions, a UI, an audit of who synced what. Every one of those is an Argo CD feature.</li>
+</ol></div>
+
+<details class="quiz"><summary>Your team keeps <code>dev</code>, <code>staging</code> and <code>prod</code> as git branches of the config repo. A hotfix to prod's replica count needs to happen now. What goes wrong, and what is the directory-based equivalent?</summary><div><p>You commit on <code>prod</code>; later "merge staging → prod" conflicts with it or reverts it, and the reverse merge drags every staging change into prod. With directories, the hotfix is a one-line change to <code>overlays/prod/kustomization.yaml</code> on <code>main</code>, reviewed, and it never collides with what dev/staging are doing.</p></div></details>
+<details class="quiz"><summary>An HPA scales a Deployment to 6 replicas; the config repo says 3. Your GitOps agent has self-heal on. What happens, and how do you fix it?</summary><div><p>The agent sees live ≠ desired and sets replicas back to 3; the HPA raises it; they fight forever. Either remove <code>replicas</code> from the manifest (let the HPA own it) or configure the agent to ignore <code>/spec/replicas</code> for that object.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>GitOps = declarative + versioned + pulled + continuously reconciled. It is the Kubernetes control loop with git as the desired state.</li>
+<li>Pull inverts the trust: the cluster reaches out; CI only writes commits. Drift becomes visible and (optionally) self-corrected.</li>
+<li>App repos produce images; a config repo produces cluster state; environments are directories with overlays/values; promotion is a one-line PR.</li>
+<li>The CI → CD handoff is a commit that changes an image tag — by CI, by a PR, or by an image-update controller.</li>
+<li>GitOps does not build, order steps, judge releases or manage secrets on its own; it needs CI, hooks, probes/analysis and a secrets operator alongside.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- push-vs-pull ---------- */
+  let svg = S.text('tp', 185, 22, 'PUSH', { cls: 'sm b muted' }) + S.text('tq', 560, 22, 'PULL (GitOps)', { cls: 'sm b muted' })
+    + `<line x1="375" y1="10" x2="375" y2="275" stroke="var(--border)" stroke-dasharray="4 4"/>`
+    // push side
+    + S.box('ci1', 20, 45, 130, 54, ['CI runner', 'kubeconfig · token'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.icon('k1', 145, 52, 'key')
+    + S.node('cl1', 190, 40, 165, 170, 'cluster A')
+    + S.box('api1', 205, 70, 135, 34, ['API server'], { fs: 10.5 })
+    + S.box('dep1', 205, 118, 135, 40, ['Deployment api', 'replicas: 3'], { fs: 10.5, subfs: 9, subcls: 'mono muted' })
+    + S.icon('h1', 100, 175, 'user', { label: 'kubectl edit', ly: 26, lcls: 'mono' })
+    + S.arrow('p1', 150, 72, 203, 85, { d: 'M 150 72 L 203 86', cls: 'hid', label: 'apply (inbound)', lx: 150, ly: 120 })
+    + S.arrow('p2', 130, 170, 203, 140, { d: 'M 130 170 L 203 142', cls: 'hid bad' })
+    + S.text('pm', 185, 245, '', { cls: 'sm b' })
+    // pull side
+    + S.box('ci2', 395, 45, 120, 54, ['CI runner', 'git token only'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('git', 395, 130, 120, 54, ['config repo', 'overlays/prod'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.node('cl2', 555, 40, 185, 170, 'cluster B')
+    + S.box('ag', 570, 70, 155, 40, ['GitOps agent', 'ServiceAccount + RBAC'], { fs: 10.5, subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.box('dep2', 570, 128, 155, 40, ['Deployment api', 'replicas: 3'], { fs: 10.5, subfs: 9, subcls: 'mono muted' })
+    + S.icon('h2', 470, 215, 'user', { label: 'kubectl edit', ly: 26, lcls: 'mono' })
+    + S.arrow('q1', 455, 99, 455, 128, { cls: 'hid', label: 'commit tag', lx: 500, ly: 118 })
+    + S.arrow('q2', 568, 90, 515, 157, { d: 'M 568 92 L 540 92 L 540 157 L 517 157', cls: 'hid', label: 'fetch (outbound)', lx: 545, ly: 195 })
+    + S.arrow('q3', 647, 110, 647, 126, { cls: 'hid' })
+    + S.arrow('q4', 500, 210, 568, 150, { d: 'M 500 210 L 568 152', cls: 'hid bad' })
+    + S.text('qm', 560, 245, '', { cls: 'sm b' })
+    + S.text('m', 380, 270, '', { cls: 'xs muted' });
+  Anim.define('push-vs-pull', { w: 760, h: 285, title: 'Who holds the credential, which way the traffic flows', ms: 2600, svg, steps: [
+    { c: '<b>Push:</b> the CI runner holds a credential for the cluster and calls the API server from outside. The API endpoint must be reachable from wherever CI runs.', on(q){ q('#p1').show().set('hl'); q('#ci1 rect').set('hl'); q('#pm').text('CI = cluster admin-ish'); } },
+    { c: '<b>Pull:</b> the CI runner\'s only credential is write access to the config repo. It commits the new image tag and is done.', on(q){ q('#q1').show().set('hl'); q('#ci2 rect').set('hl'); q('#git rect').set('pur'); q('#qm').text('CI = git committer'); } },
+    { c: 'An agent <em>inside</em> cluster B fetches the repo (outbound HTTPS/SSH — no inbound port, works behind NAT) and applies what it finds, using its own ServiceAccount.', on(q){ q('#q2').show().set('hl'); q('#ag rect').set('cy'); q('#q3').show().set('ok'); q('#dep2 rect').set('ok'); q('#qm').text('cluster reaches out; nothing reaches in'); } },
+    { c: 'Later, a human edits the Deployment by hand in both clusters.', on(q){ q('#p2').show(); q('#q4').show(); q('#dep1 text:nth-of-type(2)').text('replicas: 5 (edited)'); q('#dep1 rect').set('warn'); q('#dep2 text:nth-of-type(2)').text('replicas: 5 (edited)'); q('#dep2 rect').set('warn'); q('#m').text('same edit, two outcomes'); } },
+    { c: 'Push side: nothing is watching. The change stays until the next pipeline run happens to overwrite it — and the repo never knew. Pull side: the agent\'s next comparison shows <b>OutOfSync</b>; with self-heal it reverts within seconds, and the event is visible in its UI/log.', on(q){ q('#pm').text('drift, invisible'); q('#dep2 text:nth-of-type(2)').text('replicas: 3 (healed)'); q('#dep2 rect').set('ok'); q('#q4').hide(); q('#qm').text('drift detected → reverted'); } },
+    { c: 'Ten clusters? Push: ten credentials in CI and ten deploy steps. Pull: ten agents watching one repo (or one hub agent with ten targets). Rollback in both: push re-runs a pipeline; pull is <code>git revert</code>.', on(q){ q('#m').text('scale by adding readers, not writers'); } },
+  ]});
+
+  /* ---------- drift-reconcile ---------- */
+  svg = S.box('git', 20, 40, 190, 70, ['git: overlays/prod @ main', 'image: api:9f2e1c3', 'replicas: 3'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('live', 510, 40, 190, 70, ['cluster: live objects', 'image: api:9f2e1c3', 'replicas: 3'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('ag', 265, 45, 190, 60, ['GitOps agent', 'render → diff → act'], { fs: 11, subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.arrow('a1', 210, 75, 263, 75, { cls: 'dashed', label: 'fetch / webhook', ly: 65 })
+    + S.arrow('a2', 508, 75, 455, 75, { d: 'M 508 75 L 457 75', cls: 'dashed', label: 'watch', ly: 65 })
+    + S.arrow('a3', 455, 90, 508, 90, { cls: 'hid ok', label: 'apply', ly: 105 })
+    + S.box('st', 265, 130, 190, 36, ['Synced · Healthy'], { fs: 11, lcls: 'b', cls: 'ok' })
+    + S.term('log', 20, 185, 680, 82, ['events:', '', '', ''], { fs: 9.5 })
+    + S.text('m', 360, 280, '', { cls: 'sm b' });
+  const E = (q, lines, color) => lines.forEach((t, i) => { if (t != null) q('#log-l' + (i + 1)).text(t).style('fill', color || 'var(--code-text)'); });
+  const ST = (q, txt, cls) => { q('#st text').text(txt); q('#st rect').set(cls); };
+  Anim.define('drift-reconcile', { w: 720, h: 290, title: 'One loop, three kinds of change', ms: 2600, svg, steps: [
+    { c: 'Steady state. The agent renders the overlay from the latest commit, compares with the live objects (a three-way diff, like <code>kubectl apply</code>), finds no difference: <b>Synced</b>. Health is computed from the objects: rollout complete, Pods Ready — <b>Healthy</b>.', on(q){ q('#m').text('desired == live'); } },
+    { c: '<b>Cluster-side drift.</b> Someone runs <code>kubectl scale --replicas=5</code>. The agent\'s watch fires; live ≠ desired: <b>OutOfSync</b>. The diff shows exactly which field, and who changed it is in the audit log.', on(q){ q('#live text:nth-of-type(3)').text('replicas: 5  ← manual'); q('#live rect').set('warn'); ST(q, 'OutOfSync · Healthy', 'warn'); E(q, ['12:01  live drift: /spec/replicas 3 → 5 (user: alice)'], 'var(--amber)'); q('#m').text('unexpected drift'); } },
+    { c: 'With <b>self-heal</b> on, the agent applies the desired state again: replicas back to 3. Without it, the status stays OutOfSync until a human syncs — which is also a valid policy for prod.', on(q){ q('#a3').show(); q('#live text:nth-of-type(3)').text('replicas: 3'); q('#live rect').set('ok'); ST(q, 'Synced · Healthy', 'ok'); E(q, [null, '12:01  selfHeal: applied desired state'], 'var(--green)'); q('#m').text('healed'); } },
+    { c: '<b>Git-side change.</b> CI commits <code>newTag: e4d5c6b</code>. Webhook or the next poll: desired ≠ live, OutOfSync again — the <em>expected</em> kind. Automated sync applies it; the Deployment starts a rolling update, so health becomes <b>Progressing</b>.', on(q){ q('#a3').hide(); q('#git text:nth-of-type(2)').text('image: api:e4d5c6b'); q('#git rect').set('hl'); ST(q, 'OutOfSync → Syncing · Progressing', 'warn'); E(q, [null, null, '12:07  commit 7a1c: api → e4d5c6b (ci-bot) → sync'], 'var(--accent)'); q('#m').text('expected drift: git moved'); } },
+    { c: 'Rollout done, Pods Ready: <b>Synced · Healthy</b> at the new version. The commit is the deployment record; the agent\'s history is the audit trail.', on(q){ q('#a3').show(); q('#live text:nth-of-type(2)').text('image: api:e4d5c6b'); q('#live rect').set('ok'); q('#git rect').set('pur'); ST(q, 'Synced · Healthy', 'ok'); q('#m').text('deployed by merging'); } },
+    { c: 'The new version crashes in prod: Synced but <b>Degraded</b> (CrashLoopBackOff, Day 22). Fix: <code>git revert 7a1c</code> — desired moves back, the agent syncs, the old ReplicaSet scales up. Nobody typed kubectl; the revert is reviewed like any commit.', on(q){ ST(q, 'Synced · Degraded', 'bad'); q('#live rect').set('bad'); E(q, [null, null, null, '12:09  health Degraded (CrashLoopBackOff) → 12:11 revert 7a1c → Synced Healthy'], 'var(--red)'); q('#m').text('rollback = revert'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -21,7 +21,7 @@
     const lh = fs * 1.3;
     const ty = y + h / 2 - ((ls.length - 1) * lh) / 2 + fs * 0.36;
     return ls.map((l, i) =>
-      `<text class="lb ${o.lcls || ''} ${i > 0 && o.subcls ? o.subcls : ''}" x="${x + w / 2}" y="${(ty + i * lh).toFixed(1)}" font-size="${i > 0 && o.subfs ? o.subfs : fs}">${esc(l)}</text>`
+      `<text class="lb ${o.lcls || ''} ${i > 0 && o.subcls ? o.subcls : ''}" x="${x + w / 2}" y="${(ty + i * lh).toFixed(1)}"${(i > 0 && o.subfs) || o.fs ? ` font-size="${i > 0 && o.subfs ? o.subfs : fs}"` : ''}>${esc(l)}</text>`
     ).join('');
   }
   const S = {
@@ -34,7 +34,7 @@
     text(id, x, y, str, o = {}) {
       const ls = Array.isArray(str) ? str : [str];
       const fs = o.fs || 12;
-      return `<g id="${id}" class="${o.gcls || ''}">${ls.map((l, i) => `<text class="lb ${o.cls || ''}" x="${x}" y="${y + i * fs * 1.35}" font-size="${fs}">${esc(l)}</text>`).join('')}</g>`;
+      return `<g id="${id}" class="${o.gcls || ''}">${ls.map((l, i) => `<text class="lb ${o.cls || ''}" x="${x}" y="${y + i * fs * 1.35}"${o.fs ? ` font-size="${fs}"` : ''}>${esc(l)}</text>`).join('')}</g>`;
     },
     arrow(id, x1, y1, x2, y2, o = {}) {
       const d = o.d || `M ${x1} ${y1} L ${x2} ${y2}`;

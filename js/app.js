@@ -12,10 +12,14 @@
   /* ---------- data helpers ---------- */
   const lessons = []; C.modules.forEach(m => m.lessons.forEach(l => { l.module = m; lessons.push(l); }));
   const linux = C.linux;
+  const cicd = C.cicd || [];
   const byId = {};
-  lessons.forEach(l => byId[l.id] = l); linux.forEach(l => byId[l.id] = l); C.extras.forEach(e => byId[e.id] = e);
-  const href = e => e.module ? `${root}lessons/${e.slug}.html` : (e.slug && linux.includes(e) ? `${root}linux/${e.slug}.html` : `${root}${e.slug}.html`);
-  const kind = e => e.module ? 'lesson' : (linux.includes(e) ? 'linux' : 'extra');
+  lessons.forEach(l => byId[l.id] = l); linux.forEach(l => byId[l.id] = l); cicd.forEach(l => byId[l.id] = l); C.extras.forEach(e => byId[e.id] = e);
+  const href = e => e.module ? `${root}lessons/${e.slug}.html` : (e.slug && linux.includes(e) ? `${root}linux/${e.slug}.html` : (e.slug && cicd.includes(e) ? `${root}cicd/${e.slug}.html` : `${root}${e.slug}.html`));
+  const kind = e => e.module ? 'lesson' : (linux.includes(e) ? 'linux' : (cicd.includes(e) ? 'cicd' : 'extra'));
+  // Short label for an entry: "Day 12", "L3", "C4", "ref"
+  const tag = e => e.day != null ? (e.day === '+' ? 'bonus' : 'Day ' + e.day) : (linux.includes(e) ? 'L' + (linux.indexOf(e) + 1) : (cicd.includes(e) ? 'C' + (cicd.indexOf(e) + 1) : 'ref'));
+  const trackName = e => e.module ? e.module.title : (linux.includes(e) ? 'Linux' : (cicd.includes(e) ? 'CI/CD & GitOps' : 'Reference'));
   const cur = byId[page];
 
   /* ---------- progress ---------- */
@@ -23,7 +27,7 @@
   const done = new Set((() => { try { return JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) { return []; } })());
   const saveDone = () => { try { localStorage.setItem(KEY, JSON.stringify([...done])); } catch (e) { } };
   const setLast = () => { try { if (cur) localStorage.setItem('k8s-notes:last', cur.id); } catch (e) { } };
-  window.K8N = { lessons, linux, byId, href, done, root, cur };
+  window.K8N = { lessons, linux, cicd, byId, href, tag, trackName, done, root, cur };
 
   /* ---------- icons ---------- */
   const I = {
@@ -38,6 +42,8 @@
     book: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h6a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H4zM20 4h-6a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h7z"/></svg>`,
     term: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg>`,
     home: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11 12 3l9 8v10h-6v-6H9v6H3z"/></svg>`,
+    pipe: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="18" r="2.5"/><circle cx="5" cy="18" r="2.5"/><path d="M5 8.5v7M7.5 6H13a4 4 0 0 1 4 4v5.5"/></svg>`,
+    ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 13v7H4V6h7"/></svg>`,
     callout: {
       info: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>`,
       tip: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5V16h8v-2.5A6 6 0 0 0 12 3z"/></svg>`,
@@ -46,6 +52,7 @@
       exam: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 13h6M9 17h6"/></svg>`,
       linux: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg>`,
       mental: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a7 7 0 0 0-7 7c0 2.5 1.2 4 2.5 5.5V19h9v-3.5C17.8 14 19 12.5 19 10a7 7 0 0 0-7-7z"/><path d="M10 22h4"/></svg>`,
+      connect: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>`,
     }
   };
 
@@ -111,6 +118,13 @@
     h += `<div class="sb-mod ${lopen ? 'open' : ''}"><button><span class="sw" style="background:var(--linux)"></span><span>Under the hood</span><span class="cnt">${linux.filter(l => done.has(l.id)).length}/${linux.length}</span>${I.chev}</button><ul class="sb-list">`;
     linux.forEach((l, i) => h += `<li><a class="${l.id === page ? 'cur' : ''} ${done.has(l.id) ? 'done' : ''}" href="${href(l)}"><span class="d">L${i + 1}</span><span>${esc(l.title)}</span>${I.check}</a></li>`);
     h += `</ul></div>`;
+    if (cicd.length) {
+      h += `<div class="sb-section">CI/CD &amp; GitOps</div>`;
+      const copen = cur && kind(cur) === 'cicd';
+      h += `<div class="sb-mod ${copen ? 'open' : ''}"><button><span class="sw" style="background:var(--cicd)"></span><span>Pipelines → GitOps</span><span class="cnt">${cicd.filter(l => done.has(l.id)).length}/${cicd.length}</span>${I.chev}</button><ul class="sb-list">`;
+      cicd.forEach((l, i) => h += `<li><a class="${l.id === page ? 'cur' : ''} ${done.has(l.id) ? 'done' : ''}" href="${href(l)}"><span class="d">C${i + 1}</span><span>${esc(l.title)}</span>${I.check}</a></li>`);
+      h += `</ul></div>`;
+    }
     h += `<div class="sb-section">Reference</div>`;
     C.extras.forEach(e => h += `<a class="sb-link ${e.id === page ? 'cur' : ''}" href="${href(e)}">${e.id === 'cheatsheet' ? I.term : I.book}${esc(e.title)}</a>`);
     h += `<a class="sb-link" href="${C.playlist}" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 15.5v-7l6 3.5z"/><path d="M21.6 7.2a2.5 2.5 0 0 0-1.8-1.8C18.2 5 12 5 12 5s-6.2 0-7.8.4A2.5 2.5 0 0 0 2.4 7.2 26 26 0 0 0 2 12a26 26 0 0 0 .4 4.8 2.5 2.5 0 0 0 1.8 1.8C5.8 19 12 19 12 19s6.2 0 7.8-.4a2.5 2.5 0 0 0 1.8-1.8A26 26 0 0 0 22 12a26 26 0 0 0-.4-4.8z" fill="none" stroke="currentColor" stroke-width="2"/></svg>YouTube playlist</a>`;
@@ -118,28 +132,38 @@
   }
 
   function buildLessonHead(article) {
-    const isLinux = kind(cur) === 'linux';
+    const k = kind(cur);
     const head = document.createElement('div'); head.className = 'lesson-head';
     const mod = cur.module;
-    const idx = isLinux ? linux.indexOf(cur) + 1 : null;
-    const crumbs = isLinux
+    const idx = k === 'linux' ? linux.indexOf(cur) + 1 : (k === 'cicd' ? cicd.indexOf(cur) + 1 : null);
+    const crumbs = k === 'linux'
       ? `<a href="${root}index.html">Home</a><span>›</span><span><span class="sw" style="background:var(--linux)"></span>Linux Fundamentals</span><span>›</span><span>L${idx}</span>`
-      : `<a href="${root}index.html">Home</a><span>›</span><span><span class="sw" style="background:${mod.color}"></span>Module ${mod.num} · ${esc(mod.title)}</span>`;
-    const badge = isLinux ? `<span class="badge linux">Linux · L${idx}</span>` : `<span class="badge" style="background:color-mix(in srgb,${mod.color} 15%,transparent);color:${mod.color}">Day ${cur.day}</span>`;
+      : k === 'cicd'
+        ? `<a href="${root}index.html">Home</a><span>›</span><span><span class="sw" style="background:var(--cicd)"></span>CI/CD &amp; GitOps</span><span>›</span><span>C${idx}</span>`
+        : `<a href="${root}index.html">Home</a><span>›</span><span><span class="sw" style="background:${mod.color}"></span>Module ${mod.num} · ${esc(mod.title)}</span>`;
+    const badge = k === 'linux' ? `<span class="badge linux">Linux · L${idx}</span>`
+      : k === 'cicd' ? `<span class="badge cicd">CI/CD · C${idx}</span>`
+      : `<span class="badge" style="background:color-mix(in srgb,${mod.color} 15%,transparent);color:${mod.color}">Day ${cur.day}</span>`;
     const rel = (body.dataset.linux || '').split(',').filter(Boolean).map(id => byId[id.trim()]).filter(Boolean);
     const relK8s = (body.dataset.related || '').split(',').filter(Boolean).map(id => byId[id.trim()]).filter(Boolean);
+    const chip = r => { const kk = kind(r); return `<a class="chip ${kk === 'linux' ? 'linux' : kk === 'cicd' ? 'cicd' : ''}" href="${href(r)}">${kk === 'linux' ? I.tux + ' ' : kk === 'cicd' ? I.pipe + ' ' : ''}${kk === 'lesson' && r.day != null ? (r.day === '+' ? 'Bonus' : 'Day ' + r.day) + ' · ' : ''}${esc(r.title)}</a>`; };
+    const videoLabel = cur.day != null ? `Day ${cur.day}: ` : (idx ? (k === 'linux' ? 'L' : 'C') + idx + ': ' : '');
+    const videoBy = cur.ytBy || (cur.module ? `${C.channel} · CKA Certification Course 2025` : C.channel);
+    const videoUrl = `https://www.youtube.com/watch?v=${cur.yt}${cur.module ? '&list=PLmPit9IIdzwRjqD-l_sZBDdPlcSfKqpAt' : ''}`;
+    const refs = (cur.refs || []).map(r => `<a class="chip ref" href="${esc(r.u)}" target="_blank" rel="noopener">${I.ext} ${esc(r.t)}</a>`).join('');
     head.innerHTML = `<div class="crumbs">${crumbs}</div>
       <div class="lesson-meta">${badge}<span>≈ ${cur.mins || 10} min read</span>${done.has(cur.id) ? '<span class="badge green">Completed</span>' : ''}</div>
       <h1>${esc(cur.title)}</h1>
-      ${cur.yt ? `<a class="video" href="https://www.youtube.com/watch?v=${cur.yt}&list=PLmPit9IIdzwRjqD-l_sZBDdPlcSfKqpAt" target="_blank" rel="noopener"><img src="https://i.ytimg.com/vi/${cur.yt}/mqdefault.jpg" alt="" loading="lazy"><div class="vt"><span class="vk">▶ Watch the video lesson</span><strong>Day ${cur.day}: ${esc(cur.title)}</strong><span class="vs">${esc(C.channel)} · CKA Certification Course 2025${cur.extraYt ? ` · <a href="https://www.youtube.com/watch?v=${cur.extraYt}" target="_blank" rel="noopener">+ companion video</a>` : ''}</span></div></a>` : ''}
-      ${rel.length || relK8s.length ? `<div class="tag-row">${rel.map(r => `<a class="chip linux" href="${href(r)}">${I.tux} ${esc(r.title)}</a>`).join('')}${relK8s.map(r => `<a class="chip" href="${href(r)}">${r.day != null ? 'Day ' + r.day + ' · ' : ''}${esc(r.title)}</a>`).join('')}</div>` : ''}`;
+      ${cur.yt ? `<a class="video" href="${videoUrl}" target="_blank" rel="noopener"><img src="https://i.ytimg.com/vi/${cur.yt}/mqdefault.jpg" alt="" loading="lazy"><div class="vt"><span class="vk">▶ Watch the video lesson</span><strong>${videoLabel}${esc(cur.title)}</strong><span class="vs">${esc(videoBy)}${cur.extraYt ? ` · <a href="https://www.youtube.com/watch?v=${cur.extraYt}" target="_blank" rel="noopener">+ companion video</a>` : ''}</span></div></a>` : ''}
+      ${rel.length || relK8s.length ? `<div class="tag-row">${rel.map(chip).join('')}${relK8s.map(chip).join('')}</div>` : ''}
+      ${refs ? `<div class="tag-row refs"><span class="refs-l">Reference links</span>${refs}</div>` : ''}`;
     article.insertBefore(head, article.firstChild);
-    document.title = `${cur.day != null ? 'Day ' + cur.day + ' · ' : ''}${cur.title} · K8s Notes`;
+    document.title = `${cur.day != null ? 'Day ' + cur.day + ' · ' : (idx ? (k === 'linux' ? 'L' : 'C') + idx + ' · ' : '')}${cur.title} · K8s Notes`;
   }
 
   function buildLessonFoot(article) {
-    const isLinux = kind(cur) === 'linux';
-    const list = isLinux ? linux : lessons;
+    const k = kind(cur);
+    const list = k === 'linux' ? linux : (k === 'cicd' ? cicd : lessons);
     const i = list.indexOf(cur);
     const prev = list[i - 1], next = list[i + 1];
     const foot = document.createElement('div');
@@ -243,13 +267,13 @@
   /* ---------- callouts ---------- */
   function callouts() {
     document.querySelectorAll('.callout').forEach(c => {
-      const t = ['info', 'tip', 'warn', 'danger', 'exam', 'linux', 'mental'].find(k => c.classList.contains(k)) || 'info';
+      const t = ['info', 'tip', 'warn', 'danger', 'exam', 'linux', 'mental', 'connect'].find(k => c.classList.contains(k)) || 'info';
       let ct = c.querySelector(':scope > .ct');
-      if (!ct) { ct = document.createElement('div'); ct.className = 'ct'; ct.textContent = { info: 'Note', tip: 'Tip', warn: 'Watch out', danger: 'Danger', exam: 'CKA exam tip', linux: 'Under the hood · Linux', mental: 'Mental model' }[t]; c.insertBefore(ct, c.firstChild); }
+      if (!ct) { ct = document.createElement('div'); ct.className = 'ct'; ct.textContent = { info: 'Note', tip: 'Tip', warn: 'Watch out', danger: 'Danger', exam: 'CKA exam tip', linux: 'Under the hood · Linux', mental: 'Mental model', connect: 'Connect the dots' }[t]; c.insertBefore(ct, c.firstChild); }
       if (!ct.querySelector('svg')) ct.insertAdjacentHTML('afterbegin', I.callout[t]);
-      if (t === 'linux' && c.dataset.ref) {
+      if ((t === 'linux' || t === 'connect') && c.dataset.ref) {
         const refs = c.dataset.ref.split(',').map(s => byId[s.trim()]).filter(Boolean);
-        if (refs.length) { const more = document.createElement('div'); more.className = 'more'; more.innerHTML = 'Go deeper: ' + refs.map(r => `<a href="${href(r)}">${esc(r.title)}</a>`).join(' · '); c.appendChild(more); }
+        if (refs.length) { const more = document.createElement('div'); more.className = 'more'; more.innerHTML = (t === 'linux' ? 'Go deeper: ' : 'Revisit: ') + refs.map(r => `<a href="${href(r)}">${kind(r) === 'extra' ? '' : tag(r) + ' · '}${esc(r.title)}</a>`).join(' · '); c.appendChild(more); }
       }
     });
     document.querySelectorAll('.takeaways h3').forEach(h => { if (!h.querySelector('svg')) h.insertAdjacentHTML('afterbegin', I.callout.tip); });
@@ -258,11 +282,11 @@
 
   /* ---------- search ---------- */
   let ov, inp, res, sel = 0, items = [];
-  const INDEX = [...lessons, ...linux, ...C.extras].map(e => ({ e, text: (e.title + ' ' + (e.tags || []).join(' ') + ' ' + (e.blurb || '')).toLowerCase() }));
+  const INDEX = [...lessons, ...linux, ...cicd, ...C.extras].map(e => ({ e, text: (e.title + ' ' + (e.tags || []).join(' ') + ' ' + (e.blurb || '')).toLowerCase() }));
   function openSearch() {
     if (!ov) {
       ov = document.createElement('div'); ov.className = 'search-ov';
-      ov.innerHTML = `<div class="search-box"><input type="search" placeholder="Search lessons, topics, commands… (e.g. taint, kubeconfig, OOMKilled)" autocomplete="off"><div class="search-res"></div><div class="search-hint"><span>↑↓ navigate</span><span>↵ open</span><span>esc close</span></div></div>`;
+      ov.innerHTML = `<div class="search-box"><input type="search" placeholder="Search lessons, topics, commands… (e.g. taint, kubeconfig, Argo CD, runner)" autocomplete="off"><div class="search-res"></div><div class="search-hint"><span>↑↓ navigate</span><span>↵ open</span><span>esc close</span></div></div>`;
       body.appendChild(ov);
       inp = ov.querySelector('input'); res = ov.querySelector('.search-res');
       ov.addEventListener('click', e => { if (e.target === ov) closeSearch(); });
@@ -288,7 +312,7 @@
   }
   function paint() {
     if (!items.length) { res.innerHTML = `<div class="search-empty">No matches. Try a shorter word.</div>`; return; }
-    res.innerHTML = items.map((e, i) => `<a class="${i === sel ? 'sel' : ''}" href="${href(e)}"><span class="d">${e.day != null ? (e.day === '+' ? 'bonus' : 'Day ' + e.day) : (linux.includes(e) ? 'L' + (linux.indexOf(e) + 1) : 'ref')}</span><span class="t">${esc(e.title)}</span><span class="m">${e.module ? esc(e.module.title) : (linux.includes(e) ? 'Linux' : 'Reference')}</span></a>`).join('');
+    res.innerHTML = items.map((e, i) => `<a class="${i === sel ? 'sel' : ''}" href="${href(e)}"><span class="d">${tag(e)}</span><span class="t">${esc(e.title)}</span><span class="m">${esc(trackName(e))}</span></a>`).join('');
     const s = res.querySelector('.sel'); if (s) s.scrollIntoView({ block: 'nearest' });
   }
   document.addEventListener('keydown', e => {

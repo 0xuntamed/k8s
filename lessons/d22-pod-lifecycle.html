@@ -165,8 +165,8 @@ $ kubectl delete pod boom once cfg $now</code></pre></div>
   s2 += lane('a', 50, 'API server') + lane('e', 100, 'Endpoints / kube-proxy') + lane('k', 150, 'kubelet → container') + lane('p', 200, 'process (PID 1)');
   [0, 5, 10, 15, 20, 25, 30].forEach((t, i) => s2 += `<line x1="${180 + i * 80}" y1="40" x2="${180 + i * 80}" y2="240" stroke="var(--border)" stroke-dasharray="3 4"/>` + S.text(`tk${i}`, 180 + i * 80, 255, t + 's', { cls: 'xs muted mono' }));
   const B = (id, x, y, w, label, cls) => S.box(id, x, y, w, 30, label, { fs: 9.5, cls, hidden: true });
-  s2 += B('a1', 180, 50, 150, 'deletionTimestamp set → Terminating', 'hl');
-  s2 += B('e1', 180, 100, 90, 'removed from EndpointSlice', 'cy') + B('e2', 275, 100, 100, 'iptables updated (~1s)', 'cy');
+  s2 += B('a1', 180, 50, 175, 'deletionTimestamp → Terminating', 'hl');
+  s2 += B('e1', 180, 100, 128, 'EndpointSlice: removed', 'cy') + B('e2', 312, 100, 110, 'iptables updated (~1s)', 'cy');
   s2 += B('k1', 180, 150, 80, 'preStop: sleep 5', 'warn') + B('k2', 262, 150, 60, 'SIGTERM', 'bad') + B('k3', 660, 150, 40, 'KILL', 'bad');
   s2 += B('p1', 262, 200, 120, 'drain in-flight, exit 0', 'ok') + B('p2', 262, 200, 440, 'ignores SIGTERM…', 'bad');
   s2 += S.text('m', 360, 285, '', { cls: 'sm b' });

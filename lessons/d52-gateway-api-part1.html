@@ -188,11 +188,11 @@ spec:
   let svg = S.zone('z1', 20, 20, 680, 60, 'infrastructure provider')
     + S.box('gc', 40, 32, 300, 36, ['GatewayClass nginx → controllerName gateway.nginx.org/…'], { fs: 9.5, cls: 'soft' })
     + S.zone('z2', 20, 95, 680, 110, 'platform team · namespace infra')
-    + S.box('gw', 40, 118, 300, 74, ['Gateway main (class nginx)', 'listener http :80 · allowedRoutes: All', 'listener https :443 *.example.com · tls: wildcard-tls'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
-    + S.box('addr', 380, 130, 300, 50, ['status.addresses: 203.0.113.7', 'provisioned data plane (LB / proxy pods)'], { subfs: 8.5, subcls: 'mono muted', hidden: true })
+    + S.box('gw', 40, 118, 300, 74, ['Gateway main (class nginx)', 'listener http :80 · allowedRoutes: All', 'listener https :443 *.example.com · tls: wildcard-tls'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('addr', 380, 130, 300, 50, ['status.addresses: 203.0.113.7', 'provisioned data plane (LB / proxy pods)'], { subfs: 9, subcls: 'mono muted', hidden: true })
     + S.zone('z3', 20, 220, 330, 110, 'app team · namespace shop') + S.zone('z4', 370, 220, 330, 110, 'app team · namespace billing')
-    + S.box('r1', 40, 245, 290, 70, ['HTTPRoute shop → parentRefs: infra/main', 'shop.example.com  /api → api:8080 (90) · api-canary (10)', '                  /    → web:80'], { subfs: 8, subcls: 'mono muted', hidden: true })
-    + S.box('r2', 390, 245, 290, 70, ['HTTPRoute billing → parentRefs: infra/main', 'billing.example.com  / → invoices:8080', 'header X-Debug → invoices-debug'], { subfs: 8, subcls: 'mono muted', hidden: true })
+    + S.box('r1', 35, 245, 300, 70, ['HTTPRoute shop → parentRefs: infra/main', 'shop.example.com /api → api:8080 (90) · canary (10)', '                 /    → web:80'], { subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('r2', 390, 245, 290, 70, ['HTTPRoute billing → parentRefs: infra/main', 'billing.example.com  / → invoices:8080', 'header X-Debug → invoices-debug'], { subfs: 9, subcls: 'mono muted', hidden: true })
     + S.arrow('a0', 190, 118, 190, 70, { cls: 'dashed' }) + S.arrow('a1', 190, 245, 190, 194, { cls: 'hid' }) + S.arrow('a2', 500, 245, 340, 170, { d: 'M 500 245 L 342 172', cls: 'hid' })
     + S.text('m', 360, 345, '', { cls: 'sm b' });
   Anim.define('gateway-model', { w: 720, h: 360, title: 'Role-oriented model', ms: 2800, svg, steps: [

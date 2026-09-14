@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C5 · Jenkins on Kubernetes: Dynamic Pod Agents & Kaniko · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c05" data-root="../" data-linux="l02,l04,l06" data-related="d12,d13,d19,d21,d27,d36,d37,d41,d43,d44,d45,c04">
+<article class="lesson">
+<p class="lead">Static Jenkins agents are VMs you pay for while they idle and clean up by hand. On Kubernetes the controller can instead ask the API server for a <strong>Pod per build</strong>: it appears when a job is queued, runs the stages, and is deleted. This page shows how the Kubernetes plugin does that — using nothing but the objects from the course — and solves the one problem every cluster-native CI hits: building container images inside a container without a Docker daemon.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Running the controller in-cluster: StatefulSet + PVC, Helm chart, JCasC</li>
+<li>How the Kubernetes plugin creates agents: ServiceAccount, RBAC, the API calls</li>
+<li>The agent Pod: the <code>jnlp</code> container, tool containers, the shared workspace volume, <code>container()</code></li>
+<li>Pod templates in a Jenkinsfile; requests/limits, node pools, priority</li>
+<li>Building images without Docker: socket mounting, DinD, Kaniko, BuildKit rootless</li>
+<li>Failure modes: Pending Pods, agents that never connect, wrong container names</li>
+</ul></div>
+
+<h2>The controller as a Kubernetes workload</h2>
+<p>The controller is a single stateful process with a directory it must keep — the definition of a <a href="../lessons/d44-statefulsets.html">StatefulSet</a> with one replica and a PVC for <code>JENKINS_HOME</code> (<a href="../lessons/d27-persistent-volumes.html">Day 27</a>). The official Helm chart (<a href="../lessons/d43-helm.html">Day 43</a>) does exactly that, plus a Service for the UI, a second Service for inbound agents on port 50000, a ServiceAccount with the RBAC the plugin needs, and JCasC configuration in a ConfigMap.</p>
+<pre><code class="lang-bash">$ helm repo add jenkins https://charts.jenkins.io && helm repo update
+$ helm install jenkins jenkins/jenkins -n jenkins --create-namespace -f values.yaml
+$ kubectl -n jenkins get sts,pvc,svc,sa,role,rolebinding,cm      # what the chart made
+$ kubectl -n jenkins exec sts/jenkins -c jenkins -- cat /run/secrets/additional/chart-admin-password; echo
+$ kubectl -n jenkins port-forward svc/jenkins 8080:8080</code></pre>
+<pre><code class="lang-yaml"># values.yaml (excerpt)
+controller:
+  numExecutors: 0                      # the controller never runs builds
+  installPlugins: [kubernetes, workflow-aggregator, git, configuration-as-code, credentials-binding]
+  resources: { requests: { cpu: 500m, memory: 1Gi }, limits: { memory: 3Gi } }
+  JCasC:
+    configScripts:
+      welcome: |
+        jenkins:
+          systemMessage: "Managed by JCasC — do not click-configure"
+  ingress:
+    enabled: true
+    hostName: jenkins.example.com
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: gp3
+agent:
+  podName: default
+  image: { repository: jenkins/inbound-agent, tag: latest-jdk17 }
+  resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 1Gi } }
+  containerCap: 10                     # max concurrent agent Pods
+  podRetention: Never</code></pre>
+<div class="callout connect" data-ref="d28,d44,d27"><p>Everything you would click in the UI becomes a value or a JCasC snippet stored in a ConfigMap (<a href="../lessons/d28-configmaps-secrets.html">Day 28</a>) that the chart mounts and a sidecar reloads. Combined with a pinned plugin list, the controller becomes reproducible: <code>helm upgrade</code> recreates it from values, and only the PVC (build history) is state worth backing up — a volume snapshot of the PV.</p></div>
+
+<h2>How the plugin creates agents</h2>
+<figure data-anim="k8s-agent-lifecycle"></figure>
+<p>The controller is just another API client. Its Pod runs with a ServiceAccount whose projected token (<a href="../lessons/d37-service-accounts.html">Day 37</a>) lets it talk to <code>https://kubernetes.default.svc</code>; a Role in the namespace allows exactly what the plugin needs:</p>
+<pre><code class="lang-yaml">rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec", "pods/log"]
+  verbs: ["get", "list", "watch", "create", "delete", "patch"]     # create/delete agents; exec = container() steps; log = diagnostics
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]                                     # only if you sync Kubernetes Secrets into Jenkins credentials</code></pre>
+<pre><code class="lang-bash">$ kubectl -n jenkins auth can-i create pods --as=system:serviceaccount:jenkins:jenkins      # yes — required
+$ kubectl -n jenkins auth can-i create pods/exec --as=system:serviceaccount:jenkins:jenkins # yes — container() needs it
+$ kubectl -n jenkins auth can-i create deployments --as=system:serviceaccount:jenkins:jenkins  # no — good
+# what the controller uses (Manage Jenkins → Clouds → kubernetes):
+#   Kubernetes URL   https://kubernetes.default.svc           (in-cluster; CA + token from the SA mount)
+#   Jenkins URL      http://jenkins.jenkins.svc.cluster.local:8080
+#   Jenkins tunnel   jenkins-agent.jenkins.svc.cluster.local:50000   ← agents connect here (Day 12 ClusterIP, Day 48 DNS)</code></pre>
+<div class="callout connect" data-ref="d36,d37,d12,d48"><p>Three course lessons in one screen: the controller authenticates as <code>system:serviceaccount:jenkins:jenkins</code> (<a href="../lessons/d37-service-accounts.html">Day 37</a>), RBAC decides it may create Pods (<a href="../lessons/d36-rbac.html">Day 36</a>), and the agent finds its way back through a ClusterIP Service resolved by CoreDNS (<a href="../lessons/d12-services.html">Day 12</a>, <a href="../lessons/d48-dns-coredns.html">Day 48</a>). If any of those three is broken, agents never come online; <code>auth can-i</code>, <code>kubectl get endpointslices -n jenkins</code> and a <code>nslookup</code> from a debug Pod find which.</p></div>
+
+<h2>Anatomy of an agent Pod</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  labels: { jenkins/label: kaniko-agent }
+spec:
+  serviceAccountName: jenkins-agent     # NOT the controller's SA — least privilege
+  restartPolicy: Never
+  containers:
+  - name: jnlp                          # injected by the plugin if you omit it
+    image: jenkins/inbound-agent:latest-jdk17
+    env:
+    - { name: JENKINS_URL, value: http://jenkins.jenkins.svc:8080 }
+    - { name: JENKINS_TUNNEL, value: jenkins-agent.jenkins.svc:50000 }
+    - { name: JENKINS_SECRET, value: "…per-agent secret…" }
+    - { name: JENKINS_AGENT_NAME, value: kaniko-agent-x7k2p }
+    resources: { requests: { cpu: 100m, memory: 256Mi } }
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command: ["sleep"]
+    args: ["infinity"]                  # kept alive; steps are exec'd into it
+    resources: { requests: { cpu: 1, memory: 2Gi }, limits: { memory: 4Gi } }
+    volumeMounts:
+    - { name: regcred, mountPath: /kaniko/.docker }
+  volumes:
+  - name: workspace-volume              # injected: emptyDir mounted at /home/jenkins/agent in EVERY container
+    emptyDir: {}
+  - name: regcred
+    secret:
+      secretName: ghcr
+      items: [{ key: .dockerconfigjson, path: config.json }]
+  nodeSelector: { workload: ci }
+  tolerations: [{ key: ci, operator: Exists, effect: NoSchedule }]
+  priorityClassName: ci-low</code></pre>
+<ul class="notes">
+<li><b>jnlp</b> — the Jenkins agent itself (<code>agent.jar</code> in a small image). It connects <em>out</em> to the tunnel Service with a one-time secret, becomes an online node with one executor, and runs plain <code>sh</code> steps.</li>
+<li><b>tool containers</b> — one per toolchain (kaniko, maven, node, kubectl). They idle on <code>sleep infinity</code>; <code>container('kaniko') { sh '…' }</code> runs the step <em>inside</em> them.</li>
+<li><b>workspace-volume</b> — an emptyDir (<a href="../lessons/d26-ephemeral-volumes.html">Day 26</a>) mounted into every container at the same path, so a file written by <code>git clone</code> in jnlp is visible to kaniko: the multi-container pattern from <a href="../lessons/d21-multi-container-pods.html">Day 21</a>.</li>
+<li><b>serviceAccountName</b> — give agents their own SA with no RBAC unless a step needs the API (a deploy step could get a namespaced deployer Role, as in <a href="c03-github-actions-kubernetes.html">C3</a>).</li>
+<li><b>regcred</b> — the <code>dockerconfigjson</code> Secret from <a href="../lessons/d45-image-pull-secrets.html">Day 45</a>, mounted as a file for kaniko's <em>push</em> instead of used for the kubelet's <em>pull</em>.</li>
+<li><b>resources / nodeSelector / tolerations / priority</b> — builds are bursty: put them on a tainted CI node pool (<a href="../lessons/d16-taints-tolerations.html">Days 16–17</a>), set requests so they schedule predictably (<a href="../lessons/d19-requests-limits.html">Day 19</a>), and a low PriorityClass so they are preempted before production is (<a href="../lessons/d46-pod-priority.html">Day 46</a>).</li>
+</ul>
+</div>
+<div class="callout linux" data-ref="l02,l04"><p><code>container('kaniko')</code> is <code>kubectl exec</code> (<a href="../lessons/d13-imperative-commands.html">Day 13</a>): the controller opens a <code>pods/exec</code> stream to the API server, the kubelet asks containerd to spawn a process <em>inside the kaniko container's namespaces</em> (<a href="../linux/l02-namespaces.html">L2</a>), and the durable-task mechanism from <a href="c04-jenkins.html">C4</a> runs there. All containers in the Pod share the network namespace (so <code>localhost</code> works between them) and the emptyDir mount; they do <em>not</em> share their root filesystems — each has its own image layers under OverlayFS (<a href="../linux/l04-filesystems-overlayfs.html">L4</a>), which is why a tool installed in one container is absent in another.</p></div>
+
+<h2>Pod templates in a Jenkinsfile</h2>
+<pre data-title="Jenkinsfile (declarative, Kubernetes agent)"><code>pipeline {
+  agent {
+    kubernetes {
+      defaultContainer 'kaniko'                     // sh steps run here unless wrapped in container()
+      yaml '''
+        spec:
+          containers:
+          - name: kaniko
+            image: gcr.io/kaniko-project/executor:debug
+            command: [sleep]
+            args: [infinity]
+            volumeMounts: [{ name: regcred, mountPath: /kaniko/.docker }]
+          - name: kubectl
+            image: bitnami/kubectl:1.31
+            command: [sleep]
+            args: [infinity]
+          volumes:
+          - name: regcred
+            secret: { secretName: ghcr, items: [{ key: .dockerconfigjson, path: config.json }] }
+      '''
+    }
+  }
+  environment { TAG = "${env.GIT_COMMIT.take(7)}"; IMAGE = "ghcr.io/acme/api" }
+  stages {
+    stage('Build & push') {
+      steps {
+        sh '''/kaniko/executor --context "$WORKSPACE" --dockerfile Dockerfile \\
+              --destination "$IMAGE:$TAG" --cache=true --cache-repo "$IMAGE/cache"'''
+      }
+    }
+    stage('Deploy') {
+      steps {
+        container('kubectl') {                      // switch container; same workspace, same Pod
+          sh 'kubectl -n shop set image deploy/api api=$IMAGE:$TAG && kubectl -n shop rollout status deploy/api --timeout=180s'
+        }
+      }
+    }
+  }
+}</code></pre>
+<p>Scripted form: <code>podTemplate(yaml: '…') { node(POD_LABEL) { container('kaniko') { sh '…' } } }</code>. Templates can also be defined once in the cloud configuration (or JCasC) with a label and inherited: <code>agent { kubernetes { inheritFrom 'kaniko-agent' } }</code>.</p>
+
+<h2>Building images without a Docker daemon</h2>
+<p>Inside a Pod there is no Docker. The kubelet talks to containerd over CRI (<a href="../lessons/d25-cni-csi-cri.html">Day 25</a>); <code>docker build</code> has no daemon to talk to. Four ways out:</p>
+<div class="tbl-wrap"><table>
+<thead><tr><th>Option</th><th>How</th><th>Privilege</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>Mount <code>/var/run/docker.sock</code></td><td>hostPath to the node's Docker socket</td><td>Root on the node: the socket owner controls every container (<a href="../linux/l06-users-capabilities.html">L6</a>)</td><td>Only works on Docker nodes; never on shared clusters</td></tr>
+<tr><td>Docker-in-Docker sidecar</td><td><code>docker:dind</code> container, <code>privileged: true</code>, <code>DOCKER_HOST=tcp://localhost:2375</code></td><td><code>privileged</code> = all capabilities, no seccomp (<a href="../lessons/d41-pod-security.html">Day 41</a>)</td><td>Works everywhere; blocked by Pod Security <em>restricted</em>; use only on an isolated CI pool</td></tr>
+<tr><td><strong>Kaniko</strong></td><td>Executes the Dockerfile in userspace, snapshots layers, pushes straight to the registry</td><td>None beyond a normal container</td><td>The default choice for CI Pods</td></tr>
+<tr><td>BuildKit rootless / buildah</td><td>User namespaces + fuse-overlayfs; a real builder without root</td><td>Needs <code>--oci-worker-no-process-sandbox</code> or specific seccomp/AppArmor profiles</td><td>Faster and more featureful than kaniko; a bit more setup</td></tr>
+</tbody></table></div>
+<figure data-anim="kaniko-build"></figure>
+<div class="callout linux" data-ref="l04,l06,l02"><p>Why does Docker need root but kaniko does not? A daemon builds by <em>creating containers</em>: new namespaces, OverlayFS mounts, veth pairs — all <code>CAP_SYS_ADMIN</code> work (<a href="../linux/l06-users-capabilities.html">L6</a>). Kaniko never creates a container. It <em>is</em> the container: it unpacks the base image's layers into its own root filesystem, runs each <code>RUN</code> as an ordinary child process, and after each instruction walks the filesystem to compute what changed — that diff, tarred, is the new layer (<a href="../linux/l04-filesystems-overlayfs.html">L4</a> without the mount). Because it runs unprivileged, a <code>RUN</code> that needs privileges (mounting, iptables, <code>chroot</code> tricks) fails inside kaniko, which is exactly the class of Dockerfile you should not have.</p></div>
+
+<h2>When it goes wrong</h2>
+<div class="tbl-wrap"><table class="cmd-table">
+<thead><tr><th>Symptom</th><th>Usual cause</th><th>Check</th></tr></thead>
+<tbody>
+<tr><td>Build queued: "Waiting for next available executor"</td><td>Plugin cannot create the Pod: RBAC, containerCap reached, cloud misconfigured</td><td><code>kubectl -n jenkins logs sts/jenkins | grep -i kubernetes</code>; <code>auth can-i create pods</code></td></tr>
+<tr><td>Agent Pod <code>Pending</code></td><td>Requests too large, taints without tolerations, PVC-less node pool full</td><td><code>kubectl describe pod</code> → Events (<a href="../lessons/d19-requests-limits.html">Day 19</a>, <a href="../lessons/d16-taints-tolerations.html">Day 16</a>)</td></tr>
+<tr><td><code>ImagePullBackOff</code> on a tool container</td><td>Private image, wrong tag, no <code>imagePullSecrets</code></td><td><a href="../lessons/d22-pod-lifecycle.html">Day 22</a>, <a href="../lessons/d45-image-pull-secrets.html">Day 45</a></td></tr>
+<tr><td>Pod Running, build never starts; jnlp logs "connection refused"</td><td>Tunnel Service/port wrong, NetworkPolicy blocks 50000, Jenkins URL unreachable from the Pod</td><td><code>kubectl -n jenkins logs POD -c jnlp</code>; <code>get endpointslices</code>; <a href="../lessons/d47-network-policies.html">Day 47</a></td></tr>
+<tr><td><code>container "maven" not found in pod</code></td><td>Name in <code>container()</code> ≠ name in the template</td><td>Read the Pod YAML the plugin printed in the build log</td></tr>
+<tr><td>Tool container exits immediately</td><td>Image has an ENTRYPOINT that ends; you forgot <code>command: [sleep]</code></td><td><a href="../lessons/d04-cmd-vs-entrypoint.html">Day 4</a></td></tr>
+<tr><td>Pod vanished before you could debug</td><td><code>podRetention: Never</code></td><td>Set <code>OnFailure</code> temporarily; <code>kubectl get events -n jenkins --sort-by=.lastTimestamp</code></td></tr>
+</tbody></table></div>
+
+<div class="lab"><h3>Hands-on lab (35 min) — Jenkins in KIND with Pod agents and a kaniko build</h3>
+<ol class="steps">
+<li><strong>Install</strong> with the values above minus the ingress and storageClass lines (KIND has a default StorageClass): <code>helm install jenkins jenkins/jenkins -n jenkins --create-namespace -f values.yaml</code>. Watch <code>kubectl -n jenkins get pods -w</code> until <code>jenkins-0</code> is 2/2 (the second container is the JCasC reloader).</li>
+<li><strong>Prove the RBAC</strong>: the three <code>auth can-i</code> commands above. Look at the Role the chart created: <code>kubectl -n jenkins get role jenkins-schedule-agents -o yaml</code>.</li>
+<li><strong>Port-forward, log in</strong> (password from the exec command above) and open <em>Manage Jenkins → Clouds → kubernetes</em>. Note the URLs — they are Service DNS names from Day 12/48.</li>
+<li><strong>Registry secret</strong>: <code>kubectl -n jenkins create secret docker-registry ghcr --docker-server=ghcr.io --docker-username=YOU --docker-password=$PAT</code> — or, with no account, skip the secret and push to <code>ttl.sh</code> (anonymous) by changing <code>IMAGE</code>.</li>
+<li><strong>Pipeline job</strong> with the Jenkinsfile above (drop the Deploy stage for now). Build it. In another terminal: <code>kubectl -n jenkins get pods -w</code> — a Pod named after the template appears, runs, disappears.</li>
+<li><strong>While it runs</strong>: <code>kubectl -n jenkins describe pod &lt;agent&gt;</code> (two containers, the emptyDir, the env vars) and <code>kubectl -n jenkins logs &lt;agent&gt; -c jnlp</code> (the connection to the tunnel).</li>
+<li><strong>Break it</strong> three ways and read the symptom each time: (a) set <code>container('kanikoo')</code>; (b) add <code>requests: { cpu: 64 }</code> to kaniko → Pending; (c) apply a default-deny NetworkPolicy in <code>jenkins</code> (<a href="../lessons/d47-network-policies.html">Day 47</a>) → jnlp cannot connect. Remove it afterwards.</li>
+<li><strong>Add the Deploy stage</strong> with a <code>jenkins-agent</code> ServiceAccount bound to the deployer Role from <a href="c03-github-actions-kubernetes.html">C3</a> (namespace <code>shop</code>). You now have the full push pipeline running inside the cluster it deploys to.</li>
+</ol></div>
+
+<details class="quiz"><summary>A pipeline runs <code>docker build</code> in a Pod agent and fails with <code>Cannot connect to the Docker daemon</code>. Someone suggests mounting <code>/var/run/docker.sock</code>. Two reasons that is wrong on a kubeadm/EKS cluster?</summary><div><p>The nodes run containerd, not Docker — there is no such socket. And even where there is one, the socket grants root on the node: any build could start a privileged container with the host filesystem mounted. Use kaniko or BuildKit rootless.</p></div></details>
+<details class="quiz"><summary>The controller can create Pods but every agent Pod sits in <code>Running</code> for 2 minutes and is then deleted; the build never starts. Where do you look?</summary><div><p><code>kubectl logs &lt;agent&gt; -c jnlp</code>: the agent could not reach the controller (wrong Jenkins URL/tunnel, a NetworkPolicy, or the <code>jenkins-agent</code> Service has no endpoints). The plugin deletes agents that fail to connect within the timeout.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Controller = StatefulSet + PVC, installed by Helm, configured by JCasC; executors 0. Agents = Pods created per build by the Kubernetes plugin through the API server with a ServiceAccount and a namespaced Role.</li>
+<li>An agent Pod is the <code>jnlp</code> container plus tool containers sleeping, sharing an emptyDir workspace; <code>container('x')</code> is an exec into that container.</li>
+<li>Agents connect <em>out</em> to the <code>jenkins-agent</code> Service on 50000 — Services, DNS, RBAC and NetworkPolicies from the course are the failure points.</li>
+<li>No Docker daemon in Pods: build with kaniko (unprivileged, pushes layers directly) or BuildKit rootless; DinD needs <code>privileged</code>; the Docker socket is root on the node.</li>
+<li>Treat builds as workloads: requests, a tainted CI node pool, low priority, podRetention for debugging.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- k8s-agent-lifecycle ---------- */
+  let svg = S.zone('ns', 15, 15, 730, 262, 'namespace jenkins')
+    + S.box('ctl', 30, 45, 150, 60, ['jenkins-0', 'StatefulSet · PVC', 'SA jenkins'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('q', 30, 118, 150, 30, ['queue: api #42'], { fs: 10, lcls: 'mono', cls: 'warn' })
+    + S.box('api', 230, 45, 130, 44, ['API server', 'RBAC: pods create ✓'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.box('sch', 230, 105, 130, 34, ['scheduler'], { fs: 11 })
+    + S.node('node', 400, 40, 330, 150, 'node ci-1  (taint ci=NoSchedule)')
+    + S.zone('pod', 415, 70, 300, 108, 'pod api-42-x7k2p', { cls: 'hid' })
+    + S.box('jnlp', 425, 96, 90, 34, ['jnlp'], { fs: 10.5, cls: 'soft', hidden: true })
+    + S.box('kan', 525, 96, 90, 34, ['kaniko', 'sleep ∞'], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'soft', hidden: true })
+    + S.box('kc', 625, 96, 80, 34, ['kubectl', 'sleep ∞'], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'soft', hidden: true })
+    + S.box('ws', 425, 140, 280, 28, ['emptyDir /home/jenkins/agent  (shared workspace)'], { fs: 9.5, lcls: 'mono muted', cls: 'soft', hidden: true })
+    + S.box('svc', 230, 200, 150, 44, ['svc jenkins-agent', ':50000 → jenkins-0'], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'cy' })
+    + S.box('reg', 560, 210, 150, 40, ['registry', 'ghcr.io/acme/api:9f2e1c3'], { fs: 10.5, subfs: 9, subcls: 'mono muted' })
+    + S.arrow('a1', 180, 75, 228, 67, { d: 'M 180 75 L 228 67', cls: 'hid', label: 'POST /api/v1/…/pods', lx: 205, ly: 55 })
+    + S.arrow('a2', 295, 89, 295, 103, { cls: 'hid' })
+    + S.arrow('a3', 360, 122, 398, 122, { cls: 'hid', label: 'bind → ci-1', ly: 112 })
+    + S.arrow('a4', 425, 130, 305, 200, { d: 'M 445 130 L 445 160 L 380 160 L 380 200 L 305 200', cls: 'hid', label: 'connect + secret', lx: 405, ly: 185 })
+    + S.arrow('a5', 230, 222, 105, 105, { d: 'M 230 222 L 105 222 L 105 105', cls: 'hid' })
+    + S.arrow('a6', 570, 130, 600, 208, { d: 'M 570 130 L 600 208', cls: 'hid', label: 'push layers', lx: 640, ly: 190 })
+    + S.arrow('a7', 180, 95, 228, 80, { d: 'M 180 95 L 228 82', cls: 'hid bad', label: 'DELETE pod', lx: 205, ly: 100 })
+    + S.text('m', 380, 268, '', { cls: 'sm b' });
+  Anim.define('k8s-agent-lifecycle', { w: 760, h: 285, title: 'One Pod per build', ms: 2500, svg, steps: [
+    { c: 'A build is queued with <code>agent { kubernetes { … } }</code>. The controller has no static agents, so the plugin decides to create one.', on(q){ q('#q rect').set('warn'); q('#ctl rect').set('hl'); q('#m').text('label kaniko-agent → cloud "kubernetes"'); } },
+    { c: 'It renders the Pod template (adding the <code>jnlp</code> container and the workspace emptyDir) and POSTs it to the API server using its ServiceAccount token. RBAC checks <code>create pods</code> in namespace <code>jenkins</code>.', on(q){ q('#a1').show().set('hl'); q('#api rect').set('hl'); q('#m').text('authn: system:serviceaccount:jenkins:jenkins · authz: Role'); } },
+    { c: 'From here it is Day 7: the scheduler finds a node that satisfies the nodeSelector, toleration and requests — the CI pool — and binds the Pod. The kubelet pulls the images and starts three containers.', on(q){ q('#a2').show(); q('#sch rect').set('hl'); q('#a3').show().set('hl'); q('#pod rect').set('hl'); q('#pod').show(); q('#jnlp,#kan,#kc,#ws').show(); q('#m').text('Pending → ContainerCreating → Running'); } },
+    { c: 'The <code>jnlp</code> container starts <code>agent.jar</code> with <code>JENKINS_URL</code>, the tunnel address and a one-time secret. It connects <b>out</b> to the <code>jenkins-agent</code> Service, which forwards to the controller. The node comes online with one executor; the queued build takes it.', on(q){ q('#jnlp rect').set('hl'); q('#a4').show().set('hl'); q('#svc rect').set('cy'); q('#a5').show().set('hl'); q('#q rect').set('ok'); q('#q text').text('api #42 building'); q('#m').text('agent online: api-42-x7k2p (1 executor)'); } },
+    { c: 'Steps run. A plain <code>sh</code> runs in <code>jnlp</code>; <code>container(\'kaniko\')</code> execs into the kaniko container — same workspace volume, so the checked-out repo is there. Kaniko builds and pushes the image; <code>container(\'kubectl\')</code> deploys it.', on(q){ q('#kan rect').set('hl'); q('#ws rect').set('hl'); q('#a6').show().set('ok'); q('#reg rect').set('warn'); q('#kc rect').set('hl'); q('#m').text('exec → kaniko: /kaniko/executor … --destination'); } },
+    { c: 'The build finishes. The controller DELETEs the Pod (<code>podRetention: Never</code>). The log and results live on the controller\'s PVC; nothing of the build remains on the node. Next build, new Pod, clean state.', on(q){ q('#a7').show(); q('#pod rect').set('dim'); q('#jnlp rect,#kan rect,#kc rect,#ws rect').set('dim'); q('#a4,#a5,#a6').hide(); q('#q text').text('queue: (empty)'); q('#q rect').set(); q('#m').text('Pod deleted · log on PVC · executor gone'); } },
+  ]});
+
+  /* ---------- kaniko-build ---------- */
+  svg = S.zone('c', 15, 15, 420, 245, 'kaniko container  (unprivileged, no daemon)')
+    + S.term('df', 30, 42, 190, 96, ['Dockerfile', 'FROM python:3.12-alpine', 'RUN apk add curl', 'COPY app.py /app/', 'CMD ["python","/app/app.py"]'], { fs: 9.5 })
+    + S.term('fs', 235, 42, 185, 96, ['/  (its own rootfs)', ' bin/ lib/ usr/  ← base', '', '', ''], { fs: 9.5 })
+    + S.box('run', 30, 150, 190, 34, ['child process: apk add curl'], { fs: 10, hidden: true })
+    + S.box('snap', 235, 150, 185, 34, ['snapshot: diff → layer.tar'], { fs: 10, cls: 'pur', hidden: true })
+    + S.term('cfg', 30, 196, 390, 50, ['/kaniko/.docker/config.json  (push creds, from the Secret)', 'no CAP_SYS_ADMIN · no mounts · no new namespaces'], { fs: 9.5 })
+    + S.box('reg', 490, 40, 220, 60, ['registry', 'ghcr.io/acme/api'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('l1', 490, 120, 220, 26, ['layer: base (already there)'], { fs: 9.5, lcls: 'mono', cls: 'soft', hidden: true })
+    + S.box('l2', 490, 152, 220, 26, ['layer: sha256:7c… (apk add)'], { fs: 9.5, lcls: 'mono', cls: 'soft', hidden: true })
+    + S.box('l3', 490, 184, 220, 26, ['layer: sha256:e1… (COPY app)'], { fs: 9.5, lcls: 'mono', cls: 'soft', hidden: true })
+    + S.box('mf', 490, 216, 220, 26, ['manifest + config → :9f2e1c3'], { fs: 9.5, lcls: 'mono', cls: 'ok', hidden: true })
+    + S.arrow('a1', 490, 70, 422, 90, { d: 'M 490 72 L 422 90', cls: 'hid', label: 'pull base layers', lx: 470, ly: 100 })
+    + S.arrow('a2', 422, 167, 488, 165, { cls: 'hid' })
+    + S.arrow('a3', 422, 167, 488, 197, { d: 'M 422 170 L 488 197', cls: 'hid' })
+    + S.text('m', 360, 275, '', { cls: 'sm b' });
+  const D = (q, i, color) => q('#df-l' + i).style('fill', color || 'var(--accent)');
+  Anim.define('kaniko-build', { w: 720, h: 285, title: 'Kaniko: a build with no daemon', ms: 2500, svg, steps: [
+    { c: 'Kaniko starts as an ordinary container with the build context (the workspace) and registry credentials mounted as a file. No socket, no privileges.', on(q){ q('#cfg rect').set('hl'); q('#m').text('/kaniko/executor --context . --destination …'); } },
+    { c: '<code>FROM</code>: it pulls the base image\'s layers from the registry and <b>unpacks them into its own root filesystem</b>. The kaniko container now looks like the base image from the inside.', on(q){ D(q, 1); q('#a1').show().set('hl'); q('#fs-l1').style('fill', 'var(--code-text)'); q('#l1').show(); q('#m').text('extract layers into /  (no mount, just files)'); } },
+    { c: '<code>RUN apk add curl</code>: executed as a plain child process in that filesystem. Afterwards kaniko <b>walks the filesystem</b> and records what changed — the diff is tarred as a new layer and pushed immediately.', on(q){ D(q, 2); q('#run').show(); q('#run rect').set('hl'); q('#fs-l2').text(' usr/bin/curl  ← changed').style('fill', 'var(--amber)'); q('#snap').show(); q('#a2').show().set('ok'); q('#l2').show(); q('#m').text('layer = filesystem diff, like OverlayFS upperdir'); } },
+    { c: '<code>COPY app.py</code>: files from the context are written in; snapshot; another layer. <code>CMD</code> only changes the image config, no layer.', on(q){ D(q, 3); D(q, 4); q('#run rect').set(); q('#run text').text('copy: app.py → /app/'); q('#fs-l3').text(' app/app.py  ← changed').style('fill', 'var(--amber)'); q('#a3').show().set('ok'); q('#l3').show(); q('#m').text('snapshot again'); } },
+    { c: 'Finally the config and manifest are pushed under the tag. Nothing was written to the node, no daemon ran, no capability was needed — and the image is identical to what <code>docker build</code> would produce (same layers, same digest logic).', on(q){ q('#mf').show(); q('#reg rect').set('ok'); q('#m').text('done: ghcr.io/acme/api:9f2e1c3'); } },
+    { c: 'The limits: a <code>RUN</code> that needs privileges (mount, iptables, <code>chroot</code>) fails; huge layers make snapshots slow (<code>--snapshot-mode=redo</code>, <code>--use-new-run</code>); caching goes to a registry repo (<code>--cache-repo</code>) rather than a local daemon.', on(q){ q('#m').text('unprivileged by construction; caveats are Dockerfile smells'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

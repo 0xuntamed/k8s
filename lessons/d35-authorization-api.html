@@ -134,12 +134,12 @@ $ kubectl get --raw /healthz?verbose | tail -3</code></pre></div>
 <script>
 (function(){
   const S = Anim.S;
-  let svg = S.icon('cl', 50, 60, 'laptop', { label: 'kubectl delete pod web -n dev', ly: 28, lcls: 'mono' })
+  let svg = S.icon('cl', 80, 60, 'laptop', { label: 'kubectl delete pod web', ly: 28, lcls: 'mono' })
     + S.box('g1', 170, 30, 120, 60, ['1 · Authentication', 'cert / token'], { subfs: 9, subcls: 'muted' })
     + S.box('g2', 320, 30, 120, 60, ['2 · Authorization', 'Node → RBAC'], { subfs: 9, subcls: 'muted' })
     + S.box('g3', 470, 30, 120, 60, ['3 · Admission', 'mutate · validate'], { subfs: 9, subcls: 'muted' })
     + S.box('db', 620, 35, 80, 50, ['etcd'], { fs: 12 })
-    + S.arrow('a0', 100, 60, 168, 60) + S.arrow('a1', 290, 60, 318, 60) + S.arrow('a2', 440, 60, 468, 60) + S.arrow('a3', 590, 60, 618, 60)
+    + S.arrow('a0', 110, 60, 168, 60) + S.arrow('a1', 290, 60, 318, 60) + S.arrow('a2', 440, 60, 468, 60) + S.arrow('a3', 590, 60, 618, 60)
     + S.term('req', 20, 120, 680, 120, ['request attributes:', '  user: —      groups: —', '  verb: delete  group: ""  resource: pods  name: web  namespace: dev', '', 'decision: —'], { fs: 10 })
     + S.text('m', 360, 275, '', { cls: 'sm b' });
   Anim.define('api-pipeline', { w: 720, h: 290, title: 'Request pipeline', ms: 2800, svg, steps: [

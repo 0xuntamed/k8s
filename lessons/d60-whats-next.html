@@ -20,6 +20,7 @@
 <li>Where to go next: CKAD, CKS, and the ecosystem</li>
 </ul></div>
 
+<div class="callout connect" data-ref="c06,c07,c08,c09"><p>This page is the overview. The full treatment — GitOps principles, the Argo CD components and Application spec, sync mechanics with hooks and waves, ApplicationSets and multi-cluster — is the <strong>CI/CD &amp; GitOps track</strong> (C6–C9), with animations and labs for each.</p></div>
 <h2>GitOps and Argo CD</h2>
 <p>You have used <code>kubectl apply</code> and Helm from a terminal. In production nobody should: the source of truth for what runs in the cluster should be a <strong>git repository</strong>, and something should continuously make the cluster match it. That is GitOps, and Argo CD is the standard implementation — and it is, once again, <em>a controller with a CRD</em> (<a href="d40-operators.html">Day 40</a>).</p>
 <figure data-anim="gitops"></figure>
@@ -53,6 +54,7 @@ $ argocd app get shop; argocd app diff shop; argocd app sync shop; argocd app hi
 <li>Alternatives: Flux (same idea, more Kubernetes-native CRDs, no UI by default).</li>
 </ul>
 
+<div class="callout connect" data-ref="c02,c03,c04,c05"><p>GitHub Actions (C2–C3) and Jenkins, standalone and on Kubernetes with Pod agents and kaniko (C4–C5), each get their own pages in the track — and <a href="../cicd/c10-end-to-end-pipeline.html">C10</a> wires CI, the registry, git and Argo CD into one pull-request-to-production pipeline.</p></div>
 <h2>CI: Jenkins (and everything like it)</h2>
 <p>Argo CD deploys what is in git; something has to <em>put it there</em>. A CI pipeline builds the image from source (<a href="d02-first-dockerfile.html">Days 2–5</a>), tests it, pushes it to a registry with an immutable tag, and then commits the new tag into the manifests repository — which Argo CD notices. Jenkins is the veteran (a controller + agents running pipeline stages, often as Kubernetes Pods via the Kubernetes plugin); GitHub Actions, GitLab CI, Tekton and Argo Workflows do the same job.</p>
 <pre data-title="Jenkinsfile (declarative pipeline, Kubernetes agents)"><code>pipeline {

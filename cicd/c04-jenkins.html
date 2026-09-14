@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C4 · Jenkins: Controller, Agents & Declarative Pipelines · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c04" data-root="../" data-linux="l01,l04,l07" data-related="d07,d28,d43,c01,c02">
+<article class="lesson">
+<p class="lead">Jenkins is the CI server most companies already run: a Java application you host yourself, extended by plugins, that executes pipelines written in a <code>Jenkinsfile</code>. It predates containers, so it thinks in <em>machines</em> — a controller that schedules and agents that do the work — which is exactly why understanding it makes the Kubernetes version (<a href="c05-jenkins-on-kubernetes.html">C5</a>) obvious. This page covers the architecture, the declarative pipeline syntax, credentials, triggers, and reuse, with a look at what a <code>sh</code> step really does on the agent.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Controller vs agents vs executors; what lives in <code>JENKINS_HOME</code></li>
+<li>How agents connect (SSH, inbound/JNLP, WebSocket) and why labels matter</li>
+<li>The declarative <code>Jenkinsfile</code>: agent, environment, options, parameters, stages, when, parallel, input, post</li>
+<li>Credentials: kinds, <code>withCredentials</code>, masking, where they are stored</li>
+<li>Triggers: webhooks, multibranch pipelines, polling, cron</li>
+<li>Shared libraries and the plugins that matter</li>
+<li>Running Jenkins as a systemd service; the durable-task mechanism behind <code>sh</code></li>
+</ul></div>
+
+<h2>Architecture: one controller, many agents</h2>
+<figure data-anim="jenkins-arch"></figure>
+<dl class="kv">
+<dt>Controller</dt><dd>The Jenkins process itself (a Java web app on port 8080): UI, REST API, job definitions, build queue, scheduling, plugin host, credential store. It <em>should not run builds</em> — set its executor count to 0 in production so a malicious build cannot read the controller's disk.</dd>
+<dt>Agent</dt><dd>A machine (VM, container, Pod) running the small agent JAR that executes builds on the controller's behalf. Each agent advertises <strong>labels</strong> (<code>linux</code>, <code>docker</code>, <code>arm64</code>) and a number of <strong>executors</strong> — concurrent build slots. A pipeline says <code>agent { label 'docker' }</code> and the controller picks any agent with that label and a free executor.</dd>
+<dt>Workspace</dt><dd>A directory on the agent per job (<code>$WORKSPACE</code>, typically <code>~/workspace/&lt;job&gt;</code>) where the repo is checked out and the build runs. It <strong>persists between builds</strong> on static agents (fast incremental builds, but state leaks) — use <code>cleanWs()</code> or ephemeral agents.</dd>
+<dt><code>JENKINS_HOME</code></dt><dd>The controller's state directory: <code>config.xml</code>, <code>jobs/&lt;name&gt;/config.xml</code> and <code>builds/N/</code> (log, results, artifacts), <code>plugins/</code>, <code>secrets/</code>, <code>users/</code>, <code>nodes/</code>. Back this directory up and you have backed up Jenkins.</dd>
+</dl>
+<div class="grid-2">
+<div class="card"><h4>How agents connect</h4><ul>
+<li><strong>SSH</strong> — the controller SSHes to the agent and starts <code>agent.jar</code>. Controller needs network access to agents.</li>
+<li><strong>Inbound (JNLP)</strong> — the agent starts <code>agent.jar -url … -secret …</code> and connects <em>to</em> the controller on TCP 50000 (or over WebSocket on 8080). Works from behind NAT/firewalls; this is what Kubernetes Pod agents use (C5).</li>
+<li><strong>Cloud plugins</strong> — Docker, Kubernetes, EC2: the controller creates agents on demand and discards them.</li>
+</ul></div>
+<div class="card"><h4>Job types</h4><ul>
+<li><strong>Freestyle</strong> — configured by clicking in the UI. Legacy; avoid.</li>
+<li><strong>Pipeline</strong> — a Jenkinsfile, inline or "from SCM" (the repo). This is the standard.</li>
+<li><strong>Multibranch Pipeline</strong> — scans a repo, creates a job per branch/PR that has a Jenkinsfile, deletes them when branches go. Pair with a webhook.</li>
+<li><strong>Organization folder</strong> — multibranch for every repo in a GitHub org.</li>
+</ul></div>
+</div>
+<div class="callout linux" data-ref="l07,l04"><p>On a VM, <code>jenkins</code> is a <strong>systemd unit</strong> like the kubelet from <a href="../linux/l07-systemd-journald.html">L7</a>: <code>systemctl status jenkins</code>, <code>journalctl -u jenkins -f</code>, config via <code>systemctl edit jenkins</code> (<code>Environment="JENKINS_HOME=/var/lib/jenkins"</code>, <code>JAVA_OPTS=-Xmx2g</code>). Everything it knows is files under <code>JENKINS_HOME</code>; the "database" is XML on disk, which is why backups are <code>tar</code> and why the controller needs a fast disk — every build log write goes there. In Docker, the same directory is a volume at <code>/var/jenkins_home</code> (<a href="../lessons/d24-docker-volumes.html">Day 24</a>).</p></div>
+
+<h2>The declarative Jenkinsfile</h2>
+<figure data-anim="jenkinsfile-run"></figure>
+<pre data-title="Jenkinsfile"><code>pipeline {
+  agent none                                        // no global executor; each stage that needs one says so
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timestamps()
+  }
+  environment {
+    REGISTRY = 'ghcr.io/acme'
+    TAG      = "${env.GIT_COMMIT.take(7)}"          // Groovy string interpolation, evaluated on the controller
+    GHCR     = credentials('ghcr-bot')              // binds GHCR_USR and GHCR_PSW, masked in logs
+  }
+  parameters {
+    choice(name: 'TARGET', choices: ['dev', 'staging'], description: 'Environment to deploy after build')
+    booleanParam(name: 'RUN_E2E', defaultValue: false)
+  }
+  triggers { cron('H 3 * * 1-5') }                  // nightly on weekdays; webhooks need no trigger block
+  stages {
+    stage('Test') {
+      agent { label 'linux && docker' }             // checkout scm happens automatically on each stage agent
+      steps { sh 'make test' }
+      post { always { junit 'reports/*.xml' } }
+    }
+    stage('Checks') {
+      parallel {
+        stage('Lint')  { agent { label 'linux' } steps { sh 'make lint' } }
+        stage('Scan')  { agent { label 'linux' } steps { sh 'trivy fs --exit-code 1 --severity CRITICAL .' } }
+      }
+    }
+    stage('Build & push') {
+      agent { label 'linux && docker' }
+      when { branch 'main' }                        // skipped on feature branches
+      steps {
+        sh 'echo "$GHCR_PSW" | docker login ghcr.io -u "$GHCR_USR" --password-stdin'
+        sh "docker build -t $REGISTRY/api:$TAG . && docker push $REGISTRY/api:$TAG"
+      }
+    }
+    stage('Approve') {
+      when { branch 'main' }                        // no agent here → no executor is held while a human decides
+      steps { input message: "Deploy ${TAG} to ${params.TARGET}?", ok: 'Deploy' }
+    }
+    stage('Deploy') {
+      agent { label 'linux' }
+      when { branch 'main' }
+      steps {
+        withCredentials([file(credentialsId: "kubeconfig-${params.TARGET}", variable: 'KUBECONFIG')]) {
+          sh "kubectl set image deploy/api api=$REGISTRY/api:$TAG && kubectl rollout status deploy/api --timeout=180s"
+        }
+      }
+    }
+  }
+  post {
+    always  { echo "result: ${currentBuild.currentResult}" }      // no agent here: archive/cleanWs belong in a stage post
+    failure { slackSend channel: '#ci', message: "FAILED ${env.JOB_NAME} #${env.BUILD_NUMBER} ${env.BUILD_URL}" }
+  }
+}</code></pre>
+<dl class="kv">
+<dt>agent</dt><dd>Where it runs. A top-level agent holds one executor for the whole run and gives every stage the same workspace; <code>agent none</code> at the top with per-stage agents lets stages use different machines and lets agent-less stages (an <code>input</code>) hold nothing — at the cost that each stage gets its own workspace (Jenkins re-runs <code>checkout scm</code>; move build outputs with <code>stash</code>/<code>unstash</code>). <code>agent { docker { image 'golang:1.23' } }</code> runs the stage inside a container on the agent (needs Docker there).</dd>
+<dt>stages / steps</dt><dd>Stages are the visual units (the boxes in the UI); steps are the work. <code>sh</code>, <code>bat</code>, <code>checkout scm</code>, <code>junit</code>, <code>archiveArtifacts</code>, <code>stash/unstash</code> (move files between agents), <code>input</code>, <code>timeout</code>, <code>retry</code>, <code>withCredentials</code>, <code>withEnv</code>, <code>script { }</code> (escape hatch to Groovy).</dd>
+<dt>when</dt><dd>Conditional stage: <code>branch</code>, <code>tag</code>, <code>changeRequest()</code> (a PR), <code>environment</code>, <code>expression { }</code>, <code>anyOf/allOf/not</code>. The stage is shown as skipped, not failed.</dd>
+<dt>parallel</dt><dd>Sibling stages run concurrently — on the same agent (sharing the workspace) or on their own via per-stage agents. <code>failFast true</code> aborts siblings on first failure.</dd>
+<dt>input</dt><dd>Pauses for a human. Inside an executor-holding stage it <em>occupies the executor</em> while waiting — with a top-level agent that means the whole run's executor. Use top-level <code>agent none</code> and give the input stage no agent. This is Continuous Delivery's approval gate, Jenkins-style; GitHub Actions does the same with environments.</dd>
+<dt>post</dt><dd>Runs after stages (or after a stage, if nested): <code>always</code>, <code>success</code>, <code>failure</code>, <code>unstable</code> (tests failed but build succeeded), <code>changed</code>, <code>aborted</code>, <code>cleanup</code>. Steps that touch the workspace (<code>archiveArtifacts</code>, <code>cleanWs</code>) belong in a <em>stage's</em> <code>post</code> when the top level has no agent.</dd>
+<dt>Scripted pipeline</dt><dd>The older Groovy form: <code>node('linux') { stage('x') { sh '…' } }</code>. Full Groovy power, no structure, no <code>post</code>/<code>when</code>. Use declarative; drop into <code>script { }</code> when you need a loop.</dd>
+</dl>
+<div class="callout connect" data-ref="c02"><p>Mapping to GitHub Actions: <em>Jenkinsfile</em> ≈ workflow file; <em>stage</em> ≈ job or step group; <em>agent/label</em> ≈ <code>runs-on</code>; <em>executor</em> ≈ a runner slot; <em>credentials</em> ≈ secrets; <em>plugins</em> ≈ marketplace actions; <em>shared library</em> ≈ reusable workflow; <em>input</em> ≈ environment approval; <em>stash</em> ≈ artifacts between jobs. One real difference: a Jenkins pipeline is a single Groovy program whose stages can share one workspace, whereas GitHub jobs are always separate machines.</p></div>
+
+<h2>What <code>sh</code> actually does</h2>
+<p>A <code>sh</code> step is not the controller running a shell. The controller sends the script to the agent; the agent writes it to a temp directory next to the workspace and launches it in a <em>detached</em> way so that it survives a brief agent disconnect; the controller then polls the output file and streams it into the build log.</p>
+<figure data-anim="durable-sh"></figure>
+<div class="callout linux" data-ref="l01"><p>Under <code>workspace/api@tmp/durable-&lt;id&gt;/</code> you will find <code>script.sh</code> (your step), <code>jenkins-log.txt</code> (its stdout/stderr), <code>jenkins-result.txt</code> (its exit code, written when it finishes) and <code>pid</code>. The launcher is essentially <code>nohup sh -c 'sh script.sh &gt; jenkins-log.txt 2&gt;&amp;1; echo $? &gt; jenkins-result.txt' &amp;</code> — a background process reparented to init that ignores SIGHUP (<a href="../linux/l01-processes-signals.html">L1</a>). That is why a build keeps running when the agent's connection flaps, why <em>aborting</em> a build sends SIGTERM to that process group, and why a step that spawns a daemon and exits still "hangs" the step until the daemon closes the log file descriptor. If a step prints nothing for a long time you will see <code>process apparently never started</code> or heartbeat warnings — the controller is polling those files.</p></div>
+
+<h2>Credentials</h2>
+<p>Credentials live in the controller's store (global, per folder, or per user), encrypted at rest with a master key in <code>$JENKINS_HOME/secrets/</code>. Pipelines reference them by <strong>ID</strong>; the values are injected into the step's environment and masked in the log.</p>
+<pre><code>// kinds: usernamePassword, string (secret text), file, sshUserPrivateKey, certificate, dockerCert…
+withCredentials([
+  usernamePassword(credentialsId: 'ghcr-bot', usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS'),
+  string(credentialsId: 'slack-token', variable: 'SLACK'),
+  file(credentialsId: 'kubeconfig-prod', variable: 'KUBECONFIG')          // written to a temp file, path in $KUBECONFIG, deleted after
+]) {
+  sh 'echo "$REG_PASS" | docker login ghcr.io -u "$REG_USER" --password-stdin'   // single quotes: the SHELL expands, Groovy never sees the secret
+}</code></pre>
+<div class="callout danger"><p>Use <strong>single-quoted</strong> <code>sh '…$SECRET…'</code> so the shell reads the variable. With double quotes, Groovy interpolates the secret into the command string on the controller <em>before</em> it is sent — it then appears in the build's stored script, in <code>ps</code> output on the agent, and masking may miss it. Same class of bug as <code>${{ }}</code> injection in <a href="c02-github-actions.html">C2</a>, opposite direction.</p></div>
+<div class="callout connect" data-ref="d28"><p>Jenkins credentials are to pipelines what Kubernetes Secrets are to Pods (<a href="../lessons/d28-configmaps-secrets.html">Day 28</a>): referenced by name, injected as env vars or files, encrypted at rest — and readable by anything that runs in the same context. A pipeline that can run <code>sh</code> can print any credential it is given; restrict who can edit Jenkinsfiles and which folders can see which credentials.</p></div>
+
+<h2>Triggers and multibranch</h2>
+<pre><code class="lang-bash"># GitHub → Jenkins webhook (GitHub plugin): repo settings → Webhooks → payload URL
+https://jenkins.example.com/github-webhook/           # content type application/json; events: push, pull request
+# Generic: POST https://jenkins.example.com/job/api/build?token=TOKEN    (job "Trigger builds remotely")
+# Multibranch: "Scan Multibranch Pipeline Now" indexes branches; the webhook triggers a re-scan + build of the changed branch
+# Polling fallback (avoid): triggers { pollSCM('H/5 * * * *') }   — H spreads load across the hour</code></pre>
+<p>A multibranch job gives every branch and PR its own build history and exposes <code>env.BRANCH_NAME</code>, <code>env.CHANGE_ID</code> (PR number), <code>env.CHANGE_TARGET</code> — which is what <code>when { branch 'main' }</code> and <code>when { changeRequest() }</code> read.</p>
+
+<h2>Shared libraries and plugins</h2>
+<pre data-title="vars/buildImage.groovy in the shared library repo"><code>def call(Map cfg) {                          // usable as a step: buildImage(name: 'api')
+  def tag = env.GIT_COMMIT.take(7)
+  sh "docker build -t ${cfg.registry ?: 'ghcr.io/acme'}/${cfg.name}:${tag} ."
+  sh "docker push ${cfg.registry ?: 'ghcr.io/acme'}/${cfg.name}:${tag}"
+  return tag
+}</code></pre>
+<pre data-title="Jenkinsfile using it"><code>@Library('acme-pipeline@v3') _            // configured under Manage Jenkins → System → Global Pipeline Libraries
+pipeline {
+  agent { label 'docker' }
+  stages { stage('Build') { steps { script { env.TAG = buildImage(name: 'api') } } } }
+}</code></pre>
+<div class="tbl-wrap"><table>
+<thead><tr><th>Plugin</th><th>Why you need it</th></tr></thead>
+<tbody>
+<tr><td><code>workflow-aggregator</code> (Pipeline)</td><td>The Jenkinsfile engine, stage view</td></tr>
+<tr><td><code>git</code>, <code>github</code>, <code>github-branch-source</code></td><td>Checkout, webhooks, multibranch from GitHub</td></tr>
+<tr><td><code>credentials-binding</code></td><td><code>withCredentials</code></td></tr>
+<tr><td><code>docker-workflow</code></td><td><code>agent { docker {…} }</code>, <code>docker.build()</code></td></tr>
+<tr><td><code>kubernetes</code></td><td>Pod agents on demand — <a href="c05-jenkins-on-kubernetes.html">C5</a></td></tr>
+<tr><td><code>configuration-as-code</code> (JCasC)</td><td>Jenkins config from a YAML file instead of clicks; pairs with a ConfigMap in Kubernetes</td></tr>
+<tr><td><code>job-dsl</code></td><td>Jobs defined in code (folders, multibranch jobs) — seed job pattern</td></tr>
+<tr><td><code>timestamper</code>, <code>ws-cleanup</code>, <code>junit</code>, <code>slack</code></td><td>The utilities every pipeline ends up using</td></tr>
+</tbody></table></div>
+<div class="callout warn"><p>Plugins are Jenkins' strength and its operational burden: hundreds of them, each with its own release cadence and security advisories, and upgrades that occasionally break each other. Pin plugin versions (a <code>plugins.txt</code> baked into your own controller image), upgrade on a schedule, and read <em>Manage Jenkins → Security</em> warnings.</p></div>
+
+<div class="lab"><h3>Hands-on lab (30 min) — a controller in Docker, a pipeline, and a look under the hood</h3>
+<ol class="steps">
+<li><strong>Run the controller</strong><pre><code class="lang-bash">$ docker volume create jenkins_home
+$ docker run -d --name jenkins -p 8080:8080 -p 50000:50000 -v jenkins_home:/var/jenkins_home jenkins/jenkins:lts-jdk17
+$ docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword     # unlock at http://localhost:8080, install suggested plugins</code></pre></li>
+<li><strong>Look at JENKINS_HOME</strong>: <code>docker exec jenkins ls /var/jenkins_home</code> — <code>config.xml</code>, <code>plugins/</code>, <code>secrets/</code>, <code>users/</code>. Nothing else is state.</li>
+<li><strong>Create a Pipeline job</strong> named <code>lab</code>, "Pipeline script from SCM", pointing at your C1 lab repo, and add this <code>Jenkinsfile</code> to the repo:<pre><code>pipeline {
+  agent any
+  stages {
+    stage('Test')  { steps { sh 'sh test.sh' } }
+    stage('Slow')  { steps { sh 'for i in 1 2 3 4 5 6; do echo tick $i; sleep 5; done' } }
+  }
+  post { always { echo "result: ${currentBuild.currentResult}" } }
+}</code></pre></li>
+<li><strong>Build it</strong> and, while the <em>Slow</em> stage runs, inspect the durable task on the (built-in) agent:<pre><code class="lang-bash">$ docker exec jenkins sh -c 'ls /var/jenkins_home/workspace/lab@tmp/durable-*/ && cat /var/jenkins_home/workspace/lab@tmp/durable-*/jenkins-log.txt'
+$ docker exec jenkins ps -ef | grep -v grep | grep script.sh          # the nohup-ed shell</code></pre></li>
+<li><strong>Break the test</strong> in the repo, push, build again. Open the console log; note the exit code line and <code>result: FAILURE</code>. Then find the same build on disk: <code>docker exec jenkins cat /var/jenkins_home/jobs/lab/builds/2/log | tail</code>.</li>
+<li><strong>Add a credential</strong> (Manage Jenkins → Credentials → secret text, id <code>demo</code>) and a stage with <code>withCredentials([string(credentialsId: 'demo', variable: 'S')]) { sh 'echo "len=${#S}"; echo "$S" }' }</code>. Observe that the value is masked as <code>****</code> in the log — and that the length is not.</li>
+<li><strong>Set the built-in node's executors to 0</strong> (Manage Jenkins → Nodes) and build again: it queues forever with "Waiting for next available executor". That is the production posture — builds need agents, which is C5.</li>
+</ol></div>
+
+<details class="quiz"><summary>A stage does <code>sh "curl -H 'Authorization: Bearer ${TOKEN}' …"</code> with <code>TOKEN</code> from <code>credentials()</code>. Why is this worse than single quotes?</summary><div><p>Double quotes make Groovy interpolate on the controller: the secret becomes part of the command text sent to the agent and can show up in the pipeline's stored script and in the agent's process list. With single quotes the shell expands <code>$TOKEN</code> from its environment at run time; only the environment holds it, and masking works reliably.</p></div></details>
+<details class="quiz"><summary>The build queue shows "Waiting for next available executor on 'docker'" for an hour. Three things to check?</summary><div><p>(1) Is any agent online with label <code>docker</code> (Manage Jenkins → Nodes)? (2) Are all its executors busy — perhaps by a pipeline sitting in an <code>input</code> step inside an executor-holding stage? (3) Did the agent disconnect (inbound agents die with their process; check its host with <code>journalctl</code> / <code>kubectl logs</code>)?</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Controller schedules and stores; agents execute. Labels route pipelines to agents; executors are the concurrency slots. Keep the controller's executors at 0.</li>
+<li><code>JENKINS_HOME</code> is Jenkins: config, jobs, builds, plugins, secrets — all files. Back it up; run the controller as a systemd service or a container with a volume.</li>
+<li>Declarative Jenkinsfile: agent, environment, options, parameters, triggers, stages (when / parallel / input), post. Escape to <code>script {}</code> only when needed.</li>
+<li><code>sh</code> runs a detached script on the agent and polls its log; that mechanism explains most "hung step" behaviour.</li>
+<li>Credentials by ID, single-quoted <code>sh</code>, masked logs; treat any pipeline with <code>sh</code> as able to read its own credentials.</li>
+<li>Webhooks + multibranch for triggers, shared libraries for reuse, JCasC + plugins.txt to keep the controller reproducible.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- jenkins-arch ---------- */
+  let svg = S.box('gh', 15, 60, 110, 46, ['GitHub', 'push → webhook'], { fs: 11, subfs: 9, subcls: 'muted', cls: 'soft' })
+    + S.zone('ctl', 160, 15, 250, 255, 'controller  ·  :8080 / :50000')
+    + S.box('ui', 175, 42, 220, 34, ['UI · API · webhooks'], { fs: 11 })
+    + S.box('q', 175, 86, 220, 34, ['queue: (empty)'], { fs: 10, lcls: 'mono' })
+    + S.term('home', 175, 130, 220, 128, ['$JENKINS_HOME/', ' jobs/api/config.xml', ' jobs/api/builds/', ' plugins/  secrets/  users/', ' nodes/'], { fs: 9.5 })
+    + S.zone('ag1', 450, 15, 140, 120, 'agent "linux-1"')
+    + S.text('l1', 520, 45, 'labels: linux docker', { cls: 'xs mono muted' })
+    + S.box('e1', 462, 58, 54, 30, ['exec 1'], { fs: 9.5, cls: 'soft' }) + S.box('e2', 524, 58, 54, 30, ['exec 2'], { fs: 9.5, cls: 'soft' })
+    + S.term('ws1', 462, 96, 116, 30, [' ~/workspace/api'], { fs: 9 })
+    + S.zone('ag2', 605, 15, 140, 120, 'agent "arm-1"')
+    + S.text('l2', 675, 45, 'labels: linux arm64', { cls: 'xs mono muted' })
+    + S.box('e3', 617, 58, 54, 30, ['exec 1'], { fs: 9.5, cls: 'soft' }) + S.box('e4', 679, 58, 54, 30, ['exec 2'], { fs: 9.5, cls: 'soft' })
+    + S.term('ws2', 617, 96, 116, 30, [' (idle)'], { fs: 9 })
+    + S.term('log', 450, 150, 295, 108, ['build #42  agent linux-1', '', '', '', ''], { fs: 9.5 })
+    + S.arrow('a1', 125, 83, 158, 60, { d: 'M 125 83 L 173 60', cls: 'hid' })
+    + S.arrow('a2', 285, 76, 285, 84, { cls: 'hid' })
+    + S.arrow('a3', 395, 103, 448, 73, { d: 'M 395 103 L 448 73', cls: 'hid', label: 'label match', lx: 425, ly: 95 })
+    + S.arrow('a4', 450, 150, 395, 200, { d: 'M 450 165 L 397 195', cls: 'hid dashed', label: 'log stream', lx: 440, ly: 172 })
+    + S.text('m', 380, 283, '', { cls: 'sm b' });
+  const L = (q, id, lines, color) => lines.forEach((t, i) => { if (t != null) q(`#${id}-l${i + 1}`).text(t).style('fill', color || 'var(--code-text)'); });
+  Anim.define('jenkins-arch', { w: 760, h: 295, title: 'Controller, queue, agents, executors', ms: 2500, svg, steps: [
+    { c: 'A push to GitHub hits the controller\'s webhook endpoint. The controller looks up the job whose repo matches.', on(q){ q('#a1').show().set('hl'); q('#gh rect').set('warn'); q('#ui rect').set('hl'); q('#m').text('POST /github-webhook/'); } },
+    { c: 'The job is placed in the <b>build queue</b> with its requirement: <code>agent { label \'linux && docker\' }</code>.', on(q){ q('#a2').show().set('hl'); q('#q rect').set('warn'); q('#q text').text('queue: api #42 [linux && docker]'); q('#m').text('waiting for an executor'); } },
+    { c: 'The controller finds an online agent whose labels satisfy the expression and which has a free <b>executor</b>. <code>arm-1</code> has no <code>docker</code> label, so <code>linux-1</code> executor 1 is chosen.', on(q){ q('#a3').show().set('hl'); q('#e1 rect').set('hl'); q('#ag2 rect').set('dim'); q('#q text').text('queue: (empty)'); q('#q rect').set(); q('#m').text('label expression → linux-1 / exec 1'); } },
+    { c: 'The agent checks the repo out into the job\'s <b>workspace</b> on its own disk and runs the stages there. Every <code>sh</code> step is a process on the agent; its output is streamed back.', on(q){ q('#ws1 rect').set('hl'); q('#ws1-l0').text(' ~/workspace/api  (checkout)'); q('#a4').show(); L(q, 'log', ['[Test] + make test', '[Build] + docker build …']); q('#m').text('stages run on the agent'); } },
+    { c: 'The <b>controller</b> stores everything durable: the console log, test results, archived artifacts and the outcome, under <code>jobs/api/builds/42/</code>. The workspace stays on the agent (dirty!) until <code>cleanWs()</code> or the next build.', on(q){ L(q, 'log', [null, null, '[Deploy] + kubectl rollout status …', 'Finished: SUCCESS'], 'var(--green)'); q('#home-l2').text(' jobs/api/builds/42/ log · junit · artifacts').style('fill', 'var(--green)'); q('#e1 rect').set('ok'); q('#m').text('build #42 archived on the controller'); } },
+    { c: 'Two builds at once? The second takes executor 2. A third waits in the queue — or, with a cloud plugin, the controller <b>creates</b> a new agent for it. That is the Kubernetes plugin\'s job in C5.', on(q){ q('#e2 rect').set('hl'); q('#q text').text('queue: api #44 [linux && docker]'); q('#q rect').set('warn'); q('#m').text('no free executor → queue (or spawn an agent)'); } },
+  ]});
+
+  /* ---------- jenkinsfile-run ---------- */
+  const st = (id, x, y, w, label, sub) => S.box(id, x, y, w, 46, sub ? [label, sub] : [label], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'soft' });
+  svg = S.box('ag', 15, 20, 150, 40, ['agent none (top)', 'executors per stage'], { fs: 10, subfs: 9, subcls: 'muted' })
+    + S.box('env', 185, 20, 170, 40, ['environment { … }', 'TAG=9f2e1c3 · GHCR=****'], { fs: 10, subfs: 9, subcls: 'mono muted' })
+    + S.box('par', 375, 20, 150, 40, ['parameters', 'TARGET=staging'], { fs: 10, subfs: 9, subcls: 'mono muted' })
+    + st('s1', 15, 90, 110, 'Test', 'sh make test')
+    + st('s2a', 150, 70, 110, 'Lint', 'parallel')
+    + st('s2b', 150, 118, 110, 'Scan', 'parallel')
+    + st('s3', 285, 90, 130, 'Build & push', 'when { branch main }')
+    + st('s4', 440, 90, 110, 'Approve', 'input · no agent')
+    + st('s5', 575, 90, 120, 'Deploy', 'kubectl rollout status')
+    + S.arrow('f1', 125, 113, 148, 94, { d: 'M 125 113 L 148 93' }) + S.arrow('f2', 125, 113, 148, 141, { d: 'M 125 113 L 148 141' })
+    + S.arrow('f3', 260, 93, 283, 113, { d: 'M 260 93 L 283 113' }) + S.arrow('f4', 260, 141, 283, 113, { d: 'M 260 141 L 283 113' })
+    + S.arrow('f5', 415, 113, 438, 113) + S.arrow('f6', 550, 113, 573, 113)
+    + S.zone('post', 15, 175, 680, 60, 'post { }')
+    + S.box('pa', 30, 195, 200, 30, ['always: echo result · notify'], { fs: 10 })
+    + S.box('pf', 250, 195, 200, 30, ['failure: slackSend #ci'], { fs: 10 })
+    + S.box('ps', 470, 195, 200, 30, ['success: (nothing)'], { fs: 10 })
+    + S.text('m', 360, 262, '', { cls: 'sm b' });
+  Anim.define('jenkinsfile-run', { w: 720, h: 275, title: 'A declarative pipeline, stage by stage', ms: 2400, svg, steps: [
+    { c: 'The run starts on the controller: <code>environment</code> is evaluated (credentials bound, masked), parameters are read. With top-level <code>agent none</code>, no executor is held yet — each stage asks for its own.', on(q){ q('#ag rect').set('hl'); q('#env rect').set('hl'); q('#par rect').set('hl'); q('#m').text('no executor held yet'); } },
+    { c: '<b>Test</b> acquires an executor on a matching agent, checks out the repo into that agent\'s workspace and runs its steps. Its own <code>post { always { junit } }</code> records results even if it fails.', on(q){ q('#s1 rect').set('hl'); q('#ag text:nth-of-type(2)').text('Test: executor on linux-1'); } },
+    { c: '<b>Lint</b> and <b>Scan</b> are <code>parallel</code> siblings — both run at once, each on its own agent/executor (with a shared top-level agent they would share one workspace instead).', on(q){ q('#s1 rect').set('ok'); q('#s2a rect,#s2b rect').set('hl'); q('#f1,#f2').set('hl'); } },
+    { c: 'This build is on branch <code>feature/x</code>. <b>Build &amp; push</b> has <code>when { branch \'main\' }</code>, so it is <b>skipped</b> — shown grey, not red — and so are Approve and Deploy.', on(q){ q('#s2a rect,#s2b rect').set('ok'); q('#s3 rect,#s4 rect,#s5 rect').set('dim'); q('#m').text('feature branch: 3 stages skipped'); } },
+    { c: 'Same pipeline on <code>main</code>: Build &amp; push runs, then <b>Approve</b> pauses on <code>input</code>. That stage has no agent, so no executor is held while a human decides — the pipeline waits on the controller alone.', on(q){ q('#s3 rect').set('ok'); q('#s4 rect').set('warn'); q('#s5 rect').set(); q('#ag text:nth-of-type(2)').text('Approve: no executor'); q('#m').text('waiting for approval (no executor held)'); } },
+    { c: 'Approved. <b>Deploy</b> acquires an executor, updates the Deployment and waits for the rollout. Then <code>post</code>: <code>always</code> archives and cleans up; <code>success</code>/<code>failure</code> pick the notification.', on(q){ q('#s4 rect').set('ok'); q('#s5 rect').set('ok'); q('#pa rect').set('hl'); q('#ps rect').set('ok'); q('#ag text:nth-of-type(2)').text('Deploy: executor on linux-2'); q('#m').text('SUCCESS'); } },
+    { c: 'Had <code>rollout status</code> timed out, Deploy fails, remaining stages are skipped, <code>post.always</code> still runs, and <code>post.failure</code> sends the Slack message. Exit codes drive everything, as in every CI.', on(q){ q('#s5 rect').set('bad'); q('#ps rect').set('dim'); q('#pf rect').set('bad'); q('#m').text('FAILURE → always + failure blocks'); } },
+  ]});
+
+  /* ---------- durable-sh ---------- */
+  svg = S.box('ctl', 15, 40, 150, 50, ['controller', 'step: sh \'make test\''], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.zone('ag', 200, 15, 510, 258, 'agent process (agent.jar)')
+    + S.term('files', 215, 42, 250, 92, ['workspace/api@tmp/durable-3f1a/', ' script.sh', ' jenkins-log.txt', ' jenkins-result.txt', ' pid'], { fs: 9.5 })
+    + S.box('sh', 490, 42, 205, 44, ['nohup sh -c \'sh script.sh …\' &', 'pid 8123 · parent = init'], { fs: 10, subfs: 9, subcls: 'mono muted', hidden: true })
+    + S.box('mk', 490, 100, 205, 34, ['make test  (child of 8123)'], { fs: 10, hidden: true })
+    + S.term('out', 215, 150, 480, 74, ['jenkins-log.txt:', '', ''], { fs: 9.5 })
+    + S.arrow('a1', 165, 65, 213, 65, { cls: 'hid', label: 'script text', ly: 55 })
+    + S.arrow('a2', 465, 70, 488, 64, { d: 'M 465 70 L 488 64', cls: 'hid' })
+    + S.arrow('a3', 590, 86, 590, 98, { cls: 'hid' })
+    + S.arrow('a4', 213, 160, 165, 80, { d: 'M 213 160 L 165 82', cls: 'hid dashed', label: 'poll + stream', lx: 150, ly: 128 })
+    + S.text('m', 360, 262, '', { cls: 'sm b' });
+  Anim.define('durable-sh', { w: 720, h: 275, title: 'Inside a sh step', ms: 2500, svg, steps: [
+    { c: 'The controller sends the step\'s script text to the agent. The agent writes it as <code>script.sh</code> in a per-step <code>durable-*</code> directory beside the workspace.', on(q){ q('#a1').show().set('hl'); q('#files-l1').style('fill', 'var(--accent)'); q('#m').text('script.sh written'); } },
+    { c: 'It launches the script <b>detached</b>: a <code>nohup</code>-ed shell, backgrounded, stdout/stderr redirected to <code>jenkins-log.txt</code>, exit code to be written to <code>jenkins-result.txt</code>. Its parent is not the agent — it is reparented to init.', on(q){ q('#a2').show().set('hl'); q('#sh').show(); q('#sh rect').set('hl'); q('#files-l4').style('fill', 'var(--accent)'); q('#m').text('the step survives agent hiccups'); } },
+    { c: 'Your command runs as a child of that shell. The agent <b>polls</b> the log file and streams new bytes to the controller, which appends them to the build log.', on(q){ q('#a3').show(); q('#mk').show(); q('#mk rect').set('hl'); q('#a4').show(); q('#out-l1').text('go test ./...  ok  pkg/api  0.42s').style('fill', 'var(--code-text)'); q('#m').text('agent tails jenkins-log.txt'); } },
+    { c: 'The agent\'s connection drops for a minute. The process keeps running — it was never the agent\'s child. When the agent reconnects it picks up the log where it left off.', on(q){ q('#ag rect').set('warn'); q('#a4').hide(); q('#out-l2').text('… (agent offline; process still running)').style('fill', 'var(--amber)'); q('#m').text('disconnected, not aborted'); } },
+    { c: 'Command exits; the wrapper writes the exit code. The agent reads <code>jenkins-result.txt</code>: <code>0</code> → step succeeded, else the step fails. <b>Abort</b> = the agent sends SIGTERM to the process group; a script that ignores it keeps going until the kill.', on(q){ q('#ag rect').set(); q('#a4').show(); q('#out-l2').text('exit code 0 → jenkins-result.txt').style('fill', 'var(--green)'); q('#files-l3').style('fill', 'var(--green)'); q('#mk rect').set('ok'); q('#sh rect').set('ok'); q('#m').text('step result read from a file'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

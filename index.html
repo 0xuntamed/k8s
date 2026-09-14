@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>K8s Notes · Kubernetes from zero to CKA</title>
-<meta name="description" content="Complete Kubernetes notes following the CKA 2025 course (Day 0 → Day 59), with animations for the hard parts and Linux fundamentals to explain what happens under the hood.">
+<meta name="description" content="Complete Kubernetes notes following the CKA 2025 course (Day 0 → Day 59), with animations for the hard parts, Linux fundamentals to explain what happens under the hood, and a CI/CD & GitOps track (GitHub Actions, Jenkins, Argo CD).">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="css/style.css">
@@ -14,19 +14,20 @@
 <main>
   <section class="hero">
     <div>
-      <span class="badge">Free · 60 lessons · CKA 2025 track</span>
-      <h1 style="margin-top:.6rem">Kubernetes, <span>from zero to CKA</span> — with the Linux underneath.</h1>
-      <p class="sub">Structured notes for every lesson of the <em>CKA Certification Course 2025</em> playlist, rewritten as a reference you can actually come back to. Hard concepts get step-by-step animations; every abstraction is traced down to the Linux feature that implements it.</p>
+      <span class="badge">Free · 60 lessons · CKA 2025 track · CI/CD &amp; GitOps</span>
+      <h1 style="margin-top:.6rem">Kubernetes, <span>from zero to CKA</span> — with the Linux underneath and the pipelines on top.</h1>
+      <p class="sub">Structured notes for every lesson of the <em>CKA Certification Course 2025</em> playlist, rewritten as a reference you can actually come back to. Hard concepts get step-by-step animations; every abstraction is traced down to the Linux feature that implements it. A third track takes you from a working cluster to a working delivery pipeline: GitHub Actions, Jenkins, GitOps and Argo CD.</p>
       <div class="hero-cta">
         <a class="btn primary" href="lessons/d00-roadmap.html">Start at Day 0 →</a>
         <a class="btn" href="linux/l02-namespaces.html">Linux fundamentals</a>
+        <a class="btn" href="cicd/c01-cicd-fundamentals.html">CI/CD &amp; GitOps</a>
         <a class="btn" href="cheatsheet.html">kubectl cheatsheet</a>
       </div>
       <div class="stats">
         <div><b>60</b><span>Course lessons</span></div>
         <div><b>10</b><span>Linux modules</span></div>
-        <div><b>90+</b><span>Animations</span></div>
-        <div><b>13</b><span>Modules</span></div>
+        <div><b>10</b><span>CI/CD &amp; GitOps</span></div>
+        <div><b>110+</b><span>Animations</span></div>
       </div>
     </div>
     <div class="hero-art"><figure data-anim="hero-reconcile"></figure></div>
@@ -34,10 +35,11 @@
 
   <div id="resume"></div>
 
-  <div class="section-title"><h2>How this site is organised</h2><p>Three tracks that reference each other.</p></div>
+  <div class="section-title"><h2>How this site is organised</h2><p>Four tracks that reference each other.</p></div>
   <div class="track-cards">
     <div class="track"><h3><span class="ic" style="background:var(--accent-soft);color:var(--accent);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">K</span>The course · Day 0 → 59</h3><p>One page per video, in playlist order. Each page has the concept, the YAML, the commands, an "under the hood" box, exam tips, a hands-on lab and key takeaways.</p></div>
     <div class="track"><h3><span class="ic" style="background:var(--linux-soft);color:var(--linux);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">L</span>Linux fundamentals</h3><p>Namespaces, cgroups, OverlayFS, veth/iptables, signals, capabilities, DNS, OpenSSL, systemd. Read them when a lesson links to them — or up front if you like knowing why.</p></div>
+    <div class="track"><h3><span class="ic" style="background:var(--cicd-soft);color:var(--cicd);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">C</span>CI/CD &amp; GitOps</h3><p>GitHub Actions, Jenkins (standalone and on Kubernetes), GitOps principles and Argo CD from install to multi-cluster. Every page points back to the course lesson or Linux primitive it builds on.</p></div>
     <div class="track"><h3><span class="ic" style="background:var(--purple-soft);color:var(--purple);width:28px;height:28px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:800">R</span>Reference</h3><p>A kubectl cheatsheet organised by task and a glossary of every term used in the course. Press <kbd>Ctrl</kbd> <kbd>K</kbd> anywhere to search.</p></div>
   </div>
 
@@ -47,11 +49,15 @@
   <div class="section-title"><h2>Linux fundamentals</h2><p>The kernel features Kubernetes is built on.</p></div>
   <div class="mod-grid" id="linux-mods"></div>
 
+  <div class="section-title"><h2>CI/CD &amp; GitOps</h2><p>From a working cluster to a working delivery pipeline. Read after Module 9 (Kustomize &amp; Helm) — or whenever you ask "how do changes get in?"</p></div>
+  <div class="mod-grid" id="cicd-mods"></div>
+
   <div class="section-title"><h2>Suggested study plan</h2><p>How to use the playlist and these notes together.</p></div>
   <div class="grid-3">
     <div class="card"><h4><span class="ic">1</span>Watch, then read</h4><p>Watch the day's video once at normal speed. Then read the page here — it is organised for retention, not for narration, so it will fill gaps the video moved past quickly.</p></div>
     <div class="card"><h4><span class="ic">2</span>Type every command</h4><p>Each page ends with a lab. Use a local <a href="lessons/d08-kind-cluster.html">KIND cluster</a>; from Day 54 onward, build a real <a href="lessons/d54-kubeadm-cluster.html">kubeadm cluster</a> on VMs.</p></div>
     <div class="card"><h4><span class="ic">3</span>Chase the Linux links</h4><p>When a page says <em>Under the hood</em>, follow the link once. Understanding the primitive (a cgroup, a veth pair, a signal) makes the Kubernetes concept obvious and permanent.</p></div>
+    <div class="card"><h4><span class="ic">4</span>Then automate it</h4><p>Once you can deploy by hand, take the <a href="cicd/c01-cicd-fundamentals.html">CI/CD &amp; GitOps track</a>: build the image in a pipeline, commit the tag, and let Argo CD do the <code>kubectl apply</code> for you — forever.</p></div>
   </div>
 
   <footer class="site-footer">
@@ -99,10 +105,16 @@
     el.innerHTML = `<h3><span class="mnum">L${i + 1}</span><a href="${K.href(l)}" style="color:inherit">${l.title}</a></h3><p>${l.blurb}</p><div class="mprog"><i style="width:${K.done.has(l.id) ? 100 : 0}%"></i></div>`;
     lm.appendChild(el);
   });
+  const cm = document.getElementById('cicd-mods');
+  (window.CURRICULUM.cicd || []).forEach((l, i) => {
+    const el = document.createElement('div'); el.className = 'mod-card'; el.style.setProperty('--mc', 'var(--cicd)');
+    el.innerHTML = `<h3><span class="mnum">C${i + 1}</span><a href="${K.href(l)}" style="color:inherit">${l.title}</a></h3><p>${l.blurb}</p><div class="mprog"><i style="width:${K.done.has(l.id) ? 100 : 0}%"></i></div>`;
+    cm.appendChild(el);
+  });
   try {
     const last = localStorage.getItem('k8s-notes:last');
     const e = last && K.byId[last];
-    if (e) { const r = document.getElementById('resume'); r.className = 'resume'; r.innerHTML = `<span>Pick up where you left off:</span><a href="${K.href(e)}">${e.day != null ? 'Day ' + e.day + ' · ' : ''}${e.title} →</a>`; }
+    if (e) { const r = document.getElementById('resume'); r.className = 'resume'; r.innerHTML = `<span>Pick up where you left off:</span><a href="${K.href(e)}">${K.tag(e) === 'ref' ? '' : K.tag(e) + ' · '}${e.title} →</a>`; }
   } catch (err) { }
 })();
 </script>

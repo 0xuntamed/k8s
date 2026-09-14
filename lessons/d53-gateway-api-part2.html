@@ -199,11 +199,11 @@ $ kubectl delete httproute shop gateway main; kubectl delete deploy web api-v1 a
 <script>
 (function(){
   const S = Anim.S;
-  let svg = S.icon('c', 50, 150, 'laptop', { label: 'curl -H Host: shop.local', ly: 28, lcls: 'mono' })
+  let svg = S.icon('c', 75, 150, 'laptop', { label: 'curl -H Host: shop.local', ly: 28, lcls: 'mono' })
     + S.box('gw', 150, 120, 120, 60, ['Gateway main', 'nginx :80'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
-    + S.term('rt', 300, 40, 260, 130, ['HTTPRoute shop  (shop.local)', ' /api + X-Version:v2 → api-v2', ' /api → api-v1 (90) · api-v2 (10)', '    + ResponseHeader X-Served-By', ' /legacy → rewrite /api → api-v1', ' /old → 301 https://shop.example.com', ' /   → web'], { fs: 8.5 })
+    + S.term('rt', 300, 40, 260, 130, ['HTTPRoute shop  (shop.local)', ' /api + X-Version:v2 → api-v2', ' /api → api-v1 (90) · api-v2 (10)', '    + ResponseHeader X-Served-By', ' /legacy → rewrite /api → api-v1', ' /old → 301 https://shop.example.com', ' /   → web'], { fs: 9 })
     + S.box('v1', 610, 60, 90, 40, ['api-v1'], { fs: 11, cls: 'ok' }) + S.box('v2', 610, 130, 90, 40, ['api-v2'], { fs: 11, cls: 'cy' }) + S.box('web', 610, 200, 90, 40, ['web'], { fs: 11, cls: 'ok' })
-    + S.arrow('a1', 95, 150, 148, 150, { cls: 'hl' }) + S.arrow('a2', 270, 150, 298, 120, { d: 'M 270 150 L 298 118', cls: 'hl' })
+    + S.arrow('a1', 105, 150, 148, 150, { cls: 'hl' }) + S.arrow('a2', 270, 150, 298, 120, { d: 'M 270 150 L 298 118', cls: 'hl' })
     + S.arrow('r1', 560, 80, 608, 80, { cls: 'hid' }) + S.arrow('r2', 560, 150, 608, 150, { cls: 'hid' }) + S.arrow('r3', 560, 160, 608, 220, { d: 'M 560 165 L 608 218', cls: 'hid' })
     + S.text('req', 360, 205, '', { cls: 'sm mono b' }) + S.text('m', 360, 230, '', { cls: 'sm' }) + S.text('m2', 360, 252, '', { cls: 'xs muted' });
   const hl = (q, line) => { for (let i = 1; i <= 6; i++) q('#rt-l' + i).style('fill', i === line ? 'var(--green)' : 'var(--faint)'); };

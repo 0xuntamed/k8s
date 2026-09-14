@@ -176,11 +176,11 @@ $ kubectl delete pod hog burn be g $now; kubectl delete ns lr</code></pre></div>
 
   /* packing by requests */
   let s1 = S.text('t', 360, 22, 'node allocatable: 4 CPU · 8 GiB   (scheduler sums REQUESTS, ignores usage)', { cls: 'sm muted' });
-  s1 += S.bar('cpu', 120, 60, 500, 22, { label: 'CPU', cls: '' }) + S.text('cpuv', 640, 76, '0 / 4', { cls: 'sm mono left' });
-  s1 += S.bar('mem', 120, 110, 500, 22, { label: 'memory', cls: 'pur' }) + S.text('memv', 640, 126, '0 / 8Gi', { cls: 'sm mono left' });
+  s1 += S.bar('cpu', 120, 60, 460, 22, { label: 'CPU', cls: '' }) + S.text('cpuv', 596, 76, '0 / 4', { cls: 'sm mono left' });
+  s1 += S.bar('mem', 120, 110, 460, 22, { label: 'memory', cls: 'pur' }) + S.text('memv', 596, 126, '0 / 8Gi', { cls: 'sm mono left' });
   s1 += S.pod('p1', 100, 200, 'api', { cls: 'ok', w: 64, sub: '1 CPU · 2Gi' }) + S.pod('p2', 220, 200, 'web', { cls: 'ok', w: 64, sub: '500m · 1Gi' }) + S.pod('p3', 340, 200, 'cache', { cls: 'ok', w: 64, sub: '2 CPU · 4Gi' }) + S.pod('p4', 460, 200, 'batch', { cls: 'warn', w: 64, sub: '1 CPU · 2Gi' }) + S.pod('p5', 580, 200, 'tiny', { cls: 'cy', w: 64, sub: '200m · 256Mi' });
   s1 += S.text('m', 360, 275, '', { cls: 'sm b' });
-  const set = (q, c, m) => { q('#cpu-fill').attr('width', 500 * c / 4); q('#mem-fill').attr('width', 500 * m / 8); q('#cpuv').text(`${c} / 4`); q('#memv').text(`${m}Gi / 8Gi`); };
+  const set = (q, c, m) => { q('#cpu-fill').attr('width', 460 * c / 4); q('#mem-fill').attr('width', 460 * m / 8); q('#cpuv').text(`${c} / 4`); q('#memv').text(`${m}Gi / 8Gi`); };
   Anim.define('requests-packing', { w: 720, h: 290, title: 'Scheduling by requests', ms: 2400, svg: s1, steps: [
     { c: 'An empty node with 4 CPU and 8 GiB <b>allocatable</b>. Five Pods arrive with different <b>requests</b>.', on(q){ set(q, 0, 0); } },
     { c: '<code>api</code> requests 1 CPU / 2 Gi. Fits. The scheduler\'s view of the node is now 1 CPU / 2 Gi used — regardless of what api actually consumes.', on(q){ set(q, 1, 2); q('#p1 rect').set('hl'); } },

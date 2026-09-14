@@ -176,12 +176,12 @@ $ kubectl delete ns dev; kubectl delete clusterrolebinding jane-nodes; kubectl d
   const S = Anim.S;
   let svg = S.term('req', 20, 20, 300, 70, ['request', 'user: jane  groups: [developers]', 'verb: delete  resource: pods  ns: dev'], { fs: 9.5 })
     + S.zone('b', 20, 110, 680, 190, 'bindings the RBAC authorizer scans')
-    + S.box('rb1', 40, 140, 200, 64, ['RoleBinding jane-pods (ns dev)', 'subject: User jane', 'roleRef: Role pod-reader'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('rb2', 260, 140, 200, 64, ['RoleBinding dev-edit (ns dev)', 'subject: Group developers', 'roleRef: ClusterRole edit'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('crb', 480, 140, 200, 64, ['ClusterRoleBinding ops-view', 'subject: Group ops', 'roleRef: ClusterRole view'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('r1', 40, 225, 200, 56, ['Role pod-reader', 'pods: get list watch'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('r2', 260, 225, 200, 56, ['ClusterRole edit', 'pods: … delete …'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('r3', 480, 225, 200, 56, ['ClusterRole view', 'pods: get list watch'], { subfs: 8.5, subcls: 'mono muted' })
+    + S.box('rb1', 40, 140, 200, 64, ['RoleBinding jane-pods (ns dev)', 'subject: User jane', 'roleRef: Role pod-reader'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('rb2', 260, 140, 200, 64, ['RoleBinding dev-edit (ns dev)', 'subject: Group developers', 'roleRef: ClusterRole edit'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('crb', 480, 140, 200, 64, ['ClusterRoleBinding ops-view', 'subject: Group ops', 'roleRef: ClusterRole view'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('r1', 40, 225, 200, 56, ['Role pod-reader', 'pods: get list watch'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('r2', 260, 225, 200, 56, ['ClusterRole edit', 'pods: … delete …'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('r3', 480, 225, 200, 56, ['ClusterRole view', 'pods: get list watch'], { subfs: 9, subcls: 'mono muted' })
     + S.text('d', 500, 60, '', { cls: 'sm b' }) + S.text('d2', 500, 82, '', { cls: 'xs muted' });
   Anim.define('rbac-eval', { w: 720, h: 315, title: 'How RBAC evaluates a request', ms: 3000, svg, steps: [
     { c: 'Request: jane (in group developers) wants to <b>delete pods</b> in <b>dev</b>. RBAC collects every binding whose subjects match jane or any of her groups, in this namespace or cluster-wide.', on(q){ q('#req-l1').style('fill', 'var(--accent)'); } },

@@ -163,7 +163,7 @@ $ sudo ip netns del pod1; sudo ip netns del pod2; sudo ip link del br0</code></p
     + S.arrow('a1', 110, 140, 138, 140) + S.arrow('a2', 250, 140, 278, 140) + S.arrow('a3', 370, 130, 398, 85, { d: 'M 370 132 L 398 84' }) + S.arrow('a4', 370, 150, 398, 195, { d: 'M 370 148 L 398 195' })
     + S.arrow('a5', 510, 80, 538, 80) + S.arrow('a6', 650, 80, 668, 80) + S.arrow('a7', 510, 200, 538, 200)
     + S.term('ct', 20, 240, 680, 60, ['conntrack:', ''], { fs: 9.5 })
-    + S.dot('pk', 65, 100, { hidden: true, label: 'dst 10.96.0.42:80' });
+    + S.dot('pk', 65, 100, { hidden: true, label: 'dst 10.96.0.42:80', lcls: 'right' });
   Anim.define('netfilter', { w: 720, h: 310, title: 'A Service packet through netfilter', ms: 2800, svg: s2, steps: [
     { c: 'A packet from a Pod arrives on the node (via its veth) addressed to a Service VIP. netfilter hooks it at <b>PREROUTING</b> before any routing decision.', on(q){ q('#pk').show().to(195, 100); q('#pre rect').set('pur'); } },
     { c: 'In the nat table\'s KUBE-SERVICES chain a rule matches the VIP; a random KUBE-SEP chain <b>DNATs</b> the destination to a Pod IP. Only the first packet of the flow consults these rules.', on(q){ q('#pk').text('dst 10.244.2.9:8080'); q('#ct-l1').text('new: 10.244.1.10:5123 → 10.96.0.42:80  ⇒  10.244.2.9:8080').style('fill', 'var(--green)'); } },

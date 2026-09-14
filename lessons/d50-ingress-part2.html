@@ -135,11 +135,11 @@ $ eksctl delete cluster --name cka               # do not forget — ALBs and no
 (function(){
   const S = Anim.S;
   let svg = S.zone('aws', 20, 20, 320, 290, 'AWS (outside the cluster)')
-    + S.box('alb', 40, 60, 280, 50, ['Application Load Balancer', 'k8s-shop-shop-….elb.amazonaws.com'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur', hidden: true })
+    + S.box('alb', 40, 60, 280, 50, ['Application Load Balancer', 'k8s-shop-shop-….elb.amazonaws.com'], { subfs: 9, subcls: 'mono muted', cls: 'pur', hidden: true })
     + S.term('lr', 40, 125, 280, 70, ['listener HTTP:80 rules', '', '', ''], { fs: 9 })
-    + S.box('tg1', 40, 210, 130, 50, ['target group api', ''], { subfs: 8.5, subcls: 'mono muted', hidden: true }) + S.box('tg2', 190, 210, 130, 50, ['target group web', ''], { subfs: 8.5, subcls: 'mono muted', hidden: true })
+    + S.box('tg1', 30, 210, 160, 50, ['target group api', ''], { subfs: 9, subcls: 'mono muted', hidden: true }) + S.box('tg2', 205, 210, 130, 50, ['target group web', ''], { subfs: 9, subcls: 'mono muted', hidden: true })
     + S.zone('cl', 380, 20, 320, 290, 'EKS cluster')
-    + S.box('ctl', 400, 50, 280, 50, ['aws-load-balancer-controller', 'SA with IAM role (IRSA)'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.box('ctl', 400, 50, 280, 50, ['aws-load-balancer-controller', 'SA with IAM role (IRSA)'], { subfs: 9, subcls: 'mono muted', cls: 'cy' })
     + S.term('ing', 400, 115, 280, 60, ['Ingress shop (class alb)', ' /api → api:5678', ' /    → web:80'], { fs: 9 })
     + S.pod('a1', 440, 230, 'api', { cls: 'ok', w: 50, sub: '10.0.1.5' }) + S.pod('a2', 510, 230, 'api', { cls: 'ok', w: 50, sub: '10.0.2.8' }) + S.pod('w1', 620, 230, 'web', { cls: 'ok', w: 50, sub: '10.0.1.9' })
     + S.arrow('c1', 400, 75, 342, 85, { d: 'M 400 78 L 342 84', cls: 'hid', label: 'AWS API calls', lx: 370, ly: 60 })

@@ -30,7 +30,7 @@
 <article class="cs">
 <h1>kubectl cheatsheet</h1>
 <p class="lead">Every command from the course, grouped by task, in the form you would type it under time pressure. Type to filter. Aliases assumed: <code>k</code>=kubectl, <code>$do</code>=<code>--dry-run=client -o yaml</code>, <code>$now</code>=<code>--force --grace-period=0</code>.</p>
-<input class="cs-filter" id="f" type="search" placeholder="Filter: e.g. taint, rollout, jsonpath, etcd, drain…" autocomplete="off">
+<input class="cs-filter" id="f" type="search" placeholder="Filter: e.g. taint, rollout, jsonpath, etcd, drain, argocd…" autocomplete="off">
 <div class="cs-count" id="cnt"></div>
 <div class="cs-jump" id="jump"></div>
 
@@ -180,6 +180,20 @@
 <div class="row"><code>helm upgrade --install R … ; helm list -A; helm history R; helm rollback R 1; helm uninstall R</code><span>Lifecycle.</span></div>
 <div class="row"><code>helm template R ./chart -f v.yaml; helm install R ./chart --dry-run --debug; helm get manifest R</code><span>Render/inspect.</span></div>
 <div class="row"><code>kubectl kustomize overlays/prod; kubectl apply -k overlays/prod; kubectl diff -k overlays/prod</code><span>Kustomize (a directory, not a file).</span></div>
+</section>
+
+<section id="cicd"><h2>CI/CD &amp; Argo CD <small><a href="cicd/c02-github-actions.html">C2</a> · <a href="cicd/c04-jenkins.html">C4</a> · <a href="cicd/c07-argocd-architecture.html">C7</a> · <a href="cicd/c08-argocd-sync.html">C8</a></small></h2>
+<div class="row"><code>gh run list; gh run watch; gh run view RUN --log-failed; gh workflow run ci.yml -f env=dev; gh secret set NAME</code><span>GitHub Actions from the CLI.</span></div>
+<div class="row"><code>docker buildx build --platform linux/amd64 -t ghcr.io/org/app:$(git rev-parse --short HEAD) --push .</code><span>Build + push an immutable tag (what CI does).</span></div>
+<div class="row"><code>kubectl set image deploy/app app=ghcr.io/org/app:abc1234 && kubectl rollout status deploy/app --timeout=120s</code><span>Push-style deploy; non-zero exit fails the job.</span></div>
+<div class="row"><code>kustomize edit set image ghcr.io/org/app=ghcr.io/org/app:abc1234   # in the overlay dir, then git commit</code><span>GitOps handoff: CI writes the tag, Argo applies it.</span></div>
+<div class="row"><code>kubectl create ns argocd && kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml</code><span>Install Argo CD.</span></div>
+<div class="row"><code>kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; kubectl -n argocd port-forward svc/argocd-server 8080:443</code><span>Initial admin password + UI.</span></div>
+<div class="row"><code>argocd login localhost:8080 --insecure; argocd app list; argocd app get APP; argocd app diff APP; argocd app sync APP [--prune] [--dry-run]</code><span>Everyday Argo CD CLI.</span></div>
+<div class="row"><code>argocd app history APP; argocd app rollback APP ID; argocd app logs APP; argocd app manifests APP; argocd app set APP --sync-policy automated --self-heal --auto-prune</code><span>History, rollback, policy.</span></div>
+<div class="row"><code>argocd repo add https://github.com/org/config --username x --password TOKEN; argocd cluster add CONTEXT; argocd proj create team-a -d https://kubernetes.default.svc,team-a -s https://github.com/org/*</code><span>Repos, clusters, projects.</span></div>
+<div class="row"><code>kubectl -n argocd get applications,applicationsets,appprojects; kubectl -n argocd logs deploy/argocd-repo-server; kubectl -n argocd logs sts/argocd-application-controller</code><span>Argo CD is just CRDs + controllers.</span></div>
+<div class="row"><code>argocd.argoproj.io/sync-wave: "2"   argocd.argoproj.io/hook: PreSync   argocd.argoproj.io/hook-delete-policy: HookSucceeded   argocd.argoproj.io/sync-options: Prune=false</code><span>Annotations that order and shape a sync.</span></div>
 </section>
 
 <section id="quickyaml"><h2>YAML skeletons to remember <small><a href="lessons/d09-yaml-imperative-declarative.html">Day 9</a></small></h2>

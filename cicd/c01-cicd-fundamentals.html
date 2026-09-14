@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1 · CI/CD Fundamentals: From Commit to Cluster · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c01" data-root="../" data-linux="l01,l10" data-related="d02,d05,d10,d22,d42,d60">
+<article class="lesson">
+<p class="lead">Sixty lessons taught you to build a cluster and put workloads on it — by typing <code>kubectl apply</code>. That is fine for learning and fatal for a team: nobody knows what is running, nobody can reproduce it, and everyone has production credentials. <strong>CI/CD</strong> is the discipline that turns "a commit" into "a running, verified version" with no human in the loop except for decisions. This page builds the vocabulary the rest of the track uses, and shows why the container image you learned to build on <a href="../lessons/d02-first-dockerfile.html">Day 2</a> is the centre of everything.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>What CI, Continuous Delivery and Continuous Deployment actually mean (and the difference)</li>
+<li>The anatomy of a pipeline: triggers, stages, runners, artifacts, exit codes</li>
+<li>Why the image is <em>the</em> artifact, and why <code>:latest</code> breaks Deployments</li>
+<li>Environments and promotion: one image, many configs</li>
+<li>Push-based vs pull-based deployment — the fork in the road that leads to GitOps</li>
+<li>Which tool does which job, and where each is covered in this track</li>
+</ul></div>
+
+<h2>Where the course left you</h2>
+<p>Picture the workflow you have been using: edit a Dockerfile, <code>docker build</code>, <code>docker push</code>, edit a Deployment, <code>kubectl apply</code>, <code>kubectl rollout status</code>. Every step works. Now imagine six engineers doing it, forty times a day, across three clusters.</p>
+<div class="compare bad-good">
+<div><h4>Manual deploys</h4><ul>
+<li>Which commit is running in prod? Whatever was on someone's laptop when they ran <code>build</code>.</li>
+<li>Were the tests run? Depends on the person.</li>
+<li>Who changed the replica count last Tuesday? <code>kubectl</code> leaves no history.</li>
+<li>Everyone who can deploy holds a kubeconfig with write access to prod (<a href="../lessons/d32-tls-part2-kubeconfig.html">Day 32</a>).</li>
+<li>Rollback = remember what the previous tag was.</li>
+</ul></div>
+<div><h4>A pipeline</h4><ul>
+<li>Every deployed image is tagged with the commit it was built from.</li>
+<li>Tests run on every commit, the same way, on a clean machine.</li>
+<li>Every change to what runs is a commit with an author, a diff and a review.</li>
+<li>Humans hold no cluster credentials; the pipeline (or a controller in the cluster) does.</li>
+<li>Rollback = deploy the previous commit.</li>
+</ul></div>
+</div>
+
+<h2>CI, CD and the other CD</h2>
+<dl class="kv">
+<dt>Continuous Integration</dt><dd>Every push to a shared branch is automatically built and tested. The point is <em>integration</em>: small changes merged often, so conflicts and breakages surface in minutes, not at "release time". Output: a verified artifact (for us, an image) — or a red X.</dd>
+<dt>Continuous Delivery</dt><dd>Every verified artifact is <em>deployable</em> at the press of a button: the deployment itself is automated and rehearsed, but a human decides <em>when</em> (an approval, a merged promotion PR).</dd>
+<dt>Continuous Deployment</dt><dd>Same, without the button: what passes goes to production automatically. Requires excellent tests, good probes (<a href="../lessons/d23-health-probes.html">Day 23</a>), progressive rollouts and fast rollback — because the pipeline <em>is</em> the release manager.</dd>
+</dl>
+<div class="callout mental"><p>CI answers "is this commit good?". CD answers "how does a good commit reach an environment?". Everything in this track is one of those two questions. GitHub Actions and Jenkins are mainly CI tools that <em>can</em> do CD by pushing; Argo CD is a CD tool that does nothing else.</p></div>
+
+<h2>Anatomy of a pipeline</h2>
+<p>Regardless of vendor, a pipeline is: a <strong>trigger</strong> (a push, a pull request, a schedule, a manual click) starts a <strong>run</strong>; the run executes <strong>stages</strong> (lint → test → build → scan → push → deploy) on a <strong>runner</strong> (a machine or container the CI system controls); stages pass <strong>artifacts</strong> forward (a compiled binary, a test report, an image tag); each stage's <strong>exit code</strong> decides whether the next one runs.</p>
+<figure data-anim="pipeline-flow"></figure>
+<div class="callout linux" data-ref="l01,l10"><p>Strip away the YAML and a CI stage is a <strong>shell script run by a child process on a Linux machine</strong>. The runner forks a shell (<code>bash -e</code> — exit on the first failing command), the script runs, and the runner reads the exit status. <code>0</code> = green, anything else = red. Environment variables carry inputs (<code>$GITHUB_SHA</code>, <code>$BUILD_NUMBER</code>); files in the workspace carry outputs. When a pipeline "mysteriously" fails, it is almost always one of: a non-zero exit from a command you did not think could fail, a missing env var, or a file not where the next step expected it. The tools from <a href="../linux/l10-shell-toolkit.html">L10</a> (<code>set -euo pipefail</code>, <code>$?</code>, <code>tee</code>, <code>xargs</code>) are CI tools.</p></div>
+<pre data-title="what every CI system does with your stage, roughly"><code class="lang-bash">$ cd /workspace && git clone --depth 1 https://github.com/acme/api . && git checkout $GITHUB_SHA
+$ export CI=true GITHUB_SHA=9f2e1c3 IMAGE=ghcr.io/acme/api
+$ bash -e ./step.sh                 # your "run:" block, written to a temp file
+$ echo $?                           # 0 → next stage; non-zero → run fails, notifications go out</code></pre>
+
+<h2>The artifact is the image</h2>
+<p>In a Kubernetes world the thing CI produces is a <strong>container image</strong>, and the thing CD changes is one field: <code>spec.template.spec.containers[].image</code>. Everything hinges on how that image is <em>named</em>.</p>
+<figure data-anim="tag-immutability"></figure>
+<dl class="kv">
+<dt>Digest</dt><dd><code>sha256:aa11…</code> — the content hash of the manifest. Immutable by construction; two images with the same digest are byte-identical (<a href="../lessons/d05-multistage-builds.html">Day 5</a>: the manifest lists the layers, the layers are content-addressed too — <a href="../linux/l04-filesystems-overlayfs.html">L4</a>).</dd>
+<dt>Immutable tag</dt><dd>A tag you never move: the commit SHA (<code>api:9f2e1c3</code>), a build number, a semver you never republish. Your pipeline should <em>only</em> create these.</dd>
+<dt>Mutable tag</dt><dd><code>latest</code>, <code>main</code>, <code>stable</code> — a pointer that gets re-pointed. Convenient for humans, useless for a controller that decides whether anything changed by <em>comparing text</em>.</dd>
+</dl>
+<div class="callout connect" data-ref="d10,d22"><p>Two facts from the course explain every "<em>I pushed a new image and nothing happened</em>" ticket. (1) A Deployment starts a rollout only when its <strong>Pod template changes</strong>; if the template still says <code>api:latest</code>, nothing changed as far as the Deployment is concerned. (2) The kubelet's <code>imagePullPolicy</code> defaults to <code>IfNotPresent</code> for any tag except <code>:latest</code>, so even a restarted Pod may run the <em>cached</em> old image on one node and the new one on another. Immutable tags fix both: the text changes, the rollout happens, every node pulls exactly that image.</p></div>
+<pre><code class="lang-bash">$ TAG=$(git rev-parse --short HEAD)                              # 9f2e1c3 — the commit is the version
+$ docker build -t ghcr.io/acme/api:$TAG . && docker push ghcr.io/acme/api:$TAG
+$ docker buildx imagetools inspect ghcr.io/acme/api:$TAG | grep Digest   # sha256:aa11… — pin this if you want to be paranoid
+$ kubectl set image deploy/api api=ghcr.io/acme/api:$TAG           # template changed → new ReplicaSet → rolling update (Day 10)
+$ kubectl rollout status deploy/api --timeout=120s                 # exit 1 on failure → the pipeline goes red</code></pre>
+
+<h2>Environments and promotion</h2>
+<p>You do not build a separate image for staging and production. You build <strong>one image</strong> and run it with <strong>different configuration</strong>: replica counts, resource limits, hostnames, feature flags, database URLs. The image moves — is <em>promoted</em> — through environments; the config stays put in each.</p>
+<div class="flow"><span>build once → api:9f2e1c3</span><i>→</i><span>dev (auto)</span><i>→</i><span>staging (auto + smoke tests)</span><i>→</i><span>prod (approval)</span></div>
+<div class="callout connect" data-ref="d28,d42,d43"><p>"Same image, different config" is exactly what <a href="../lessons/d42-kustomize.html">Kustomize overlays</a> and <a href="../lessons/d43-helm.html">Helm values files</a> are for, and why config lives in <a href="../lessons/d28-configmaps-secrets.html">ConfigMaps and Secrets</a> instead of being baked into the image. A promotion is literally "change the image tag in <code>overlays/prod</code>" — one line, one commit, one review. That commit is what CD reacts to.</p></div>
+<div class="file-tree">config-repo/
+├── base/                     # Deployment, Service, Ingress — no environment specifics
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── kustomization.yaml
+└── overlays/
+    ├── dev/kustomization.yaml       # images: [{name: ghcr.io/acme/api, newTag: 9f2e1c3}]  replicas: 1
+    ├── staging/kustomization.yaml   #                                  newTag: 9f2e1c3   replicas: 2
+    └── prod/kustomization.yaml      #                                  newTag: 4b7d0e9   replicas: 6 (not promoted yet)</div>
+
+<h2>Push or pull?</h2>
+<p>Once CI has a verified image, <em>something</em> has to change the cluster. There are only two shapes:</p>
+<div class="compare">
+<div><h4>Push (CI deploys)</h4><p>The pipeline holds cluster credentials and runs <code>kubectl apply</code> / <code>helm upgrade</code> at the end. Simple, immediate, and what most teams start with. Costs: every CI system becomes a cluster admin; nothing notices if someone changes the cluster by hand afterwards; N clusters means N sets of credentials in CI.</p><p class="muted"><small>Covered in <a href="c03-github-actions-kubernetes.html">C3</a> (GitHub Actions) and <a href="c05-jenkins-on-kubernetes.html">C5</a> (Jenkins).</small></p></div>
+<div><h4>Pull (GitOps)</h4><p>CI only writes the new tag into a git repo. A controller <em>inside</em> the cluster watches that repo and applies whatever it says — continuously, reverting drift. CI has no cluster access; the cluster has read-only git access. Costs: one more component to run, and a mental shift: "deploy" means "merge".</p><p class="muted"><small>Covered in <a href="c06-gitops-principles.html">C6</a> onwards (Argo CD).</small></p></div>
+</div>
+<div class="callout mental"><p>Pull-based CD is the <strong>reconcile loop</strong> from <a href="../lessons/d07-architecture.html">Day 7</a> with one substitution: the desired state lives in git instead of in etcd. You already know how this controller behaves — it is the same loop as a ReplicaSet, just with a different source of truth.</p></div>
+
+<h2>The landscape</h2>
+<div class="tbl-wrap"><table>
+<thead><tr><th>Tool</th><th>Job</th><th>Runs where</th><th>Shape</th><th>In this track</th></tr></thead>
+<tbody>
+<tr><td><strong>GitHub Actions</strong></td><td>CI (+ push CD)</td><td>GitHub-hosted VMs or your runners</td><td>YAML workflows in the repo, marketplace of actions</td><td><a href="c02-github-actions.html">C2</a>, <a href="c03-github-actions-kubernetes.html">C3</a></td></tr>
+<tr><td><strong>Jenkins</strong></td><td>CI (+ push CD)</td><td>Your servers or your cluster</td><td>A controller + agents, Jenkinsfile (Groovy), plugins</td><td><a href="c04-jenkins.html">C4</a>, <a href="c05-jenkins-on-kubernetes.html">C5</a></td></tr>
+<tr><td>GitLab CI, CircleCI, Tekton, Argo Workflows</td><td>CI</td><td>Various; Tekton/Argo Workflows run as Kubernetes CRDs</td><td>Same concepts, different YAML</td><td>Mapped by analogy</td></tr>
+<tr><td><strong>Argo CD</strong></td><td>Pull CD (GitOps)</td><td>In the cluster</td><td>Controller + CRDs (<code>Application</code>), UI, CLI</td><td><a href="c07-argocd-architecture.html">C7</a>–<a href="c09-argocd-scale.html">C9</a></td></tr>
+<tr><td>Flux</td><td>Pull CD (GitOps)</td><td>In the cluster</td><td>Controllers + CRDs (<code>Kustomization</code>, <code>HelmRelease</code>), no UI</td><td>Mentioned in <a href="c06-gitops-principles.html">C6</a></td></tr>
+<tr><td>Argo Rollouts, Flagger</td><td>Progressive delivery</td><td>In the cluster</td><td>Canary / blue-green as a CRD replacing Deployment</td><td><a href="c09-argocd-scale.html">C9</a></td></tr>
+</tbody></table></div>
+
+<div class="lab"><h3>Hands-on lab (20 min) — a pipeline by hand, so you know what the tools automate</h3>
+<p>You need a <a href="../lessons/d08-kind-cluster.html">KIND cluster</a> and Docker. We use <code>ttl.sh</code>, an anonymous registry where images expire (the tag is the TTL) — no login needed.</p>
+<pre><code class="lang-bash">$ mkdir ci-lab && cd ci-lab && git init -q
+$ cat &gt; app.sh &lt;&lt;'EOF'
+#!/bin/sh
+echo "version: $(cat /VERSION)"; exec python3 -m http.server 8080
+EOF
+$ cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-alpine
+ARG VERSION=dev
+RUN echo "$VERSION" &gt; /VERSION
+COPY app.sh /app.sh
+CMD ["sh", "/app.sh"]
+EOF
+$ cat &gt; test.sh &lt;&lt;'EOF'
+#!/bin/sh
+set -eu
+grep -q 'http.server' app.sh          # a "test": fails with exit 1 if the line is missing
+echo "tests passed"
+EOF
+$ git add -A && git commit -qm "initial" </code></pre>
+<pre data-title="ci.sh — the whole pipeline as a script"><code class="lang-bash">$ REPO=ttl.sh/$(uuidgen | tr A-Z a-z)          # your private throwaway repo name
+$ cat &gt; ci.sh &lt;&lt;EOF
+#!/bin/bash
+set -euo pipefail                               # any failing command fails the pipeline
+TAG=\$(git rev-parse --short HEAD)               # stage 0: the version IS the commit
+echo "== test";  sh test.sh                      # stage 1: exit code decides
+echo "== build"; docker build --build-arg VERSION=\$TAG -t $REPO:\$TAG .    # stage 2: immutable tag
+echo "== push";  docker push $REPO:\$TAG          # stage 3: artifact leaves the runner
+echo "== deploy"; kubectl set image deploy/lab lab=$REPO:\$TAG   # stage 4: only the template changes
+kubectl rollout status deploy/lab --timeout=90s  # stage 5: red if the rollout does not finish
+EOF
+$ kubectl create deploy lab --image=$REPO:bootstrap --port=8080 2&gt;/dev/null || true    # first ever "release" will fail to pull; that's fine
+$ bash ci.sh                                    # run the pipeline
+$ kubectl get deploy lab -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+$ kubectl logs deploy/lab | head -1             # version: &lt;commit&gt;</code></pre>
+<p>Now break it and watch the pipeline protect the cluster:</p>
+<pre><code class="lang-bash">$ sed -i 's/http.server/http.serve/' app.sh && git commit -qam "typo"
+$ bash ci.sh; echo "exit=$?"                    # "== test" then exit=1: build, push, deploy never ran
+$ git revert --no-edit HEAD && bash ci.sh       # rollback is a commit; the pipeline redeploys the old code with a NEW immutable tag
+$ kubectl rollout history deploy/lab            # every run = one revision (Day 10)</code></pre>
+<p>Everything in the next nine pages is this script — with a runner instead of your laptop, a trigger instead of <code>bash ci.sh</code>, secrets instead of your Docker login, and (from C6) a controller doing the last two stages instead of the script.</p></div>
+
+<details class="quiz"><summary>Your Deployment says <code>image: api:latest</code>. CI pushed a new <code>latest</code>. <code>kubectl get pods</code> shows the same Pods, unchanged. Why, and what are two ways to force the new version?</summary><div><p>The Pod template did not change (the string <code>api:latest</code> is identical), so the Deployment controller has nothing to reconcile (<a href="../lessons/d10-replicasets-deployments.html">Day 10</a>). Quick hacks: <code>kubectl rollout restart deploy/api</code> (adds a restart annotation to the template) with <code>imagePullPolicy: Always</code> so every node re-pulls. The real fix: tag with the commit SHA and change the template.</p></div></details>
+<details class="quiz"><summary>Your team wants to "deploy to prod from CI in one click". Is that Continuous Delivery or Continuous Deployment? What credential does the CI system need in a push model, and what is the pull-model alternative?</summary><div><p>Delivery (a human presses the button). In a push model CI holds a kubeconfig/token with write access to prod — ideally a dedicated ServiceAccount bound to a narrow Role (<a href="../lessons/d36-rbac.html">Day 36</a>, <a href="../lessons/d37-service-accounts.html">Day 37</a>). In a pull model CI only needs write access to the config repo; Argo CD inside the cluster applies the change.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>CI = every commit built and tested the same way on a clean runner; CD = a rehearsed, automated path from a verified artifact to an environment.</li>
+<li>A pipeline stage is a shell script; its exit code is the verdict. Debug pipelines like you debug shell scripts.</li>
+<li>The artifact is the image. Tag it immutably (commit SHA); a Deployment only rolls when its template <em>text</em> changes.</li>
+<li>Build once, promote through environments by changing config (overlays/values), never by rebuilding.</li>
+<li>Push CD gives CI cluster credentials; pull CD (GitOps) puts a reconciling controller in the cluster and gives CI only git access.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- pipeline-flow ---------- */
+  let svg = S.icon('dev', 40, 82, 'user', { label: 'developer', ly: 28 })
+    + S.box('git', 95, 55, 110, 50, ['app repo', 'git push'], { subfs: 9, subcls: 'mono muted' })
+    + S.zone('ci', 240, 28, 330, 104, 'CI  ·  runner')
+    + S.box('lint', 255, 62, 64, 40, ['lint'], { fs: 11 })
+    + S.box('test', 331, 62, 64, 40, ['test'], { fs: 11 })
+    + S.box('build', 407, 62, 64, 40, ['build'], { fs: 11 })
+    + S.box('push', 483, 62, 72, 40, ['push'], { fs: 11 })
+    + S.box('reg', 605, 55, 140, 50, ['registry', 'api:9f2e1c3'], { subfs: 9, subcls: 'mono muted' })
+    + S.zone('cd', 240, 168, 330, 76, 'CD')
+    + S.box('dep', 255, 192, 140, 40, ['update manifest', 'image: api:9f2e1c3'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('roll', 415, 192, 140, 40, ['rolling update', 'Deployment → new RS'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.node('cl', 605, 150, 140, 130, 'cluster')
+    + S.pod('p1', 640, 215, 'api', { cls: 'ok', w: 54, sub: '4b7d0e9' })
+    + S.pod('p2', 710, 215, 'api', { cls: 'ok', w: 54, sub: '4b7d0e9' })
+    + S.arrow('a1', 62, 80, 93, 80)
+    + S.arrow('a2', 205, 80, 253, 80, { label: 'webhook', ly: 70 })
+    + S.arrow('a3', 555, 82, 603, 82)
+    + S.arrow('a4', 519, 102, 325, 190, { d: 'M 519 102 L 519 150 L 325 150 L 325 190', cls: 'hid', label: 'tag', lx: 430, ly: 145 })
+    + S.arrow('a5', 395, 212, 413, 212, { cls: 'hid' })
+    + S.arrow('a6', 555, 212, 603, 212, { cls: 'hid', label: 'apply', ly: 232 })
+    + S.arrow('a7', 675, 150, 675, 107, { cls: 'hid dashed', label: 'pull', lx: 700, ly: 132 })
+    + S.text('m', 380, 272, '', { cls: 'sm b' });
+  Anim.define('pipeline-flow', { w: 760, h: 285, title: 'A pipeline run, stage by stage', ms: 2400, svg, steps: [
+    { c: 'A developer pushes commit <code>9f2e1c3</code>. Nothing else is required of them.', on(q){ q('#a1').set('hl'); q('#git rect').set('hl'); q('#m').text('trigger: push to main'); } },
+    { c: 'The git host calls the CI system (webhook). CI allocates a <b>runner</b> — a fresh machine or container — clones the repo at that commit and starts the first stage.', on(q){ q('#a2').set('hl'); q('#ci rect').set('hl'); q('#lint rect').set('hl'); q('#m').text('runner: clone, checkout 9f2e1c3'); } },
+    { c: 'Stages run in order. Each is a shell script; exit code 0 means "next".', on(q){ q('#lint rect').set('ok'); q('#test rect').set('hl'); } },
+    { c: 'Suppose the tests fail (exit 1). The run stops. <b>Nothing was built, nothing was pushed, the cluster never heard about this commit.</b>', on(q){ q('#test rect').set('bad'); q('#m').text('exit=1 → run failed · notify · stop'); } },
+    { c: 'The developer fixes and pushes again. New run, new runner. This time tests pass and <b>build</b> produces an image tagged with the commit SHA.', on(q){ q('#test rect').set('ok'); q('#build rect').set('hl'); q('#m').text('docker build -t api:9f2e1c3'); } },
+    { c: '<b>push</b> uploads it to the registry. The artifact now exists outside the runner; the runner can be thrown away.', on(q){ q('#build rect').set('ok'); q('#push rect').set('ok'); q('#a3').set('ok'); q('#reg rect').set('warn'); q('#m').text('registry has api:9f2e1c3'); } },
+    { c: 'CD begins: the <b>only</b> thing that changes is the image tag in the manifest.', on(q){ q('#a4').show().set('hl'); q('#dep rect').set('hl'); q('#m').text('kustomize edit set image … / kubectl set image …'); } },
+    { c: 'The Deployment sees a new Pod template and does what Day 10 taught: a new ReplicaSet, a rolling update; kubelets pull the tag from the registry.', on(q){ q('#a5,#a6').show().set('ok'); q('#roll rect').set('hl'); q('#a7').show(); q('#p1 rect,#p2 rect').set('warn'); q('#p1 text:nth-of-type(2),#p2 text:nth-of-type(2)').text('9f2e1c3'); q('#m').text('rollout in progress'); } },
+    { c: '<code>rollout status</code> returns 0 once every replica is Ready (probes, Day 23). The run is green. Same image, same steps, every time.', on(q){ q('#p1 rect,#p2 rect').set('ok'); q('#roll rect').set('ok'); q('#m').text('exit=0 · api:9f2e1c3 is live'); } },
+  ]});
+
+  /* ---------- tag-immutability ---------- */
+  svg = S.zone('regz', 15, 15, 330, 255, 'registry: ghcr.io/acme/api')
+    + S.box('img1', 30, 60, 130, 44, ['digest', 'sha256:aa11…'], { subfs: 10, subcls: 'mono muted', cls: 'soft' })
+    + S.box('img2', 30, 150, 130, 44, ['digest', 'sha256:bb22…'], { subfs: 10, subcls: 'mono muted', cls: 'soft', hidden: true })
+    + S.pod('tl', 265, 60, ':latest', { cls: 'warn', w: 70 })
+    + S.pod('t1', 265, 110, ':9f2e1c3', { cls: 'ok', w: 70 })
+    + S.pod('t2', 265, 200, ':e4d5c6b', { cls: 'ok', w: 70, hidden: true })
+    + S.arrow('al', 230, 60, 162, 75, { d: 'M 230 62 L 162 76', cls: 'warn' })
+    + S.arrow('a1', 230, 110, 162, 88, { d: 'M 230 110 L 162 88', cls: 'ok' })
+    + S.arrow('a2', 230, 200, 162, 178, { d: 'M 230 200 L 162 178', cls: 'hid ok' })
+    + S.zone('clz', 375, 15, 330, 255, 'cluster')
+    + S.box('dep', 395, 50, 200, 50, ['Deployment api', 'image: api:latest'], { subfs: 10, subcls: 'mono' })
+    + S.pod('p1', 430, 165, 'pod', { cls: 'ok', w: 60, sub: 'runs aa11…' })
+    + S.pod('p2', 520, 165, 'pod', { cls: 'ok', w: 60, sub: 'runs aa11…' })
+    + S.text('kl', 620, 160, ['kubelet', 'IfNotPresent'], { cls: 'xs muted', fs: 9.5 })
+    + S.text('m', 540, 250, 'two names for one image', { cls: 'sm b' });
+  Anim.define('tag-immutability', { w: 720, h: 285, title: 'Why :latest breaks CD', ms: 2600, svg, steps: [
+    { c: 'An image is really a <b>digest</b>. Tags are pointers to digests. Here <code>:latest</code> (mutable) and <code>:9f2e1c3</code> (the commit, immutable) both point at <code>aa11…</code>. The Deployment references <code>:latest</code>; both Pods run <code>aa11…</code>.', on(q){} },
+    { c: 'CI builds a new commit and pushes. A new digest <code>bb22…</code> appears; <code>:latest</code> is <b>re-pointed</b> to it and a new immutable tag <code>:e4d5c6b</code> is created. <code>:9f2e1c3</code> still points where it always did.', on(q){ q('#img2').show(); q('#t2').show(); q('#a2').show(); q('#al').attr('d', 'M 230 66 L 162 165'); q('#m').text(':latest moved · :9f2e1c3 did not'); } },
+    { c: 'The Deployment still says <code>image: api:latest</code>. Its Pod template is <b>byte-for-byte unchanged</b>, so the Deployment controller does nothing. No new ReplicaSet, no rollout, old Pods keep running <code>aa11…</code>.', on(q){ q('#dep rect').set('warn'); q('#m').text('template unchanged → no rollout'); } },
+    { c: 'Someone deletes a Pod to "force it". The new Pod lands on a node that has <code>aa11…</code> cached; <code>IfNotPresent</code> means it runs the old image. Another node pulls fresh and gets <code>bb22…</code>. Now prod runs <b>two versions at once</b> and nobody can tell from the manifest.', on(q){ q('#p2 rect').set('bad'); q('#p2 text:nth-of-type(2)').text('runs bb22…'); q('#m').text('mixed versions, invisible in YAML'); } },
+    { c: 'The fix is naming. CD sets <code>image: api:e4d5c6b</code>. The template text changed → new ReplicaSet → every Pod is replaced and every node pulls exactly <code>bb22…</code>. Rollback is <code>image: api:9f2e1c3</code>, which can never mean anything else.', on(q){ q('#dep rect').set('ok'); q('#dep text:nth-of-type(2)').text('image: api:e4d5c6b'); q('#p1 rect,#p2 rect').set('ok'); q('#p1 text:nth-of-type(2),#p2 text:nth-of-type(2)').text('runs bb22…'); q('#tl rect').set('dim'); q('#m').text('immutable tag → deterministic rollout'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

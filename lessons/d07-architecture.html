@@ -149,7 +149,7 @@ $ docker exec kind-control-plane ls /etc/kubernetes/manifests   # KIND: static p
     + S.box('api2', 250, 40, 190, 44, ['kube-apiserver'], { fs: 12 })
     + S.box('etcd2', 540, 40, 130, 44, ['etcd'], { fs: 12 })
     + S.box('sched2', 40, 100, 160, 40, ['scheduler'], { fs: 11 })
-    + S.box('cm2', 250, 100, 190, 40, ['controller-manager', 'Deployment · ReplicaSet ctrls'], { subfs: 8, subcls: 'muted' })
+    + S.box('cm2', 250, 100, 190, 40, ['controller-manager', 'Deployment · ReplicaSet ctrls'], { subfs: 9, subcls: 'muted' })
     + S.icon('kc2', 110, 55, 'laptop', { label: 'kubectl apply -f deploy.yaml', ly: 28 })
     + S.arrow('f1', 140, 62, 248, 62, { cls: 'hid' })
     + S.arrow('f2', 440, 62, 538, 62, { cls: 'hid' })

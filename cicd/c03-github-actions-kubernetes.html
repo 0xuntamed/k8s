@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C3 · GitHub Actions → Kubernetes: Build, Push, Deploy & OIDC · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c03" data-root="../" data-linux="l04,l06,l09" data-related="d05,d10,d23,d32,d36,d37,d40,d45,c02">
+<article class="lesson">
+<p class="lead">C2 gave you a workflow that builds and tests. This page finishes the push-style pipeline: build the image <em>properly</em> (BuildKit, layer cache, immutable tags), push it to a registry the cluster can pull from, and deploy it — first with a kubeconfig stored as a secret, then the modern way with OIDC so no long-lived credential exists anywhere. It ends with runners <em>inside</em> the cluster, and with the reasons push-based deploys eventually make teams reach for GitOps.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li><code>docker/build-push-action</code>: BuildKit, <code>type=gha</code> cache, multi-arch, metadata tags</li>
+<li>Pushing to GHCR with <code>GITHUB_TOKEN</code>; making private images pullable (<code>imagePullSecrets</code>)</li>
+<li>Deploying with kubectl/Helm from a job: the ServiceAccount + RBAC you should create for CI</li>
+<li>OIDC federation: how a job gets cloud credentials with no stored secret</li>
+<li>Gating with environments; failing the job on a bad rollout; automatic undo</li>
+<li>actions-runner-controller: ephemeral runner Pods in your cluster</li>
+<li>Why push deploys drift, and what comes next</li>
+</ul></div>
+
+<h2>Build and push, properly</h2>
+<pre><code class="lang-yaml">jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }     # packages:write → push to ghcr.io/&lt;owner&gt;/…
+    outputs: { tag: ${{ steps.meta.outputs.version }}, digest: ${{ steps.push.outputs.digest }} }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3                 # only for multi-arch (arm64 on an amd64 runner)
+      - uses: docker/setup-buildx-action@v3               # BuildKit builder with cache export support
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=,format=short          # 9f2e1c3  ← the immutable tag CD will use
+            type=ref,event=branch                  # main     ← convenience, mutable
+            type=semver,pattern={{version}}        # 1.4.2 on a v1.4.2 tag
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}    # PRs: build only
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false</code></pre>
+<dl class="kv">
+<dt>buildx / BuildKit</dt><dd>The modern builder: parallel stages, better caching, cache export/import, multi-platform manifests. <code>docker build</code> already uses BuildKit; <code>setup-buildx-action</code> gives you a builder that can export cache to external stores.</dd>
+<dt><code>type=gha</code> cache</dt><dd>Layers are stored in GitHub's Actions cache between runs. Second build of an unchanged <code>npm ci</code> layer is a cache hit even though the VM is brand new. <code>mode=max</code> caches intermediate stages of a multi-stage build too.</dd>
+<dt>metadata-action</dt><dd>Computes tags/labels from the event: the short SHA, the branch, semver from a git tag. Put the SHA first — it is what you will write into manifests.</dd>
+<dt><code>digest</code> output</dt><dd>The content hash of what was pushed. Pin it in manifests (<code>image: ghcr.io/acme/api@sha256:…</code>) for supply-chain strictness; the tag is for humans.</dd>
+</dl>
+<div class="callout linux" data-ref="l04"><p>A cache hit is a cache hit on <strong>layers</strong> — the OverlayFS lowerdirs from <a href="../linux/l04-filesystems-overlayfs.html">L4</a>. BuildKit hashes each instruction plus its inputs (the files a <code>COPY</code> touches, the previous layer); an identical hash means it can reuse the stored tarball instead of running the command. This is why the Dockerfile order from <a href="../lessons/d05-multistage-builds.html">Day 5</a> matters more in CI than on a laptop: put <code>COPY package*.json</code> + <code>RUN npm ci</code> <em>before</em> <code>COPY . .</code>, and a source-only change never reinstalls dependencies.</p></div>
+
+<h3>Can the cluster pull it?</h3>
+<p>Images pushed to GHCR under a private repo are private. The kubelet needs credentials: a <code>kubernetes.io/dockerconfigjson</code> Secret referenced by <code>imagePullSecrets</code> (or attached to the ServiceAccount) — exactly <a href="../lessons/d45-image-pull-secrets.html">Day 45</a>. Use a fine-grained PAT with <code>read:packages</code>, not your account password, and rotate it.</p>
+<pre><code class="lang-bash">$ kubectl create secret docker-registry ghcr --docker-server=ghcr.io --docker-username=acme-bot --docker-password=$GHCR_READ_TOKEN -n shop
+$ kubectl patch sa default -n shop -p '{"imagePullSecrets":[{"name":"ghcr"}]}'     # every Pod in the ns can pull</code></pre>
+
+<h2>Deploying from a job — option A: a kubeconfig secret</h2>
+<p>The simplest push deploy: give the job a kubeconfig and run <code>kubectl</code>. Do it with a purpose-built identity, not a copy of your admin config.</p>
+<pre><code class="lang-yaml"># in the cluster: an identity for CI that can only update Deployments in one namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ci-deployer, namespace: shop }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: deployer, namespace: shop }
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]              # needed by rollout status / undo
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: ci-deployer, namespace: shop }
+roleRef: { kind: Role, name: deployer, apiGroup: rbac.authorization.k8s.io }
+subjects: [{ kind: ServiceAccount, name: ci-deployer, namespace: shop }]</code></pre>
+<pre><code class="lang-bash">$ TOKEN=$(kubectl -n shop create token ci-deployer --duration=8760h)          # bound token, 1 year (Day 37); rotate it
+$ CA=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+$ SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+$ cat &gt; ci-kubeconfig &lt;&lt;EOF
+apiVersion: v1
+kind: Config
+clusters: [{name: prod, cluster: {server: $SERVER, certificate-authority-data: $CA}}]
+users: [{name: ci-deployer, user: {token: $TOKEN}}]
+contexts: [{name: prod, context: {cluster: prod, user: ci-deployer, namespace: shop}}]
+current-context: prod
+EOF
+$ kubectl --kubeconfig ci-kubeconfig auth can-i patch deploy -n shop       # yes
+$ kubectl --kubeconfig ci-kubeconfig auth can-i delete secret -n shop      # no — good
+$ gh secret set KUBECONFIG_PROD --env production &lt; ci-kubeconfig</code></pre>
+<div class="callout connect" data-ref="d32,d36,d37"><p>That kubeconfig is the one from <a href="../lessons/d32-tls-part2-kubeconfig.html">Day 32</a> minus the client certificate: a cluster (server + CA), a user (a bearer token), a context. The token is a projected ServiceAccount token (<a href="../lessons/d37-service-accounts.html">Day 37</a>), the API server authenticates it, and the Role from <a href="../lessons/d36-rbac.html">Day 36</a> limits what it can do. <code>auth can-i</code> is your unit test for CI permissions.</p></div>
+<pre><code class="lang-yaml">  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/kubeconfig"
+          printf '%s' "$KUBECONFIG_B64" | base64 -d &gt; "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" &gt;&gt; "$GITHUB_ENV"
+        env: { KUBECONFIG_B64: ${{ secrets.KUBECONFIG_PROD }} }
+      - run: kubectl set image deploy/api api=ghcr.io/${{ github.repository }}:${{ needs.build.outputs.tag }}
+      - run: kubectl rollout status deploy/api --timeout=180s          # exit 1 → job fails
+      - if: failure()
+        run: kubectl rollout undo deploy/api                            # automatic rollback (Day 10)</code></pre>
+<figure data-anim="push-deploy"></figure>
+<div class="callout warn"><p><strong>Reachability.</strong> A GitHub-hosted runner is on the public internet; your API server must be reachable from it (public endpoint + an allowlist of GitHub's IP ranges, or a bastion). If the cluster is private, you need a <strong>self-hosted runner</strong> inside the network — see actions-runner-controller below.</p></div>
+<h3>With Helm or Kustomize instead of <code>set image</code></h3>
+<pre><code class="lang-bash">$ helm upgrade --install api ./chart -n shop --set image.tag=$TAG --wait --timeout 3m --atomic   # --atomic rolls back on failure
+$ cd overlays/prod && kustomize edit set image ghcr.io/acme/api=ghcr.io/acme/api:$TAG && kubectl apply -k . && kubectl rollout status deploy/api</code></pre>
+<p><code>helm --wait --atomic</code> does the rollout-status-and-undo dance for you. Notice that <code>kustomize edit set image</code> modifies a <em>file in git</em> — if you commit it instead of applying it, you have just built the handoff GitOps uses (<a href="c06-gitops-principles.html">C6</a>).</p>
+
+<h2>Deploying from a job — option B: OIDC, no stored secret</h2>
+<p>A stored kubeconfig is a long-lived credential sitting in GitHub. With managed clusters (EKS, GKE, AKS) you can avoid it entirely: the job proves <em>who it is</em> with a short-lived token that GitHub signs, and the cloud exchanges that for temporary credentials mapped to a role. Nothing to leak, nothing to rotate.</p>
+<figure data-anim="oidc-flow"></figure>
+<pre><code class="lang-yaml">  deploy:
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }      # lets the job request an OIDC token
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-deploy-shop
+          aws-region: eu-west-1
+      - run: aws eks update-kubeconfig --name prod --region eu-west-1   # writes a kubeconfig whose user is an exec plugin
+      - run: kubectl set image deploy/api api=… && kubectl rollout status deploy/api --timeout=180s</code></pre>
+<pre data-title="IAM role trust policy — who may assume it"><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:acme/api:environment:production" }
+    }
+  }]
+}</code></pre>
+<dl class="kv">
+<dt><code>sub</code> claim</dt><dd>Identifies the workflow run: <code>repo:acme/api:ref:refs/heads/main</code>, or <code>repo:acme/api:environment:production</code> when the job uses an environment. The trust policy pins it — a fork or another branch cannot assume the role.</dd>
+<dt><code>aud</code> claim</dt><dd>Who the token is for (<code>sts.amazonaws.com</code>); prevents replaying a token meant for one cloud at another.</dd>
+<dt>Mapping into Kubernetes</dt><dd>EKS <em>access entries</em> (or the legacy <code>aws-auth</code> ConfigMap) map the IAM role to a Kubernetes group; a RoleBinding gives that group the <code>deployer</code> Role. GKE uses Workload Identity Federation + IAM roles; AKS uses federated credentials on a managed identity + Azure RBAC. Same three hops everywhere: <em>GitHub identity → cloud identity → Kubernetes RBAC</em>.</dd>
+</dl>
+<div class="callout connect" data-ref="d31,d37,l09"><p>An OIDC token is a JWT: a signed statement of claims. The cloud verifies the signature with GitHub's published public keys (a JWKS at a well-known URL) — the same "trust the signer's public key" idea as certificates in <a href="../lessons/d31-tls-part1.html">Day 31</a>. Kubernetes uses the identical mechanism inside the cluster: projected ServiceAccount tokens (<a href="../lessons/d37-service-accounts.html">Day 37</a>) are OIDC JWTs signed by the API server, and cloud IAM can trust <em>those</em> too (IRSA / Workload Identity) — the reverse direction of this page.</p></div>
+
+<h2>Runners inside the cluster: actions-runner-controller</h2>
+<p><strong>ARC</strong> is a Kubernetes controller (with CRDs — <a href="../lessons/d40-operators.html">Day 40</a>) that listens to GitHub's job queue and creates one <em>ephemeral</em> runner Pod per job. The Pod registers, runs one job, and is deleted. You get self-hosted runners that scale to zero, sit inside your network (private clusters, internal registries), and are clean every time.</p>
+<pre><code class="lang-bash">$ helm install arc --namespace arc-systems --create-namespace oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+$ helm install arc-runners --namespace arc-runners --create-namespace \
+    --set githubConfigUrl=https://github.com/acme \
+    --set githubConfigSecret.github_token=$GH_PAT \
+    --set minRunners=0 --set maxRunners=10 \
+    oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+$ kubectl -n arc-runners get autoscalingrunnersets,ephemeralrunners      # the CRDs doing the work</code></pre>
+<pre><code class="lang-yaml">jobs:
+  build:
+    runs-on: arc-runners          # the scale set's name is the label</code></pre>
+<div class="callout linux" data-ref="l06,l02"><p>Building images <em>inside</em> a runner Pod hits the wall from <a href="../lessons/d41-pod-security.html">Day 41</a>: <code>docker build</code> needs a Docker daemon, and a daemon needs <code>privileged</code> (it creates namespaces, mounts overlays, writes iptables — <a href="../linux/l06-users-capabilities.html">L6</a>). ARC's <code>containerMode: dind</code> runs a privileged sidecar for exactly that, which is a big grant. The rootless alternatives — <strong>kaniko</strong>, <strong>BuildKit rootless</strong>, <strong>buildah</strong> — execute the Dockerfile in user space and push layers directly to the registry with no daemon at all. <a href="c05-jenkins-on-kubernetes.html">C5</a> goes through kaniko in detail; the same Pod works as a GitHub runner.</p></div>
+
+<h2>Why push deploys eventually hurt</h2>
+<ul>
+<li><strong>Credentials fan out.</strong> Every CI system, every environment, every cluster: a token in a secret store, each one an admin-ish key living outside the cluster. OIDC helps, but only on managed clouds.</li>
+<li><strong>No reconciliation.</strong> The job runs once. If someone <code>kubectl edit</code>s the Deployment afterwards, or a node fails and a manual fix is applied, the cluster silently diverges from what CI last pushed. Nothing notices until the next deploy overwrites it (or does not).</li>
+<li><strong>Git is not the truth.</strong> The pipeline computed the manifest and applied it; the resulting state exists only in etcd. To know what is running you ask the cluster, not the repo.</li>
+<li><strong>Multi-cluster is N pipelines.</strong> Or one pipeline with N secrets and N sequential steps.</li>
+</ul>
+<p>The pull model fixes all four at once by moving the last step into the cluster: <a href="c06-gitops-principles.html">C6</a>.</p>
+
+<div class="lab"><h3>Hands-on lab (30 min) — deploy to your KIND cluster from a real workflow</h3>
+<p>Hosted runners cannot reach a cluster on your laptop, so you will run a <strong>self-hosted runner</strong> locally — which also demystifies what a runner is.</p>
+<ol class="steps">
+<li><strong>Register a runner</strong>: repo → Settings → Actions → Runners → New self-hosted runner. Follow the commands: download, <code>./config.sh --url … --token … --ephemeral</code>, then <code>./run.sh</code> in a terminal. Watch it appear as <em>Idle</em>.</li>
+<li><strong>Create the CI identity</strong> in the cluster: apply the ServiceAccount/Role/RoleBinding above (namespace <code>shop</code>), create <code>deploy/api</code> with any image (<code>kubectl create deploy api --image=nginx:1.26 -n shop</code>), build the kubeconfig with <code>create token</code>, and check it with <code>auth can-i</code>.</li>
+<li><strong>Workflow</strong>: <code>runs-on: self-hosted</code>; steps: checkout, <code>docker build -t api:${GITHUB_SHA::7} .</code>, <code>kind load docker-image api:${GITHUB_SHA::7}</code> (instead of a registry), then the kubeconfig + <code>set image</code> + <code>rollout status</code> + <code>if: failure()</code> undo steps from this page. Store the kubeconfig as a repo secret with <code>gh secret set</code>.</li>
+<li><strong>Push</strong> and watch <code>gh run watch</code> and, in another terminal, <code>kubectl get rs -n shop -w</code> — a new ReplicaSet scales up while the old scales down (<a href="../lessons/d10-replicasets-deployments.html">Day 10</a>).</li>
+<li><strong>Break the rollout</strong>: change the Dockerfile's <code>CMD</code> to <code>["false"]</code>, push, and watch: CrashLoopBackOff → <code>rollout status</code> times out → job fails → the undo step restores the previous ReplicaSet. Confirm with <code>kubectl rollout history deploy/api -n shop</code>.</li>
+<li><strong>Drift</strong>: <code>kubectl scale deploy/api --replicas=5 -n shop</code>. Nothing in GitHub notices. Remember this for C6.</li>
+</ol></div>
+
+<details class="quiz"><summary>Your deploy job fails with <code>error: You must be logged in to the server (Unauthorized)</code>. List three things to check, in order.</summary><div><p>(1) Is the kubeconfig actually there and selected — did the step that writes it run, is <code>KUBECONFIG</code> set via <code>$GITHUB_ENV</code>? (2) Has the ServiceAccount token expired (<code>create token --duration</code>) or was the SA deleted? Decode the JWT's <code>exp</code> with <code>cut -d. -f2 | base64 -d</code>. (3) With OIDC: does the trust policy's <code>sub</code> condition match this branch/environment, and does the job have <code>id-token: write</code>? A 403 <em>Forbidden</em> instead of 401 means authentication worked and RBAC said no.</p></div></details>
+<details class="quiz"><summary>Why should the CI Role not include <code>create</code> on Deployments or any verb on Secrets?</summary><div><p>Least privilege: CI updates the image of an existing Deployment; it should not be able to create arbitrary workloads (a compromised pipeline could run a crypto-miner) or read Secrets. If a job is compromised via a malicious action, the blast radius is "change the image tag of api in shop" — which is visible and revertible.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Build with buildx, cache layers with <code>type=gha</code>, tag with the short SHA, record the digest; push on merges, not on PRs.</li>
+<li>A private registry needs <code>imagePullSecrets</code> in the cluster — same as Day 45.</li>
+<li>Push deploys need an identity: a dedicated ServiceAccount + narrow Role, or OIDC federation into cloud IAM mapped to RBAC. Test with <code>auth can-i</code>.</li>
+<li><code>rollout status --timeout</code> turns a bad rollout into a red job; <code>if: failure()</code> + <code>rollout undo</code> (or <code>helm --atomic</code>) auto-reverts.</li>
+<li>ARC gives ephemeral runner Pods in-cluster; build images there rootlessly (kaniko/BuildKit), not with a privileged daemon.</li>
+<li>Push deploys do not reconcile and scatter credentials — the problem GitOps exists to solve.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- push-deploy ---------- */
+  let svg = S.zone('gh', 15, 15, 300, 120, 'GitHub Actions')
+    + S.box('bj', 30, 45, 125, 44, ['job: build', 'buildx → push'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.box('dj', 175, 45, 125, 44, ['job: deploy', 'kubectl set image'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('rs', 175, 95, 125, 30, ['rollout status'], { fs: 10, hidden: true })
+    + S.box('reg', 30, 165, 125, 44, ['ghcr.io', 'api:9f2e1c3'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.node('cl', 350, 15, 395, 255, 'cluster · namespace shop')
+    + S.box('dep', 370, 45, 160, 44, ['Deployment api', 'image: api:4b7d0e9'], { fs: 11, subfs: 9, subcls: 'mono' })
+    + S.box('rs1', 370, 110, 160, 30, ['RS old · 3/3'], { fs: 10, cls: 'ok' })
+    + S.box('rs2', 370, 150, 160, 30, ['RS new · 0/0'], { fs: 10, hidden: true })
+    + S.pod('p1', 575, 125, 'pod', { cls: 'ok', w: 46, h: 24 }) + S.pod('p2', 630, 125, 'pod', { cls: 'ok', w: 46, h: 24 }) + S.pod('p3', 685, 125, 'pod', { cls: 'ok', w: 46, h: 24 })
+    + S.pod('n1', 575, 165, 'pod', { cls: 'warn', w: 46, h: 24, hidden: true }) + S.pod('n2', 630, 165, 'pod', { cls: 'warn', w: 46, h: 24, hidden: true }) + S.pod('n3', 685, 165, 'pod', { cls: 'warn', w: 46, h: 24, hidden: true })
+    + S.text('probe', 640, 205, 'readiness probes gate each step', { cls: 'xs muted', fs: 9 })
+    + S.arrow('a1', 92, 89, 92, 163, { cls: 'hid', label: 'push', lx: 110, ly: 130 })
+    + S.arrow('a2', 155, 67, 173, 67, { cls: 'hid', label: 'needs', ly: 58 })
+    + S.arrow('a3', 300, 60, 368, 60, { cls: 'hid', label: 'PATCH /apis/apps/v1/…', lx: 335, ly: 40 })
+    + S.arrow('a4', 300, 110, 368, 110, { d: 'M 300 110 L 330 110 L 330 165 L 368 165', cls: 'hid dashed', label: 'watch', lx: 320, ly: 150 })
+    + S.arrow('a5', 550, 60, 575, 145, { d: 'M 555 89 L 555 160 L 573 160', cls: 'hid', label: 'pull', lx: 545, ly: 235 })
+    + S.text('m', 380, 262, '', { cls: 'sm b' });
+  const podsTo = (q, sel, cls, txt) => { q(sel).show(); q(sel + ' rect').set(cls); };
+  Anim.define('push-deploy', { w: 760, h: 285, title: 'A push-style deploy, and what fails it', ms: 2500, svg, steps: [
+    { c: 'The <b>build</b> job pushes <code>api:9f2e1c3</code> to GHCR and exposes the tag as a job output. The cluster is still running <code>4b7d0e9</code>.', on(q){ q('#bj rect').set('ok'); q('#a1').show().set('ok'); q('#reg rect').set('warn'); q('#m').text('artifact in registry'); } },
+    { c: 'The <b>deploy</b> job (after an environment approval, if configured) loads its kubeconfig and PATCHes the Deployment\'s image. One field changed.', on(q){ q('#a2').show(); q('#dj rect').set('hl'); q('#a3').show().set('hl'); q('#dep rect').set('hl'); q('#dep text:nth-of-type(2)').text('image: api:9f2e1c3'); q('#m').text('template changed → rollout begins'); } },
+    { c: 'The Deployment controller creates a new ReplicaSet and scales it up while scaling the old one down — Day 10\'s rolling update. The kubelet pulls the new tag with the namespace\'s <code>imagePullSecrets</code>.', on(q){ q('#rs2').show(); q('#rs2 rect').set('hl'); q('#rs2 text').text('RS new · 1/1'); q('#rs1 text').text('RS old · 2/2'); q('#a5').show(); q('#n1').show(); q('#p3').hide(); q('#m').text('maxSurge / maxUnavailable pace it'); } },
+    { c: 'Meanwhile the job runs <code>kubectl rollout status --timeout=180s</code>, which <b>watches</b> the Deployment and blocks until every new replica is Ready (readiness probe, Day 23) — or the deadline passes.', on(q){ q('#rs').show(); q('#rs rect').set('hl'); q('#a4').show(); q('#n1 rect').set('ok'); q('#n2').show(); q('#p2').hide(); q('#rs2 text').text('RS new · 2/2'); q('#rs1 text').text('RS old · 1/1'); q('#m').text('watching… 2 of 3 updated'); } },
+    { c: 'Happy path: all three new Pods pass readiness, old RS reaches 0, <code>rollout status</code> exits 0, the job is green.', on(q){ q('#n2 rect').set('ok'); q('#n3').show(); q('#n3 rect').set('ok'); q('#p1').hide(); q('#rs2 text').text('RS new · 3/3'); q('#rs2 rect').set('ok'); q('#rs1 text').text('RS old · 0/0'); q('#rs1 rect').set('dim'); q('#rs rect').set('ok'); q('#dj rect').set('ok'); q('#m').text('exit 0 · deployed 9f2e1c3'); } },
+    { c: 'Unhappy path (rewound): the new image crashes. The new Pod never becomes Ready, the rollout stalls at 1 of 3, <code>rollout status</code> hits the timeout and exits 1. The job fails and <code>if: failure()</code> runs <code>kubectl rollout undo</code>, which scales the old RS back up.', on(q){ q('#n1 rect,#n2 rect,#n3 rect').set('bad'); q('#n2,#n3').hide(); q('#p1,#p2').show(); q('#p3').hide(); q('#rs2 text').text('RS new · 0/1 CrashLoop'); q('#rs2 rect').set('bad'); q('#rs1 text').text('RS old · 2/2 → 3/3'); q('#rs1 rect').set('ok'); q('#rs rect').set('bad'); q('#dj rect').set('bad'); q('#dep text:nth-of-type(2)').text('image: api:4b7d0e9 (undone)'); q('#m').text('exit 1 → job red → rollout undo'); } },
+  ]});
+
+  /* ---------- oidc-flow ---------- */
+  svg = S.box('oidc', 15, 20, 190, 50, ['GitHub OIDC provider', 'token.actions.githubusercontent.com'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('job', 15, 115, 190, 54, ['deploy job on runner', 'permissions: id-token: write'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('sts', 320, 20, 175, 50, ['AWS STS', 'AssumeRoleWithWebIdentity'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('role', 320, 115, 175, 54, ['IAM role gha-deploy', 'trust: sub = repo:acme/api:…'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.box('eks', 575, 115, 170, 54, ['EKS API server', 'access entry → group → RBAC'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.pod('jwt', 258, 142, 'JWT', { cls: 'pur', w: 50, h: 24, hidden: true })
+    + S.pod('cred', 410, 95, 'temp creds', { cls: 'ok', w: 74, h: 22, hidden: true })
+    + S.arrow('a1', 110, 115, 110, 70, { cls: 'hid', label: 'give me a token', lx: 155, ly: 96 })
+    + S.arrow('a2', 205, 142, 318, 142, { cls: 'hid', label: 'JWT + role ARN', ly: 132 })
+    + S.arrow('a3', 407, 115, 407, 70, { cls: 'hid', label: 'verify sig (JWKS) + trust policy', lx: 470, ly: 96 })
+    + S.arrow('a4', 495, 142, 573, 142, { cls: 'hid', label: 'SigV4 → token', ly: 132 })
+    + S.term('claims', 15, 190, 480, 82, ['$ jwt decode $ACTIONS_ID_TOKEN', '  iss: https://token.actions.githubusercontent.com', '  sub: repo:acme/api:environment:production', '  aud: sts.amazonaws.com   exp: +10 min'], { fs: 10 })
+    + S.text('m', 620, 230, ['no long-lived secret', 'exists anywhere'], { cls: 'sm b', fs: 12 });
+  Anim.define('oidc-flow', { w: 760, h: 285, title: 'OIDC: a job proves who it is', ms: 2600, svg, steps: [
+    { c: 'The job has <code>permissions: id-token: write</code>. The runner asks GitHub\'s OIDC provider for an identity token for this specific run.', on(q){ q('#a1').show().set('hl'); q('#job rect').set('hl'); q('#m text').text(''); } },
+    { c: 'GitHub returns a <b>JWT</b>: signed claims saying which repo, branch/environment, workflow and actor this is. It expires in minutes. Decoded, it looks like the terminal below.', on(q){ q('#oidc rect').set('pur'); q('#jwt').show(); q('#claims-l1,#claims-l2,#claims-l3').style('fill', 'var(--code-text)'); } },
+    { c: 'The <code>configure-aws-credentials</code> action sends that JWT plus the role ARN to <b>STS</b>.', on(q){ q('#a2').show().set('hl'); q('#jwt').to(330, 95); } },
+    { c: 'STS fetches GitHub\'s public keys (JWKS) and <b>verifies the signature</b> — same trust model as a certificate chain. Then it checks the role\'s trust policy: is <code>aud</code> right, does <code>sub</code> match the allowed repo/environment?', on(q){ q('#a3').show().set('hl'); q('#sts rect').set('hl'); q('#role rect').set('hl'); } },
+    { c: 'Match → STS issues <b>temporary credentials</b> (1 hour by default). No access key was ever stored in GitHub; a token from a fork or another branch fails the <code>sub</code> check.', on(q){ q('#cred').show(); q('#sts rect').set('ok'); q('#role rect').set('ok'); q('#jwt').hide(); } },
+    { c: '<code>aws eks update-kubeconfig</code> writes a kubeconfig whose user is an exec plugin: every kubectl call presents a signed request; EKS maps the IAM role to a Kubernetes group via an access entry, and a RoleBinding gives that group the <code>deployer</code> Role. Three hops: GitHub identity → cloud identity → RBAC.', on(q){ q('#a4').show().set('ok'); q('#cred').to(535, 95); q('#eks rect').set('ok'); q('#m text:first-child').text('GitHub → IAM → RBAC'); q('#m text:nth-of-type(2)').text('nothing to rotate'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

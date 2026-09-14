@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C7 · Argo CD: Architecture, Install & the Application CRD · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c07" data-root="../" data-linux="l07,l09" data-related="d09,d14,d28,d36,d37,d39,d40,d42,d43,d49,c06">
+<article class="lesson">
+<p class="lead">Argo CD is the GitOps loop from <a href="c06-gitops-principles.html">C6</a> packaged as a set of Kubernetes controllers, three CRDs and a web UI. Once you see that an <code>Application</code> is a custom resource (<a href="../lessons/d39-crds.html">Day 39</a>) reconciled by a controller (<a href="../lessons/d40-operators.html">Day 40</a>) that renders Kustomize or Helm (<a href="../lessons/d42-kustomize.html">Days 42</a>–<a href="../lessons/d43-helm.html">43</a>) and talks to the API server with a ServiceAccount (<a href="../lessons/d37-service-accounts.html">Day 37</a>), there is nothing left to be mysterious about. This page installs it, tours the components, and goes through every field of the Application spec that matters.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>The components: api-server, repo-server, application-controller, redis, dex, applicationset- and notifications-controllers</li>
+<li>Installing (manifests or Helm), first login, exposing the UI</li>
+<li>The <code>Application</code> spec: source, destination, project, syncPolicy, and status</li>
+<li>How Argo CD tracks which live objects belong to an app</li>
+<li>Repository and cluster credentials as Secrets</li>
+<li><code>AppProject</code> boundaries, Argo CD RBAC and SSO</li>
+</ul></div>
+
+<h2>Components</h2>
+<figure data-anim="argocd-components"></figure>
+<dl class="kv">
+<dt>argocd-server</dt><dd>The API (gRPC + REST) and the web UI. Authenticates users (local accounts, SSO via Dex or OIDC), enforces Argo CD's own RBAC, and serves the resource tree, diffs, logs and sync buttons. It is <em>not</em> the reconciler — it reads state the controller has computed (via Redis) and forwards actions.</dd>
+<dt>argocd-repo-server</dt><dd>Clones repositories (cached on disk), checks out the requested revision and <strong>renders manifests</strong>: <code>kustomize build</code>, <code>helm template</code>, plain YAML directories, Jsonnet, or a config-management plugin sidecar. Output is cached in Redis keyed by revision. Has no cluster access at all.</dd>
+<dt>argocd-application-controller</dt><dd>The reconciler (a StatefulSet, shardable). Watches <code>Application</code> objects; for each one asks the repo-server for manifests, keeps informers on the live objects in the destination cluster, computes <strong>sync status</strong> (diff) and <strong>health status</strong>, and performs sync operations (apply, prune, hooks). Writes results into <code>Application.status</code>.</dd>
+<dt>argocd-redis</dt><dd>Cache: rendered manifests, app state, cluster inventory. Losing it costs a re-render, nothing more — all durable state is in the Application CRs and Secrets.</dd>
+<dt>argocd-dex-server</dt><dd>An OIDC identity broker for SSO (GitHub, GitLab, LDAP, SAML…). Optional if you point Argo CD at an OIDC provider directly.</dd>
+<dt>argocd-applicationset-controller</dt><dd>Turns <code>ApplicationSet</code> templates into many <code>Application</code>s (<a href="c09-argocd-scale.html">C9</a>).</dd>
+<dt>argocd-notifications-controller</dt><dd>Sends events (sync succeeded, health degraded) to Slack, email, webhooks, GitHub commit statuses.</dd>
+</dl>
+<div class="callout connect" data-ref="d07,d40"><p>Map it onto <a href="../lessons/d07-architecture.html">Day 7</a>: <em>argocd-server</em> is the API server of the Argo world, <em>application-controller</em> is its controller-manager, <em>repo-server</em> is a stateless worker, <em>Redis</em> a cache rather than etcd — because the durable state is stored as CRs in the real API server. It is an operator (<a href="../lessons/d40-operators.html">Day 40</a>) whose "custom resource" is an entire deployed application.</p></div>
+
+<h2>Install and log in</h2>
+<pre><code class="lang-bash">$ kubectl create namespace argocd
+$ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+#   variants: core-install.yaml (no UI/API — CLI in core mode), ha/install.yaml (HA redis, multiple servers)
+#   or Helm: helm repo add argo https://argoproj.github.io/argo-helm && helm install argocd argo/argo-cd -n argocd
+$ kubectl -n argocd get deploy,sts,svc,cm,secret,crd | grep -E 'argocd|argoproj'
+$ kubectl -n argocd rollout status deploy/argocd-server
+$ kubectl -n argocd port-forward svc/argocd-server 8080:443 &amp;
+$ argocd admin initial-password -n argocd            # or: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
+$ argocd login localhost:8080 --username admin --password '…' --insecure     # self-signed cert on port-forward
+$ argocd account update-password && kubectl -n argocd delete secret argocd-initial-admin-secret
+$ argocd version; argocd cluster list; argocd app list</code></pre>
+<div class="callout tip"><p><strong>Behind an Ingress</strong> (<a href="../lessons/d49-ingress-part1.html">Day 49</a>): terminate TLS at the Ingress and run the server in plain HTTP with <code>server.insecure: "true"</code> in the <code>argocd-cmd-params-cm</code> ConfigMap, or pass TLS through so Argo CD's own certificate is used. The CLI speaks gRPC; if your Ingress does not support it, log in with <code>--grpc-web</code>.</p></div>
+<div class="callout linux" data-ref="l07,l09"><p>The initial password is a random string stored in a Secret — the same "bootstrap credential you rotate immediately" pattern as a kubeadm join token. The self-signed certificate the server presents on port 8080 is generated at first start into the <code>argocd-server-tls</code> Secret; inspect it with the tools from <a href="../linux/l09-openssl-certificates.html">L9</a> (<code>openssl s_client -connect localhost:8080</code>). And every component is a Deployment whose logs you read with <code>kubectl logs</code>, not <code>journalctl</code> — the Argo processes are containers, not systemd units.</p></div>
+
+<h2>The Application resource</h2>
+<div class="yaml-anno">
+<pre><code class="lang-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-prod
+  namespace: argocd                  # Applications live in Argo CD's namespace (by default)
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io   # deleting the Application deletes what it deployed
+spec:
+  project: shop
+  source:
+    repoURL: https://github.com/acme/platform-config
+    targetRevision: main             # branch, tag, or commit SHA
+    path: apps/api/overlays/prod     # a directory: Kustomize here
+    # helm: { valueFiles: [values-prod.yaml], parameters: [{name: image.tag, value: 9f2e1c3}] }
+    # directory: { recurse: true }   # plain YAML tree
+  destination:
+    server: https://kubernetes.default.svc   # or name: prod-eu (a registered cluster)
+    namespace: shop
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+    - CreateNamespace=true
+    - ServerSideApply=true
+    retry:
+      limit: 3
+      backoff: { duration: 10s, factor: 2, maxDuration: 2m }
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers: [/spec/replicas]   # HPA owns this field (Day 20)
+  revisionHistoryLimit: 10</code></pre>
+<ul class="notes">
+<li><b>source</b> — where the desired state comes from: a repo, a revision, a path. What is at the path decides the renderer: a <code>kustomization.yaml</code> → Kustomize; a <code>Chart.yaml</code> → Helm; otherwise plain manifests. Per-tool options live under <code>helm:</code>, <code>kustomize:</code>, <code>directory:</code>. <code>sources:</code> (plural) combines several — a chart from one repo with values from another (<a href="c09-argocd-scale.html">C9</a>).</li>
+<li><b>targetRevision</b> — <code>main</code> follows the branch; <code>v1.4.0</code> or a SHA pins. Prod often tracks a tag or a release branch that a promotion PR advances.</li>
+<li><b>destination</b> — which cluster (<code>server</code> URL or registered <code>name</code>) and namespace. <code>https://kubernetes.default.svc</code> is the cluster Argo CD runs in.</li>
+<li><b>project</b> — the <code>AppProject</code> that fences what this app may do. <code>default</code> allows everything; do not use it in production.</li>
+<li><b>syncPolicy.automated</b> — sync on git change without a click. <code>prune</code>: delete objects removed from git. <code>selfHeal</code>: also re-sync on cluster-side drift. Omit the block entirely for manual sync (review the diff, then <em>Sync</em>).</li>
+<li><b>syncOptions</b> — behaviour switches (<a href="c08-argocd-sync.html">C8</a>): create the namespace, server-side apply, prune last, replace instead of apply, skip validation.</li>
+<li><b>ignoreDifferences</b> — fields other controllers own; excluded from the diff so the app is not perpetually OutOfSync.</li>
+<li><b>finalizer</b> — with it, <code>kubectl delete application</code> cascades to the deployed objects; without it only the Application object goes and the workload stays (orphaned).</li>
+</ul>
+</div>
+<pre><code class="lang-bash">$ kubectl apply -f api-prod.yaml                      # an Application is just a CR — GitOps the Application too (C9: app of apps)
+$ argocd app create api-prod --repo https://github.com/acme/platform-config --path apps/api/overlays/prod \
+    --dest-server https://kubernetes.default.svc --dest-namespace shop --project shop --sync-policy automated --self-heal --auto-prune
+$ argocd app get api-prod                             # sync status, health, each resource with its own status
+$ argocd app diff api-prod                            # rendered vs live
+$ argocd app sync api-prod [--prune] [--dry-run]      # a manual sync
+$ argocd app manifests api-prod                       # what the repo-server rendered
+$ kubectl -n argocd get app api-prod -o jsonpath='{.status.sync.status} {.status.health.status}{"\n"}'
+$ kubectl -n argocd get app api-prod -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}'   # ComparisonError etc.</code></pre>
+<div class="callout connect" data-ref="d39,d09,d59"><p><code>kubectl explain application.spec --api-version argoproj.io/v1alpha1</code> works because the CRD carries an OpenAPI schema (<a href="../lessons/d39-crds.html">Day 39</a>). <code>status</code> is written by the controller and read by you — the same contract as every built-in object (<a href="../lessons/d09-yaml-imperative-declarative.html">Day 9</a>), so <a href="../lessons/d59-jsonpath.html">JSONPath</a> queries against Applications are the fastest way to monitor a fleet from a script.</p></div>
+
+<h2>How Argo CD knows what belongs to an app</h2>
+<p>When it applies a manifest, Argo CD stamps a <strong>tracking</strong> marker on the object — by default the label <code>app.kubernetes.io/instance: &lt;app name&gt;</code>; optionally the annotation <code>argocd.argoproj.io/tracking-id: &lt;app&gt;:&lt;group&gt;/&lt;kind&gt;:&lt;ns&gt;/&lt;name&gt;</code> (set <code>application.resourceTrackingMethod: annotation</code> in <code>argocd-cm</code>). The controller's informers index live objects by that marker; anything with the app's marker that is <em>not</em> in the rendered manifests is a prune candidate, and anything in the manifests with no live counterpart is <em>Missing</em>.</p>
+<pre><code class="lang-bash">$ kubectl -n shop get deploy api -o jsonpath='{.metadata.labels.app\.kubernetes\.io/instance}{"\n"}'     # api-prod
+$ kubectl -n shop get all -l app.kubernetes.io/instance=api-prod                                       # everything this app owns</code></pre>
+<div class="callout warn"><p>If your Helm chart already sets <code>app.kubernetes.io/instance</code> to the <em>release</em> name (most do), two apps deploying the same chart collide. Switch to annotation tracking, or set <code>helm.releaseName</code> to the app name. A resource claimed by two Applications shows a <code>SharedResourceWarning</code> condition.</p></div>
+
+<h2>Credentials: repositories and clusters</h2>
+<p>Argo CD keeps credentials as Kubernetes Secrets in its namespace with a well-known label — so they, too, can be created declaratively (and sealed/external — <a href="c06-gitops-principles.html">C6</a>).</p>
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: platform-config-repo
+  namespace: argocd
+  labels: { argocd.argoproj.io/secret-type: repository }      # repo-creds: the same, matching a URL prefix
+stringData:
+  type: git
+  url: https://github.com/acme/platform-config
+  username: not-used
+  password: ghp_…readonly-token…                                # or sshPrivateKey: | …  with url git@github.com:acme/platform-config.git</code></pre>
+<pre><code class="lang-bash">$ argocd repo add https://github.com/acme/platform-config --username x --password $TOKEN     # same Secret, made for you
+$ argocd repo add git@github.com:acme/platform-config.git --ssh-private-key-path ~/.ssh/argocd   # deploy key, read-only
+$ argocd cluster add prod-eu --name prod-eu            # a kubeconfig context → creates SA argocd-manager + ClusterRoleBinding IN THAT CLUSTER,
+                                                       # stores its token in a Secret labelled argocd.argoproj.io/secret-type: cluster
+$ kubectl -n argocd get secret -l argocd.argoproj.io/secret-type=cluster</code></pre>
+<div class="callout connect" data-ref="d37,d36,d32"><p><code>argocd cluster add</code> is <a href="../lessons/d37-service-accounts.html">Day 37</a> + <a href="../lessons/d36-rbac.html">Day 36</a> + <a href="../lessons/d32-tls-part2-kubeconfig.html">Day 32</a> in one command: it creates a ServiceAccount in the target cluster, binds it to <code>cluster-admin</code> (tighten this!), mints a token, and stores server URL + CA + token — the three parts of a kubeconfig — in a Secret. For the in-cluster destination it simply uses its own Pod's ServiceAccount.</p></div>
+
+<h2>Projects, RBAC and SSO</h2>
+<figure data-anim="appproject-guard"></figure>
+<pre><code class="lang-yaml">apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: { name: shop, namespace: argocd }
+spec:
+  description: Shop team workloads
+  sourceRepos: ["https://github.com/acme/platform-config", "https://charts.bitnami.com/bitnami"]
+  destinations:
+  - { server: https://kubernetes.default.svc, namespace: "shop*" }        # shop, shop-canary…
+  - { name: prod-eu, namespace: shop }
+  clusterResourceWhitelist: []                    # no cluster-scoped objects (no ClusterRoles, no CRDs, no Namespaces…)
+  namespaceResourceBlacklist:
+  - { group: "", kind: ResourceQuota }
+  - { group: "", kind: LimitRange }
+  roles:
+  - name: developer
+    policies: ["p, proj:shop:developer, applications, sync, shop/*, allow"]
+    groups: ["acme:shop-devs"]                    # SSO group
+  syncWindows:
+  - { kind: deny, schedule: "0 22 * * *", duration: 8h, applications: ["*"] }   # no syncs overnight</code></pre>
+<pre data-title="argocd-rbac-cm (global RBAC)"><code class="lang-yaml">data:
+  policy.default: role:readonly
+  policy.csv: |
+    p, role:platform, applications, *, */*, allow
+    p, role:platform, clusters, *, *, allow
+    p, role:platform, repositories, *, *, allow
+    g, acme:platform-team, role:platform
+  scopes: "[groups, email]"</code></pre>
+<dl class="kv">
+<dt>AppProject</dt><dd>A boundary around a set of Applications: which repos may be sources, which clusters/namespaces may be destinations, which resource kinds may be created. It is enforced at <em>sync</em> time: an app that violates it gets an <code>InvalidSpecError</code> or a sync error naming the rule. This is how one Argo CD serves many teams without one team's manifests landing in another's namespace.</dd>
+<dt>RBAC</dt><dd>Casbin-style policies over Argo CD's own objects (applications, projects, repositories, clusters, accounts) and actions (get, create, sync, delete, override, action/…). Subjects are SSO groups or local accounts. Separate from Kubernetes RBAC — Argo CD applies manifests with <em>its</em> ServiceAccount; Argo RBAC decides which humans may push its buttons.</dd>
+<dt>SSO</dt><dd>Dex connectors (GitHub org/teams, GitLab, SAML, LDAP) or a direct OIDC issuer in <code>argocd-cm</code>. Groups arrive as claims and match the <code>g,</code> lines. Local accounts are for automation (<code>argocd account generate-token</code>) and break-glass.</dd>
+</dl>
+<div class="callout connect" data-ref="d14,d36"><p>Two RBAC layers, two questions. Kubernetes RBAC (<a href="../lessons/d36-rbac.html">Day 36</a>): <em>may Argo CD's ServiceAccount create a Deployment in <code>shop</code>?</em> Argo CD RBAC + AppProject: <em>may this user sync this app, and may this app touch that namespace?</em> Namespaces (<a href="../lessons/d14-namespaces.html">Day 14</a>) are the unit both layers agree on — one project per team, one or more namespaces per project.</p></div>
+
+<div class="lab"><h3>Hands-on lab (30 min) — install, deploy, watch the loop</h3>
+<ol class="steps">
+<li><strong>Install</strong> Argo CD in KIND with the manifests above; port-forward; log in with the CLI; change the admin password.</li>
+<li><strong>Tour the components</strong>: <code>kubectl -n argocd get pods</code>; <code>kubectl -n argocd logs deploy/argocd-repo-server --tail=20</code>; <code>kubectl get crd | grep argoproj</code>; <code>kubectl explain application.spec.syncPolicy --api-version argoproj.io/v1alpha1</code>.</li>
+<li><strong>First app</strong> from the public example repo:<pre><code class="lang-bash">$ argocd app create guestbook --repo https://github.com/argoproj/argocd-example-apps.git --path guestbook \
+    --dest-server https://kubernetes.default.svc --dest-namespace guestbook --sync-option CreateNamespace=true
+$ argocd app get guestbook            # OutOfSync / Missing: nothing applied yet (manual sync policy)
+$ argocd app diff guestbook           # the whole manifest, because live is empty
+$ argocd app sync guestbook && argocd app get guestbook      # Synced / Progressing → Healthy</code></pre></li>
+<li><strong>See the tracking label</strong>: <code>kubectl -n guestbook get all -l app.kubernetes.io/instance=guestbook</code>. Open the UI: the resource tree is exactly that query.</li>
+<li><strong>Your own repo</strong>: push the C6 lab's <code>config</code> repo to GitHub (public is fine), create an Application for <code>overlays/dev</code> with <code>--sync-policy automated --self-heal --auto-prune</code>, and repeat the C6 drift experiments — scale by hand, delete the Service, commit a new tag, revert. Watch <code>argocd app get -w</code> alongside.</li>
+<li><strong>Project fence</strong>: create the <code>shop</code> AppProject above (with only your repo and only namespace <code>shop*</code>), move the app into it (<code>argocd app set … --project shop</code>), then edit the Application's destination namespace to <code>kube-system</code> and read the error.</li>
+<li><strong>Break the repo credential</strong>: point the Application at a private repo without adding credentials. <code>argocd app get</code> shows a <code>ComparisonError</code>; fix with <code>argocd repo add</code>.</li>
+</ol></div>
+
+<details class="quiz"><summary>The UI shows an app as <em>Unknown</em> sync status with a ComparisonError. Which component failed, and how do you see why?</summary><div><p>The repo-server could not render the source (bad credentials, wrong path, invalid kustomization, a Helm values file that does not exist). <code>argocd app get</code> prints the condition message; <code>kubectl -n argocd logs deploy/argocd-repo-server</code> has the underlying <code>git</code>/<code>kustomize</code>/<code>helm</code> error.</p></div></details>
+<details class="quiz"><summary>You deleted an Application from the UI and its Deployment is still running. Why?</summary><div><p>The Application had no <code>resources-finalizer.argocd.argoproj.io</code> finalizer (the UI asks "foreground/background/non-cascading"; non-cascading skips it). Without the finalizer only the Application CR is removed and the deployed objects are orphaned. Re-create the app and delete it with cascade, or clean up with the tracking label.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Argo CD = argocd-server (API/UI/RBAC) + repo-server (render) + application-controller (diff, health, sync) + Redis (cache) + optional Dex, ApplicationSet and notifications controllers — all Deployments/StatefulSets in the <code>argocd</code> namespace.</li>
+<li>An <code>Application</code> is a CR: <em>source</em> (repo, revision, path) → <em>destination</em> (cluster, namespace), fenced by a <em>project</em>, with a <em>syncPolicy</em>. Its <code>status</code> carries sync and health.</li>
+<li>Ownership is a tracking label/annotation on every applied object; the resource tree is a label query.</li>
+<li>Repo and cluster credentials are labelled Secrets; <code>cluster add</code> creates a ServiceAccount in the target cluster.</li>
+<li>AppProjects fence repos, destinations and kinds; Argo CD RBAC decides what humans may do; Kubernetes RBAC decides what Argo CD's ServiceAccount may do.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- argocd-components ---------- */
+  let svg = S.icon('u', 40, 60, 'user', { label: 'UI / CLI', ly: 26 })
+    + S.zone('ns', 100, 15, 470, 262, 'namespace argocd')
+    + S.box('srv', 115, 45, 150, 46, ['argocd-server', 'API · UI · RBAC · SSO'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.box('dex', 115, 105, 150, 34, ['dex (SSO)'], { fs: 10.5, cls: 'soft' })
+    + S.box('redis', 115, 155, 150, 34, ['redis (cache)'], { fs: 10.5, cls: 'soft' })
+    + S.box('ctl', 300, 45, 250, 60, ['application-controller', 'watch Applications · diff · health · sync'], { fs: 11, subfs: 9, subcls: 'muted', cls: 'cy' })
+    + S.box('repo', 300, 125, 250, 60, ['repo-server', 'git clone · kustomize build / helm template'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.box('app', 300, 210, 250, 50, ['Application api-prod  (CR)', 'status: Synced · Healthy'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.box('git', 615, 125, 130, 60, ['git', 'platform-config'], { fs: 11, subfs: 9, subcls: 'mono muted' })
+    + S.node('cl', 600, 30, 150, 80, 'target cluster')
+    + S.pod('dep', 675, 78, 'Deployment', { w: 90, cls: 'ok' })
+    + S.arrow('a1', 62, 60, 113, 65, { d: 'M 62 60 L 113 66', cls: 'hid', label: 'login', lx: 85, ly: 50 })
+    + S.arrow('a2', 190, 91, 190, 103, { cls: 'hid' })
+    + S.arrow('a3', 425, 210, 425, 107, { d: 'M 425 208 L 425 107', cls: 'hid', label: 'watch', lx: 445, ly: 200 })
+    + S.arrow('a4', 425, 107, 425, 123, { cls: 'hid', label: 'render rev 7a1c', lx: 490, ly: 118 })
+    + S.arrow('a5', 550, 155, 613, 155, { cls: 'hid', label: 'fetch', ly: 145 })
+    + S.arrow('a6', 550, 62, 598, 75, { d: 'M 550 62 L 598 74', cls: 'hid', label: 'live objects', lx: 575, ly: 52 })
+    + S.arrow('a7', 300, 172, 265, 172, { d: 'M 300 172 L 267 172', cls: 'hid dashed' })
+    + S.arrow('a8', 265, 68, 298, 68, { cls: 'hid', label: 'sync!', ly: 60 })
+    + S.text('m', 335, 275, '', { cls: 'sm b' });
+  Anim.define('argocd-components', { w: 760, h: 285, title: 'Who does what', ms: 2500, svg, steps: [
+    { c: 'A user opens the UI or runs the CLI. <b>argocd-server</b> authenticates them (local account, or SSO through Dex) and applies Argo CD RBAC to every request.', on(q){ q('#a1').show().set('hl'); q('#srv rect').set('hl'); q('#a2').show(); q('#dex rect').set('hl'); q('#m').text('authn/authz for humans'); } },
+    { c: 'An <b>Application</b> object exists in the <code>argocd</code> namespace — created by kubectl, the CLI, the UI or another Application. The <b>application-controller</b> watches these CRs, like any operator.', on(q){ q('#app rect').set('pur'); q('#a3').show().set('hl'); q('#ctl rect').set('cy'); q('#m').text('informer on applications.argoproj.io'); } },
+    { c: 'To know the desired state it asks the <b>repo-server</b> to render <code>source</code> at <code>targetRevision</code>. The repo-server fetches the repo (cached clone), checks out the revision and runs the right tool.', on(q){ q('#a4').show().set('hl'); q('#repo rect').set('hl'); q('#a5').show().set('hl'); q('#git rect').set('hl'); q('#m').text('kustomize build apps/api/overlays/prod'); } },
+    { c: 'Rendered manifests are cached in <b>Redis</b> by revision, so a thousand apps on the same commit render once. Redis is a cache: lose it and everything is recomputed.', on(q){ q('#a7').show(); q('#redis rect').set('hl'); q('#m').text('cache key: repo + revision + path'); } },
+    { c: 'The controller keeps informers on the <b>target cluster</b>, finds the live objects with the app\'s tracking label, and diffs them against the rendered manifests → <b>sync status</b>. It evaluates each object\'s <b>health</b> (rollout done? Pods Ready?) and writes both into <code>Application.status</code>.', on(q){ q('#a6').show().set('hl'); q('#cl rect').set('hl'); q('#app text:nth-of-type(2)').text('status: OutOfSync · Healthy'); q('#app rect').set('warn'); q('#m').text('diff(rendered, live) → status'); } },
+    { c: 'The UI reads that status (via the server and Redis) and draws the tree. The user clicks <b>Sync</b> (or automated sync fires): the controller applies the manifests to the target cluster with its ServiceAccount, and the status returns to Synced.', on(q){ q('#a8').show().set('ok'); q('#dep rect').set('warn'); q('#app text:nth-of-type(2)').text('status: Synced · Progressing → Healthy'); q('#app rect').set('ok'); q('#m').text('kubectl apply, done by a controller'); } },
+  ]});
+
+  /* ---------- appproject-guard ---------- */
+  svg = S.box('app', 15, 30, 230, 96, ['Application api-prod', 'project: shop', 'source: github.com/acme/platform-config', 'dest: in-cluster / shop'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.term('proj', 275, 30, 260, 110, ['AppProject shop', ' sourceRepos: [acme/platform-config]', ' destinations: [in-cluster / shop*]', ' clusterResourceWhitelist: []', ' roles: developer → sync only'], { fs: 9.5 })
+    + S.box('gate', 275, 160, 260, 40, ['sync: checks pass → apply'], { fs: 11, cls: 'ok' })
+    + S.node('cl', 570, 30, 175, 170, 'cluster')
+    + S.pod('ns1', 657, 80, 'ns shop', { w: 100, cls: 'ok' })
+    + S.pod('ns2', 657, 130, 'ns kube-system', { w: 120, cls: 'dim' })
+    + S.pod('cr', 657, 175, 'ClusterRole', { w: 100, cls: 'dim', hidden: true })
+    + S.arrow('a1', 245, 78, 273, 78, { cls: 'hl' })
+    + S.arrow('a2', 405, 140, 405, 158, { cls: 'hid' })
+    + S.arrow('a3', 535, 180, 605, 90, { d: 'M 535 180 L 605 92', cls: 'hid ok' })
+    + S.arrow('a4', 535, 180, 595, 130, { d: 'M 535 182 L 595 132', cls: 'hid bad' })
+    + S.text('m', 380, 240, '', { cls: 'sm b' }) + S.text('m2', 380, 262, '', { cls: 'xs muted' });
+  Anim.define('appproject-guard', { w: 760, h: 275, title: 'AppProject: the fence around an app', ms: 2600, svg, steps: [
+    { c: 'Every Application belongs to a project. Before rendering or syncing, the controller checks the app\'s <code>source</code> and <code>destination</code> against the project\'s allow-lists.', on(q){ q('#proj-l1,#proj-l2').style('fill', 'var(--accent)'); q('#m').text('source ✓ destination ✓'); } },
+    { c: 'The repo is listed, the namespace matches <code>shop*</code>: the sync proceeds and objects land in <code>shop</code>.', on(q){ q('#a2').show().set('ok'); q('#a3').show(); q('#ns1 rect').set('ok'); q('#m').text('applied to shop'); } },
+    { c: 'Someone edits the Application: <code>destination.namespace: kube-system</code>. The project does not allow it → <b>InvalidSpecError</b>; nothing is applied. The manifests could be perfect and it still cannot go there.', on(q){ q('#app text:nth-of-type(4)').text('dest: in-cluster / kube-system'); q('#app rect').set('bad'); q('#a3').hide(); q('#a4').show(); q('#gate text').text('InvalidSpecError: destination not permitted'); q('#gate rect').set('bad'); q('#m').text('fenced by project, not by RBAC'); } },
+    { c: 'Back to <code>shop</code>. Now the repo gains a <code>ClusterRole</code> manifest. <code>clusterResourceWhitelist: []</code> means <em>no cluster-scoped kinds</em> → the sync fails on that resource with a clear message; the namespaced objects still apply.', on(q){ q('#app text:nth-of-type(4)').text('dest: in-cluster / shop'); q('#app rect').set('pur'); q('#a4').hide(); q('#a3').show(); q('#cr').show(); q('#cr rect').set('bad'); q('#proj-l3').style('fill', 'var(--red)'); q('#gate text').text('sync error: ClusterRole not permitted in project'); q('#gate rect').set('warn'); q('#m').text('kinds are fenced too'); } },
+    { c: 'Project <b>roles</b> map SSO groups to actions on the project\'s apps: developers may <em>sync</em> but not <em>delete</em> or <em>override</em>. Global <code>argocd-rbac-cm</code> policies sit above. Kubernetes RBAC on Argo CD\'s own ServiceAccount is a separate, third gate.', on(q){ q('#proj-l4').style('fill', 'var(--accent)'); q('#gate text').text('developer: sync ✓ · delete ✗'); q('#gate rect').set('ok'); q('#m').text('three gates: project · Argo RBAC · K8s RBAC'); q('#m2').text('team isolation on one shared Argo CD'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

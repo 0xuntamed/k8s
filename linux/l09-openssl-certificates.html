@@ -152,9 +152,9 @@ $ kill %1; cd -</code></pre></div>
 (function(){
   const S = Anim.S;
   let svg = S.term('cmd', 20, 20, 680, 40, ['$ openssl verify -CAfile ca.crt -untrusted intermediate.crt api.crt'], { fs: 10 })
-    + S.box('leaf', 40, 90, 200, 70, ['api.crt', 'subject CN=api.internal', 'issuer CN=intermediate'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('int', 260, 90, 200, 70, ['intermediate.crt', 'subject CN=intermediate', 'issuer CN=my-ca'], { subfs: 8.5, subcls: 'mono muted' })
-    + S.box('root', 480, 90, 200, 70, ['ca.crt (trusted)', 'subject CN=my-ca', 'issuer CN=my-ca'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.box('leaf', 40, 90, 200, 70, ['api.crt', 'subject CN=api.internal', 'issuer CN=intermediate'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('int', 260, 90, 200, 70, ['intermediate.crt', 'subject CN=intermediate', 'issuer CN=my-ca'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('root', 480, 90, 200, 70, ['ca.crt (trusted)', 'subject CN=my-ca', 'issuer CN=my-ca'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
     + S.arrow('s1', 240, 125, 258, 125, { cls: 'hid' }) + S.arrow('s2', 460, 125, 478, 125, { cls: 'hid' })
     + S.term('chk', 20, 185, 680, 100, ['checks:', '', '', ''], { fs: 9.5 })
     + S.text('m', 360, 305, '', { cls: 'sm b' });

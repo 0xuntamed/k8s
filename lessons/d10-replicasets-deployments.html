@@ -152,6 +152,7 @@ $ kubectl get rs -l app=web                     # two ReplicaSets, old one at 0
 $ kubectl rollout history deploy/web
 $ kubectl rollout undo deploy/web && kubectl get rs -l app=web</code></pre></div>
 
+<div class="callout connect" data-ref="c01,c03,c09"><p>Two consequences for automation: a rollout happens only when the Pod template <em>text</em> changes, which is why pipelines tag images with the commit SHA rather than <code>:latest</code> (<a href="../cicd/c01-cicd-fundamentals.html">C1</a>); and <code>kubectl rollout status --timeout</code> returns non-zero on a stuck rollout, which is how a deploy job turns red and triggers <code>rollout undo</code> (<a href="../cicd/c03-github-actions-kubernetes.html">C3</a>). When rolling updates are not enough, Argo Rollouts replaces this object with canary/blue-green steps (<a href="../cicd/c09-argocd-scale.html">C9</a>).</p></div>
 <div class="takeaways"><h3>Key takeaways</h3><ul>
 <li>Pod → ReplicaSet (keep N alive by label) → Deployment (manage ReplicaSets across revisions). Create Deployments, not Pods.</li>
 <li>Ownership is by <strong>selector</strong>, not by who created the Pod; template labels must match the selector.</li>

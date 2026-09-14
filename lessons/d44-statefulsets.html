@@ -196,7 +196,7 @@ $ kubectl delete sts web; kubectl delete svc web; kubectl delete pvc -l app=web<
   const S = Anim.S;
 
   let s1 = S.box('svc', 260, 20, 200, 44, ['Service db (headless)', 'clusterIP: None'], { subfs: 9, subcls: 'mono muted', cls: 'cy' });
-  [0, 1, 2].forEach(i => { const x = 60 + i * 220; s1 += S.node(`n${i}`, x, 100, 180, 190, `zone ${['a','b','c'][i]}`, { sub: '' }) + S.pod(`p${i}`, x + 90, 160, `db-${i}`, { cls: 'ok', w: 70, sub: `db-${i}.db.ns.svc` }) + S.box(`v${i}`, x + 40, 220, 100, 40, [`PVC data-db-${i}`, '20Gi in zone ' + ['a','b','c'][i]], { subfs: 8, subcls: 'mono muted', cls: 'warn' }) + S.arrow(`m${i}`, x + 90, 175, x + 90, 218, { cls: 'ok' }); });
+  [0, 1, 2].forEach(i => { const x = 60 + i * 220; s1 += S.node(`n${i}`, x, 100, 180, 190, `zone ${['a','b','c'][i]}`, { sub: '' }) + S.pod(`p${i}`, x + 90, 160, `db-${i}`, { cls: 'ok', w: 70, sub: `db-${i}.db.ns.svc` }) + S.box(`v${i}`, x + 40, 220, 100, 40, [`PVC data-db-${i}`, '20Gi in zone ' + ['a','b','c'][i]], { subfs: 9, subcls: 'mono muted', cls: 'warn' }) + S.arrow(`m${i}`, x + 90, 175, x + 90, 218, { cls: 'ok' }); });
   s1 += S.text('m', 360, 305, '', { cls: 'sm b' });
   Anim.define('sts-identity', { w: 720, h: 320, title: 'Stable name, DNS and disk', ms: 2800, svg: s1, steps: [
     { c: 'Three replicas, each with a fixed ordinal name, its own DNS record under the headless Service, and its own PVC — provisioned in the zone where the Pod first ran.', on(q){} },

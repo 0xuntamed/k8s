@@ -118,10 +118,10 @@ $ kubectl run t --rm -it --image=nicolaka/netshoot -- sh -c 'cat /etc/resolv.con
   let svg = S.box('app', 20, 30, 120, 44, ['app', 'getaddrinfo("api")'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
     + S.box('libc', 180, 30, 130, 44, ['libc resolver', 'nsswitch: files dns'], { subfs: 9, subcls: 'mono muted' })
     + S.box('hosts', 180, 110, 130, 44, ['/etc/hosts', 'api? no'], { subfs: 9, subcls: 'mono muted' })
-    + S.box('rc', 350, 30, 170, 60, ['/etc/resolv.conf', 'search shop.svc… svc… cluster.local', 'ndots:5'], { subfs: 8, subcls: 'mono muted' })
-    + S.box('ns', 570, 30, 130, 44, ['nameserver', '10.96.0.10 (CoreDNS)'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.box('rc', 345, 30, 200, 60, ['/etc/resolv.conf', 'search shop.svc… svc… cluster.local', 'ndots:5'], { subfs: 9, subcls: 'mono muted' })
+    + S.box('ns', 575, 30, 130, 44, ['nameserver', '10.96.0.10 (CoreDNS)'], { subfs: 9, subcls: 'mono muted', cls: 'cy' })
     + S.term('q', 20, 180, 680, 90, ['queries sent (UDP 53):', '', '', ''], { fs: 9.5 })
-    + S.arrow('a1', 140, 52, 178, 52) + S.arrow('a2', 245, 74, 245, 108, { cls: 'hid' }) + S.arrow('a3', 310, 52, 348, 52, { cls: 'hid' }) + S.arrow('a4', 520, 52, 568, 52, { cls: 'hid' })
+    + S.arrow('a1', 140, 52, 178, 52) + S.arrow('a2', 245, 74, 245, 108, { cls: 'hid' }) + S.arrow('a3', 310, 52, 343, 52, { cls: 'hid' }) + S.arrow('a4', 545, 52, 573, 52, { cls: 'hid' })
     + S.text('m', 360, 295, '', { cls: 'sm b' });
   Anim.define('resolver', { w: 720, h: 310, title: 'What happens on getaddrinfo("api")', ms: 2800, svg, steps: [
     { c: 'The app calls <code>getaddrinfo("api")</code>. This is a library function, not a syscall; the kernel has no idea what DNS is.', on(q){ q('#a1').set('hl'); } },

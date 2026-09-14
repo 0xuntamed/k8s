@@ -151,12 +151,12 @@ $ kubectl delete ingress shop; kubectl delete deploy web api; kubectl delete svc
 <script>
 (function(){
   const S = Anim.S;
-  let svg = S.icon('u', 40, 150, 'user', { label: 'shop.example.com/api/orders', ly: 28, lcls: 'mono' })
+  let svg = S.icon('u', 80, 150, 'user', { label: 'shop.example.com/api/orders', ly: 28, lcls: 'mono' })
     + S.box('dns', 20, 30, 120, 40, ['DNS', '→ 203.0.113.7'], { subfs: 9, subcls: 'mono muted' })
     + S.box('lb', 160, 125, 100, 50, ['cloud LB', '203.0.113.7'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
     + S.zone('cl', 290, 20, 410, 290, 'cluster')
     + S.box('ic', 310, 110, 150, 80, ['ingress controller', 'nginx pod', 'TLS · Host · path'], { subfs: 9, subcls: 'muted', cls: 'cy' })
-    + S.term('rules', 310, 205, 150, 90, ['Ingress shop', ' /api → api:8080', ' /    → web:80', 'tls: shop-tls'], { fs: 8.5 })
+    + S.term('rules', 310, 205, 150, 90, ['Ingress shop', ' /api → api:8080', ' /    → web:80', 'tls: shop-tls'], { fs: 9 })
     + S.box('sapi', 500, 60, 90, 40, ['svc api', ':8080'], { subfs: 9, subcls: 'mono muted' }) + S.box('sweb', 500, 200, 90, 40, ['svc web', ':80'], { subfs: 9, subcls: 'mono muted' })
     + S.pod('pa1', 640, 55, 'api', { cls: 'ok', w: 50 }) + S.pod('pa2', 640, 100, 'api', { cls: 'ok', w: 50 }) + S.pod('pw1', 640, 210, 'web', { cls: 'ok', w: 50 })
     + S.arrow('a0', 60, 130, 60, 72, { cls: 'hid' })

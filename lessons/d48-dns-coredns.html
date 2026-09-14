@@ -170,7 +170,7 @@ $ kubectl delete ns shop</code></pre></div>
     + S.box('rec', 270, 125, 130, 50, ['recursive resolver', 'cache'], { subfs: 9, subcls: 'muted', cls: 'cy' })
     + S.box('root', 480, 30, 200, 40, ['root servers', '"ask .com at …"'], { subfs: 9, subcls: 'muted' })
     + S.box('tld', 480, 125, 200, 40, ['.com servers', '"ask example.com at …"'], { subfs: 9, subcls: 'muted' })
-    + S.box('auth', 480, 220, 200, 40, ['example.com authoritative', 'www A 93.184.216.34 TTL 300'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
+    + S.box('auth', 480, 220, 200, 40, ['example.com authoritative', 'www A 93.184.216.34 TTL 300'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
     + S.arrow('a1', 80, 150, 108, 150) + S.arrow('a2', 220, 150, 268, 150, { cls: 'hid', label: 'www.example.com?', ly: 140 })
     + S.arrow('a3', 400, 140, 478, 55, { d: 'M 400 140 L 478 55', cls: 'hid' }) + S.arrow('a4', 400, 150, 478, 145, { cls: 'hid' }) + S.arrow('a5', 400, 160, 478, 235, { d: 'M 400 160 L 478 235', cls: 'hid' })
     + S.text('m', 360, 290, '', { cls: 'sm b' });
@@ -186,7 +186,7 @@ $ kubectl delete ns shop</code></pre></div>
     + S.term('rc', 35, 45, 270, 80, ['nameserver 10.96.0.10', 'search shop.svc.cluster.local', '  svc.cluster.local cluster.local', 'options ndots:5'], { fs: 9 })
     + S.text('qn', 170, 160, '', { cls: 'sm mono b' }) + S.text('qn2', 170, 185, '', { cls: 'xs mono muted' })
     + S.box('cd', 420, 60, 260, 60, ['CoreDNS', 'kubernetes plugin · forward .'], { subfs: 9, subcls: 'muted', cls: 'cy' })
-    + S.term('log', 420, 140, 280, 110, ['queries received:', '', '', '', ''], { fs: 8.5 })
+    + S.term('log', 395, 140, 315, 110, ['queries received:', '', '', '', ''], { fs: 8.5 })
     + S.arrow('a1', 320, 100, 418, 90, { cls: 'hl' })
     + S.text('m', 360, 290, '', { cls: 'sm b' });
   const L = (q, lines, color) => lines.forEach((t, i) => q('#log-l' + (i + 1)).text(t).style('fill', color));
@@ -194,7 +194,7 @@ $ kubectl delete ns shop</code></pre></div>
     { c: 'The kubelet wrote this resolv.conf. <code>ndots:5</code> means: any name with fewer than 5 dots is <i>relative</i> — try the search domains first.', on(q){ } },
     { c: 'App looks up <code>api</code> (0 dots). First candidate: <code>api.shop.svc.cluster.local</code>. CoreDNS finds Service api in shop → one query, one answer.', on(q){ q('#qn').text('api'); q('#qn2').text('→ api.shop.svc.cluster.local ✓'); L(q, ['api.shop.svc.cluster.local  A 10.96.4.7', '', '', ''], 'var(--green)'); q('#m').text('short name: 1 query'); } },
     { c: '<code>api.prod</code> (1 dot): first <code>api.prod.shop.svc.cluster.local</code> → NXDOMAIN; then <code>api.prod.svc.cluster.local</code> → found. Two queries.', on(q){ q('#qn').text('api.prod'); q('#qn2').text('→ .shop.svc… ✗ → .svc.cluster.local ✓'); L(q, ['api.prod.shop.svc.cluster.local  NXDOMAIN', 'api.prod.svc.cluster.local  A 10.96.9.2', '', ''], 'var(--amber)'); q('#log-l2').style('fill', 'var(--green)'); q('#m').text('cross-namespace: 2 queries'); } },
-    { c: '<code>api.payments.example.com</code> (3 dots, still &lt; 5): three cluster-suffixed attempts fail before the bare name is forwarded upstream. <b>Four round trips</b> for every external call.', on(q){ q('#qn').text('api.payments.example.com'); q('#qn2').text('→ 3 × NXDOMAIN → forwarded ✓'); L(q, ['api.payments.example.com.shop.svc.cluster.local  NXDOMAIN', 'api.payments.example.com.svc.cluster.local  NXDOMAIN', 'api.payments.example.com.cluster.local  NXDOMAIN', 'api.payments.example.com  A 52.x.x.x  (forwarded)'], 'var(--red)'); q('#log-l4').style('fill', 'var(--green)'); q('#m').text('external names pay the ndots tax'); } },
+    { c: '<code>api.payments.example.com</code> (3 dots, still &lt; 5): three cluster-suffixed attempts fail before the bare name is forwarded upstream. <b>Four round trips</b> for every external call.', on(q){ q('#qn').text('api.payments.example.com'); q('#qn2').text('→ 3 × NXDOMAIN → forwarded ✓'); L(q, ['api.payments.example.com.shop.svc.cluster.local ✗', 'api.payments.example.com.svc.cluster.local ✗', 'api.payments.example.com.cluster.local ✗', 'api.payments.example.com  A 52.x.x.x (fwd)'], 'var(--red)'); q('#log-l4').style('fill', 'var(--green)'); q('#m').text('external names pay the ndots tax'); } },
     { c: 'Fixes: use a trailing dot (<code>api.payments.example.com.</code> is absolute — 1 query), lower <code>ndots</code> with <code>dnsConfig</code>, or run NodeLocal DNSCache. For cluster names, prefer the FQDN in config files.', on(q){ q('#qn').text('api.payments.example.com.'); q('#qn2').text('absolute (trailing dot) → forwarded immediately'); L(q, ['api.payments.example.com  A 52.x.x.x', '', '', ''], 'var(--green)'); q('#m').text('trailing dot or ndots:2'); } },
   ]});
 })();

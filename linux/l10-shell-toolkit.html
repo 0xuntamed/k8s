@@ -156,7 +156,7 @@ $ kubectl delete deploy web bad</code></pre></div>
   const S = Anim.S;
   const stages = [['kubectl get pods -A', 'all pods, one per line'], ["awk '$4 != \"Running\"'", 'keep non-Running rows'], ["awk '{print $1\"/\"$2}'", 'namespace/name'], ['sort | uniq -c', 'count duplicates'], ['sort -rn | head -5', 'top 5']];
   let svg = '';
-  stages.forEach((s, i) => { const x = 20 + i * 138; svg += S.box(`s${i}`, x, 40, 128, 54, [s[0], s[1]], { subfs: 8, subcls: 'muted', fs: 9.5, lcls: 'mono', cls: 'soft' }); if (i) svg += S.arrow(`a${i}`, x - 10, 67, x - 2, 67, { cls: 'hid' }); });
+  stages.forEach((s, i) => { const x = 20 + i * 138; svg += S.box(`s${i}`, x, 40, 128, 54, [s[0], s[1]], { subfs: 9, subcls: 'muted', fs: 9.5, lcls: 'mono', cls: 'soft' }); if (i) svg += S.arrow(`a${i}`, x - 10, 67, x - 2, 67, { cls: 'hid' }); });
   svg += S.term('out', 20, 120, 680, 130, ['data at this stage:', '', '', '', '', ''], { fs: 9 });
   svg += S.text('m', 360, 275, '', { cls: 'sm b' });
   const show = (q, lines) => { for (let i = 1; i <= 5; i++) q('#out-l' + i).text(lines[i - 1] || '').style('fill', 'var(--code-text)'); };

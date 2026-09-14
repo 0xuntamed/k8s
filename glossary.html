@@ -187,18 +187,67 @@
     ['Webhook (admission)', 'An HTTPS service the API server calls to mutate or validate objects (MutatingWebhookConfiguration / ValidatingWebhookConfiguration).', 'd38', 'k8s'],
     ['Whiteout', 'An OverlayFS marker in the upper layer that hides a file from a lower layer.', 'l04', 'linux'],
     ['WaitForFirstConsumer', 'A StorageClass binding mode that delays provisioning until a Pod is scheduled, so the volume lands in the right zone.', 'd27', 'k8s'],
+    ['Continuous Integration (CI)', 'Every push is automatically built and tested on a clean runner; output is a verified artifact (an image) or a red build.', 'c01', 'cicd'],
+    ['Continuous Delivery / Deployment (CD)', 'Delivery: every verified artifact is deployable with an approval. Deployment: it goes to production automatically.', 'c01', 'cicd'],
+    ['Pipeline', 'A run triggered by an event that executes stages (test, build, scan, push, deploy) on a runner; each stage\'s exit code gates the next.', 'c01', 'cicd'],
+    ['Runner / agent', 'The machine or container a CI system executes steps on: a GitHub Actions runner VM, a Jenkins agent, an ARC or Jenkins Pod.', 'c02', 'cicd'],
+    ['Immutable tag', 'An image tag that is never moved (commit SHA, build number). Contrast :latest. Required for Deployments to notice a change.', 'c01', 'cicd'],
+    ['Image digest', 'sha256 hash of an image manifest; the only truly immutable image reference. Written into manifests by mature pipelines.', 'c01', 'cicd'],
+    ['Workflow (GitHub Actions)', 'A YAML file in .github/workflows/ with an on: trigger and jobs made of steps; jobs run in parallel on separate runners.', 'c02', 'cicd'],
+    ['Job / step (GitHub Actions)', 'A job is a unit of work on one runner; steps inside it run sequentially and share the filesystem; needs: orders jobs.', 'c02', 'cicd'],
+    ['GITHUB_TOKEN', 'The automatic per-job token whose scopes are set by the permissions: block; used to push to GHCR and call the GitHub API.', 'c02', 'cicd'],
+    ['$GITHUB_ENV / $GITHUB_OUTPUT', 'Files the runner reads between steps to carry environment variables and step outputs forward.', 'c02', 'cicd'],
+    ['OIDC federation', 'A CI job proves its identity with a signed JWT from GitHub; a cloud exchanges it for short-lived credentials — no stored secret.', 'c03', 'cicd'],
+    ['actions-runner-controller (ARC)', 'A Kubernetes controller that creates one ephemeral GitHub runner Pod per queued job.', 'c03', 'cicd'],
+    ['Jenkins controller', 'The Jenkins process: UI, API, queue, scheduler, credentials, JENKINS_HOME. Should run zero executors in production.', 'c04', 'cicd'],
+    ['Executor', 'A concurrent build slot on a Jenkins agent; pipelines wait in the queue for a free executor with matching labels.', 'c04', 'cicd'],
+    ['Jenkinsfile', 'A pipeline definition in Groovy: declarative (pipeline { agent, stages, post }) or scripted (node { }).', 'c04', 'cicd'],
+    ['JENKINS_HOME', 'The controller\'s state directory: config.xml, jobs/, builds/, plugins/, secrets/. Backing it up backs up Jenkins.', 'c04', 'cicd'],
+    ['Durable task', 'How a Jenkins sh step runs: a detached script on the agent whose log and exit code are read from files, surviving disconnects.', 'c04', 'cicd'],
+    ['jnlp / inbound agent', 'The Jenkins agent that connects out to the controller (port 50000 or WebSocket); the container injected into every Pod agent.', 'c05', 'cicd'],
+    ['Pod template (Jenkins)', 'The Pod spec the Kubernetes plugin uses to create an agent: jnlp plus tool containers sharing an emptyDir workspace.', 'c05', 'cicd'],
+    ['kaniko', 'Builds container images from a Dockerfile in userspace, without a daemon or privileges, pushing layers straight to a registry.', 'c05', 'cicd'],
+    ['Docker-in-Docker (DinD)', 'Running a Docker daemon inside a container; requires privileged: true. Avoid on shared clusters.', 'c05', 'cicd'],
+    ['GitOps', 'Desired state is declarative, versioned in git, pulled by an in-cluster agent, and continuously reconciled.', 'c06', 'gitops'],
+    ['Push vs pull deployment', 'Push: CI holds cluster credentials and applies. Pull: an agent in the cluster fetches git and applies; CI only commits.', 'c06', 'gitops'],
+    ['Config repository', 'The git repo holding manifests/overlays/values per environment that a GitOps agent watches; separate from the app repo.', 'c06', 'gitops'],
+    ['Drift', 'Live state differing from the desired state: expected (a new commit) or unexpected (a manual change). Shown as OutOfSync.', 'c06', 'gitops'],
+    ['Self-heal', 'Automated sync that also reverts cluster-side drift, keeping git the only accepted path.', 'c06', 'gitops'],
+    ['Prune', 'Deleting live objects that were removed from git during a sync.', 'c08', 'gitops'],
+    ['Promotion', 'Moving the same image digest through environments by changing per-environment config (overlay) — via a commit or PR, never a rebuild.', 'c06', 'gitops'],
+    ['Argo CD', 'A GitOps controller for Kubernetes: Application CRDs reconciled by an application-controller, with a UI, CLI, RBAC and SSO.', 'c07', 'gitops'],
+    ['Application (Argo CD)', 'A CR mapping a source (repo, revision, path) to a destination (cluster, namespace) under a project, with a syncPolicy.', 'c07', 'gitops'],
+    ['AppProject', 'An Argo CD boundary: allowed source repos, destinations and resource kinds for a set of Applications, plus roles and sync windows.', 'c07', 'gitops'],
+    ['argocd-repo-server', 'The Argo CD component that clones repos and renders manifests (kustomize build, helm template); results cached in Redis.', 'c07', 'gitops'],
+    ['argocd-application-controller', 'The Argo CD reconciler: diffs rendered manifests against live objects, computes sync and health, performs syncs.', 'c07', 'gitops'],
+    ['Tracking label / annotation', 'app.kubernetes.io/instance (or argocd.argoproj.io/tracking-id) stamped on applied objects so Argo CD knows what it owns.', 'c07', 'gitops'],
+    ['Sync status', 'Synced (live matches git), OutOfSync (differs or Missing), Unknown (comparison failed).', 'c08', 'gitops'],
+    ['Health status', 'Healthy, Progressing, Degraded, Suspended, Missing — computed per resource kind from status conditions and probes.', 'c08', 'gitops'],
+    ['Sync hook', 'A resource annotated argocd.argoproj.io/hook: PreSync|Sync|PostSync|SyncFail (usually a Job) run in that phase of a sync.', 'c08', 'gitops'],
+    ['Sync wave', 'argocd.argoproj.io/sync-wave: N — ordering within a sync phase; each wave waits for the previous wave\'s health.', 'c08', 'gitops'],
+    ['ignoreDifferences', 'Application fields excluded from the diff (jsonPointers, jq paths, managed-field managers) because another controller owns them.', 'c08', 'gitops'],
+    ['ComparisonError', 'An Application condition meaning the source could not be fetched or rendered; the detail is in the repo-server logs.', 'c08', 'gitops'],
+    ['App of Apps', 'A root Application whose source directory contains other Application manifests; bootstraps a whole cluster from one apply.', 'c09', 'gitops'],
+    ['ApplicationSet', 'A template plus generators (list, git, clusters, matrix, pull request…) that creates and owns many Applications.', 'c09', 'gitops'],
+    ['Cluster Secret (Argo CD)', 'A Secret labelled argocd.argoproj.io/secret-type: cluster holding a target cluster\'s URL and credentials; its labels feed the cluster generator.', 'c09', 'gitops'],
+    ['Argo CD Image Updater', 'A controller that watches a registry for new tags matching a policy and commits the update to git.', 'c09', 'gitops'],
+    ['Argo Rollouts', 'A Rollout CRD replacing Deployment with canary/blue-green steps, metric analysis and traffic shaping; Flagger is the alternative.', 'c09', 'gitops'],
+    ['Canary release', 'Sending a small share of traffic to the new version, judging it by metrics, then widening or aborting.', 'c09', 'gitops'],
+    ['cosign', 'Signs image digests (keyless via OIDC or with a key); admission policy verifies the signature before Pods start.', 'c10', 'cicd'],
+    ['SBOM', 'Software bill of materials: the list of packages in an image, generated in CI and attached to the digest.', 'c10', 'cicd'],
+    ['Trivy', 'A scanner for images, filesystems and manifests; --exit-code 1 on critical findings turns it into a pipeline gate.', 'c10', 'cicd'],
     ['Zombie process', 'An exited process whose parent has not yet called wait(); accumulates if PID 1 does not reap.', 'l01', 'linux'],
   ];
   T.sort((a, b) => a[0].localeCompare(b[0], 'en', { sensitivity: 'base' }));
   const K = window.K8N;
   const list = document.getElementById('list'), f = document.getElementById('f'), cnt = document.getElementById('cnt'), letters = document.getElementById('letters');
-  const kindLabel = { k8s: 'Kubernetes', linux: 'Linux', tls: 'TLS / auth', eco: 'Ecosystem' };
+  const kindLabel = { k8s: 'Kubernetes', linux: 'Linux', tls: 'TLS / auth', eco: 'Ecosystem', cicd: 'CI/CD', gitops: 'GitOps / Argo CD' };
   let html = '', last = '';
   T.forEach(([term, def, ref, kind]) => {
     const L = term[0].toUpperCase();
     if (L !== last) { html += `<h2 id="L-${L}" data-letter="${L}">${L}</h2>`; last = L; }
     const e = ref && K.byId[ref];
-    const link = e ? `<a href="${K.href(e)}">${e.day != null ? 'Day ' + e.day : 'Linux L' + (K.linux.indexOf(e) + 1)} →</a>` : '';
+    const link = e ? `<a href="${K.href(e)}">${K.linux.includes(e) ? 'Linux ' : K.cicd.includes(e) ? 'CI/CD ' : ''}${K.tag(e)} →</a>` : '';
     html += `<div class="t" data-letter="${L}"><dt>${term}<span class="k">${kindLabel[kind] || ''}</span>${link}</dt><dd>${def}</dd></div>`;
   });
   list.innerHTML = html;

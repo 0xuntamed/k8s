@@ -139,8 +139,8 @@ $ docker rm -f n side</code></pre></div>
   let s2 = S.zone('pod', 20, 20, 680, 280, 'pod (sandbox)')
     + S.box('pause', 290, 45, 140, 40, ['pause', 'creates net·uts·ipc'], { subfs: 9, subcls: 'muted', cls: 'soft' })
     + S.term('shared', 200, 100, 320, 60, ['shared: net:[402653…1]  uts:[…2]  ipc:[…3]', '  eth0 10.244.1.9 · hostname api-7f9c'], { fs: 9 })
-    + S.box('a', 40, 190, 200, 90, ['container app', 'mnt: myapi image', 'pid: own (PID 1 = api)', 'setns → shared net/uts/ipc'], { subfs: 8.5, subcls: 'mono muted', cls: 'ok' })
-    + S.box('b', 480, 190, 200, 90, ['container proxy', 'mnt: envoy image', 'pid: own (PID 1 = envoy)', 'setns → shared net/uts/ipc'], { subfs: 8.5, subcls: 'mono muted', cls: 'cy' })
+    + S.box('a', 40, 190, 200, 90, ['container app', 'mnt: myapi image', 'pid: own (PID 1 = api)', 'setns → shared net/uts/ipc'], { subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('b', 480, 190, 200, 90, ['container proxy', 'mnt: envoy image', 'pid: own (PID 1 = envoy)', 'setns → shared net/uts/ipc'], { subfs: 9, subcls: 'mono muted', cls: 'cy' })
     + S.arrow('j1', 140, 190, 240, 160, { d: 'M 140 190 L 240 162', cls: 'hid' }) + S.arrow('j2', 580, 190, 480, 160, { d: 'M 580 190 L 480 162', cls: 'hid' })
     + S.text('m', 360, 315, '', { cls: 'sm b' });
   Anim.define('pod-ns', { w: 720, h: 330, title: 'Namespaces in a Pod', ms: 2800, svg: s2, steps: [

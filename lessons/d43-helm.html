@@ -59,6 +59,7 @@ resources:
   requests: {cpu: 100m, memory: 128Mi}
   limits: {cpu: 500m, memory: 256Mi}</code></pre>
 
+<div class="callout connect" data-ref="c09,c03"><p>In a GitOps setup Argo CD runs only the <em>template</em> half of Helm (<code>helm template</code>) and applies the result itself — there are no release Secrets and <code>helm rollback</code> is replaced by <code>git revert</code> (<a href="../cicd/c09-argocd-scale.html">C9</a>). In a push pipeline, <code>helm upgrade --install --atomic</code> from a job is the deploy step (<a href="../cicd/c03-github-actions-kubernetes.html">C3</a>).</p></div>
 <h2>Upgrade, rollback, history</h2>
 <figure data-anim="helm-release"></figure>
 <pre><code class="lang-bash">$ helm upgrade web bitnami/nginx -n demo -f my-values.yaml --set replicaCount=5      # revision 2
@@ -204,12 +205,12 @@ $ helm uninstall web hello -n demo; kubectl delete ns demo</code></pre></div>
     + S.arrow('a1', 220, 75, 278, 110, { d: 'M 220 75 L 278 110' }) + S.arrow('a2', 220, 190, 278, 130, { d: 'M 220 190 L 278 130' }) + S.arrow('a3', 400, 120, 458, 120)
     + S.zone('ns', 460, 20, 240, 280, 'namespace demo')
     + S.pod('d', 530, 80, 'Deployment', { w: 90, cls: 'ok', hidden: true }) + S.pod('s', 640, 80, 'Service', { w: 70, cls: 'cy', hidden: true })
-    + S.term('rel', 475, 120, 210, 160, ['release "web" state (Secrets):', '', '', '', '', ''], { fs: 9 })
+    + S.term('rel', 468, 120, 228, 160, ['release "web" state (Secrets):', '', '', '', '', ''], { fs: 9 })
     + S.text('m', 360, 290, '', { cls: 'sm b' });
   Anim.define('helm-release', { w: 720, h: 305, title: 'Install → upgrade → rollback', ms: 2800, svg, steps: [
     { c: '<code>helm install web bitnami/nginx -f my-values.yaml</code>: Helm merges values (chart defaults ← file ← --set), renders the templates to YAML, and applies the objects.', on(q){ q('#helm rect').set('pur'); q('#d,#s').show(); q('#rel-l1').text('sh.helm.release.v1.web.v1  deployed').style('fill', 'var(--green)'); q('#m').text('revision 1: manifest + values stored in a Secret'); } },
     { c: '<code>helm upgrade web … --set replicaCount=5</code>: render again with new values, three-way-merge against the live objects, store <b>revision 2</b>. Revision 1 is kept as "superseded".', on(q){ q('#vals-l1').text('replicaCount: 5').style('fill', 'var(--accent)'); q('#d').text('Deployment ×5'); q('#rel-l1').text('sh.helm.release.v1.web.v1  superseded').style('fill', 'var(--muted)'); q('#rel-l2').text('sh.helm.release.v1.web.v2  deployed').style('fill', 'var(--green)'); q('#m').text('revision 2'); } },
-    { c: 'The upgrade turns out to be bad. <code>helm rollback web 1</code> re-applies revision 1\'s stored manifest — as a new <b>revision 3</b>, so history stays linear.', on(q){ q('#d').text('Deployment ×2'); q('#rel-l2').text('sh.helm.release.v1.web.v2  superseded').style('fill', 'var(--muted)'); q('#rel-l3').text('sh.helm.release.v1.web.v3  deployed (rollback to 1)').style('fill', 'var(--green)'); q('#m').text('rollback = re-apply an old Secret\'s manifest'); } },
+    { c: 'The upgrade turns out to be bad. <code>helm rollback web 1</code> re-applies revision 1\'s stored manifest — as a new <b>revision 3</b>, so history stays linear.', on(q){ q('#d').text('Deployment ×2'); q('#rel-l2').text('sh.helm.release.v1.web.v2  superseded').style('fill', 'var(--muted)'); q('#rel-l3').text('sh.helm.release.v1.web.v3  deployed ←v1').style('fill', 'var(--green)'); q('#m').text('rollback = re-apply an old Secret\'s manifest'); } },
     { c: '<code>helm uninstall web</code> deletes every object the release owns and (by default) its history Secrets. The chart in the repo and your values file are untouched — <code>helm install</code> again recreates it.', on(q){ q('#d,#s').add('hid'); q('#rel-l1,#rel-l2,#rel-l3').text('').style('fill', 'var(--faint)'); q('#rel-l0').text('(no release)'); q('#m').text('no server, no daemon: Helm is a client + Secrets'); } },
   ]});
 })();

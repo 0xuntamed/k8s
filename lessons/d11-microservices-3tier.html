@@ -86,7 +86,7 @@ Service     redis      ClusterIP → port 6379</code></pre>
 (function(){
   const S = Anim.S;
   let svg = S.icon('user', 40, 150, 'user', { label: 'browser' })
-    + S.box('ing', 100, 125, 90, 50, ['Ingress', 'shop.example.com'], { subfs: 8, subcls: 'muted', cls: 'cy' })
+    + S.box('ing', 100, 125, 90, 50, ['Ingress', 'shop.example.com'], { subfs: 9, subcls: 'muted', cls: 'cy' })
     + S.zone('t1', 215, 40, 150, 230, 'presentation')
     + S.box('fsvc', 230, 125, 120, 44, ['Service frontend', 'ClusterIP'], { subfs: 9, subcls: 'mono muted' })
     + S.pod('f1', 270, 205, 'web', { cls: 'ok', w: 44 }) + S.pod('f2', 325, 205, 'web', { cls: 'ok', w: 44 }) + S.pod('f3', 270, 245, 'web', { cls: 'ok', w: 44 })

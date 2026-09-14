@@ -140,6 +140,7 @@ generatorOptions:
 <div><h4>JSON 6902 patch</h4><p>Explicit operations (<code>add</code>, <code>remove</code>, <code>replace</code>, <code>move</code>, <code>test</code>) on JSON-pointer paths. Precise, works on CRDs whose list-merge keys kustomize does not know, can append to arrays (<code>/-</code>). Less readable.</p></div>
 </div>
 
+<div class="callout connect" data-ref="c06,c09"><p><code>kustomize edit set image</code> is the line a CI pipeline runs to <em>promote</em> a build: it rewrites <code>images:</code> in the overlay, CI commits the change, and a GitOps controller applies it — see the handoff in <a href="../cicd/c06-gitops-principles.html">C6</a>. Argo CD runs <code>kustomize build</code> for you on the server side (<a href="../cicd/c09-argocd-scale.html">C9</a>), so the overlay directory layout you are learning here is also your environment layout in GitOps.</p></div>
 <h2>Other useful features</h2>
 <dl class="kv">
 <dt>components</dt><dd>Reusable feature bundles (e.g. "add a sidecar", "enable TLS") that any overlay can include: <code>components: [../../components/tls]</code>.</dd>

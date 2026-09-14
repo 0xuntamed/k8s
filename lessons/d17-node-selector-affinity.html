@@ -145,7 +145,7 @@ $ kubectl delete pod ssd nowhere prefer-b $now</code></pre></div>
   const S = Anim.S;
   const nodes = [['worker-1', 'disktype=ssd · zone=a · arch=amd64'], ['worker-2', 'disktype=hdd · zone=a · arch=amd64'], ['worker-3', 'disktype=nvme · zone=b · arch=amd64'], ['worker-4', 'disktype=ssd · zone=b · arch=arm64']];
   let svg = S.term('rule', 20, 20, 300, 130, ['required:', '  disktype In [ssd, nvme]', '  arch NotIn [arm64]', 'preferred:', '  w=80  zone In [a]', '  w=20  disktype In [nvme]'], { fs: 10 });
-  nodes.forEach((n, i) => { const x = 350 + (i % 2) * 180, y = 20 + Math.floor(i / 2) * 75; svg += S.box(`n${i}`, x, y, 165, 60, [n[0], n[1]], { subfs: 8, subcls: 'mono muted', fs: 12 }) + S.text(`s${i}`, x + 82, y + 52, '', { cls: 'xs b acc' }); });
+  nodes.forEach((n, i) => { const x = 345 + (i % 2) * 185, y = 20 + Math.floor(i / 2) * 75; svg += S.box(`n${i}`, x, y, 178, 60, [n[0], n[1]], { subfs: 8.5, subcls: 'mono muted', fs: 12 }) + S.text(`s${i}`, x + 89, y + 52, '', { cls: 'xs b acc' }); });
   svg += S.pod('pod', 170, 210, 'db pod', { cls: 'ok', w: 70 }) + S.text('m', 360, 290, '', { cls: 'sm b' });
   Anim.define('affinity', { w: 720, h: 305, title: 'Node affinity: filter then score', ms: 3000, svg, steps: [
     { c: 'One Pod, four nodes. The Pod has a <b>required</b> rule (disktype ssd or nvme, not arm64) and two <b>preferred</b> rules with weights 80 and 20.', on(q){} },

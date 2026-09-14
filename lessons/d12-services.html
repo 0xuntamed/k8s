@@ -183,7 +183,7 @@ $ docker exec cka-control-plane iptables -t nat -L KUBE-SERVICES -n | grep -E 'w
   let s2 = S.node('nd', 20, 20, 680, 300, 'node-1 — network namespace of the host', {})
     + S.pod('cli', 90, 120, 'client', { cls: 'gray', w: 64, sub: '10.244.1.3' })
     + S.term('rules', 200, 60, 300, 130, ['iptables -t nat  (written by kube-proxy)', 'KUBE-SERVICES:', ' dst 10.96.0.42:80 → KUBE-SVC-API', 'KUBE-SVC-API:', ' statistic p=0.33 → SEP-1 (10.244.1.5)', ' statistic p=0.50 → SEP-2 (10.244.2.9)', '              → SEP-3 (10.244.2.10)'], { fs: 9.5 })
-    + S.box('ct', 200, 210, 300, 40, ['conntrack: 10.244.1.3:51234 → 10.96.0.42:80  ⇒  10.244.2.9:8080'], { fs: 9, lcls: 'mono', hidden: true })
+    + S.box('ct', 180, 210, 350, 40, ['conntrack: 10.244.1.3:51234 → 10.96.0.42:80  ⇒  10.244.2.9:8080'], { fs: 9, lcls: 'mono', hidden: true })
     + S.pod('e1', 580, 90, 'api', { cls: 'ok', sub: '10.244.1.5' }) + S.pod('e2', 580, 170, 'api', { cls: 'ok', sub: '10.244.2.9' }) + S.pod('e3', 580, 250, 'api', { cls: 'ok', sub: '10.244.2.10' })
     + S.dot('pk', 90, 100, { hidden: true, label: 'dst 10.96.0.42:80' })
     + S.arrow('a1', 125, 120, 198, 120, { cls: 'hid' }) + S.arrow('a2', 500, 150, 548, 170, { cls: 'hid' })

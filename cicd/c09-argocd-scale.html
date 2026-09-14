@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C9 · Argo CD at Scale: Helm & Kustomize Sources, App of Apps, ApplicationSets & Multi-Cluster · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c09" data-root="../" data-linux="l10" data-related="d10,d12,d20,d36,d37,d39,d42,d43,d49,d52,d56,c07,c08">
+<article class="lesson">
+<p class="lead">One Application deploying one overlay is the tutorial. Real platforms have forty services, three environments, a handful of clusters and a stack of infrastructure charts — and nobody wants to hand-write two hundred Application manifests. This page is the scaling toolkit: rendering Helm and Kustomize sources properly, bootstrapping everything from one root app, generating Applications from templates, managing many clusters from one hub, automating image updates, and rolling out progressively with Argo Rollouts.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Source types: directory, Kustomize, Helm (repo, OCI, values), multi-source, plugins — and how Argo CD renders each</li>
+<li>App of Apps: bootstrapping a cluster from one Application</li>
+<li>ApplicationSets: list, git, cluster, matrix and pull-request generators</li>
+<li>Multi-cluster: hub-and-spoke, cluster Secrets and labels, sharding</li>
+<li>Image updates: CI commits vs Argo CD Image Updater</li>
+<li>Progressive delivery with Argo Rollouts; notifications; performance settings</li>
+</ul></div>
+
+<h2>Sources: how Argo CD renders</h2>
+<p>The repo-server turns a <code>source</code> into plain manifests. What it runs depends on what it finds at <code>path</code> — and you can steer it.</p>
+<dl class="kv">
+<dt>Directory</dt><dd>Plain YAML/JSON. <code>directory: { recurse: true, include: "*.yaml", exclude: "test/*" }</code>. Multi-document files are fine.</dd>
+<dt>Kustomize</dt><dd>A <code>kustomization.yaml</code> at the path → <code>kustomize build</code>. Overrides without touching the repo: <code>kustomize: { images: ["ghcr.io/acme/api:9f2e1c3"], namePrefix: canary-, commonLabels: {…}, buildOptions: "--enable-helm" }</code>. This <code>images</code> field is exactly what CI's <code>kustomize edit set image</code> writes into the file — the file is the GitOps way, the field is the escape hatch (<a href="../lessons/d42-kustomize.html">Day 42</a>).</dd>
+<dt>Helm</dt><dd>A <code>Chart.yaml</code> at the path, or <code>chart:</code> + a Helm repo URL / OCI registry → <code>helm template</code>. <code>helm: { valueFiles: [values-prod.yaml], values: "replicaCount: 3", valuesObject: {…}, parameters: [{name: image.tag, value: 9f2e1c3}], releaseName: api, skipCrds: false }</code>. Helm hooks are translated into Argo CD hooks (<code>pre-install</code> → PreSync, <code>post-install</code> → PostSync). <strong>No Helm release exists</strong> in the cluster: Argo CD applies the rendered objects itself, so <code>helm list</code> is empty and rollback is Argo's or git's, not Helm's (<a href="../lessons/d43-helm.html">Day 43</a>).</dd>
+<dt>Multi-source</dt><dd><code>sources:</code> (plural): a chart from a public repo plus values from your config repo — the pattern for third-party charts.</dd>
+<dt>Plugins (CMP)</dt><dd>A sidecar on the repo-server that renders anything else (Jsonnet, cdk8s, SOPS-decrypting Helm) via a <code>ConfigManagementPlugin</code> spec.</dd>
+</dl>
+<pre><code class="lang-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: { name: ingress-nginx, namespace: argocd }
+spec:
+  project: platform
+  sources:
+  - repoURL: https://kubernetes.github.io/ingress-nginx     # the chart, from a Helm repo (or oci://…)
+    chart: ingress-nginx
+    targetRevision: 4.11.2
+    helm:
+      releaseName: ingress-nginx
+      valueFiles: [$values/infra/ingress-nginx/values-prod.yaml]   # $values → the ref below
+  - repoURL: https://github.com/acme/platform-config          # our values, from git
+    targetRevision: main
+    ref: values
+  destination: { server: https://kubernetes.default.svc, namespace: ingress-nginx }
+  syncPolicy: { automated: { prune: true, selfHeal: true }, syncOptions: [CreateNamespace=true, ServerSideApply=true] }</code></pre>
+<div class="callout connect" data-ref="d43,d42"><p>You used <code>helm install</code> on <a href="../lessons/d43-helm.html">Day 43</a> and <code>kubectl apply -k</code> on <a href="../lessons/d42-kustomize.html">Day 42</a>. Argo CD uses the same two tools — only the <em>template/build</em> half of them — and replaces the <em>apply</em> half with its own controller. Everything you know about values precedence, overlays and patches transfers unchanged; what changes is that <code>helm rollback</code> and release Secrets are gone, because git is the release history now.</p></div>
+
+<h2>App of Apps: bootstrapping</h2>
+<figure data-anim="app-of-apps"></figure>
+<p>Applications are resources; a directory of Application manifests can itself be the source of an Application. That <strong>root app</strong> is how a fresh cluster goes from "Argo CD installed" to "everything deployed" with one <code>kubectl apply</code>.</p>
+<div class="file-tree">platform-config/argocd/
+├── root.yaml                         # THE one manifest you apply by hand: an Application whose path is argocd/apps/
+├── projects/                         # AppProjects (C7), synced by root too
+│   └── shop.yaml
+└── apps/
+    ├── argocd.yaml                   # Argo CD manages itself (Helm chart + values in git)   wave -3
+    ├── cert-manager.yaml             #                                                       wave -2
+    ├── ingress-nginx.yaml            #                                                       wave -1
+    ├── monitoring.yaml               # kube-prometheus-stack (Day 56)                        wave -1
+    └── shop-apps.yaml                # an ApplicationSet for the team's services (below)     wave 0</div>
+<pre><code class="lang-yaml"># argocd/root.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: { name: root, namespace: argocd, finalizers: [resources-finalizer.argocd.argoproj.io] }
+spec:
+  project: default                              # root needs to create AppProjects and Applications in argocd
+  source: { repoURL: https://github.com/acme/platform-config, targetRevision: main, path: argocd, directory: { recurse: true } }
+  destination: { server: https://kubernetes.default.svc, namespace: argocd }
+  syncPolicy: { automated: { prune: true, selfHeal: true } }</code></pre>
+<pre><code class="lang-bash">$ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml   # day 0
+$ kubectl apply -f argocd/root.yaml                                                                          # day 0, step 2 — that's it
+$ argocd app list                    # root, argocd, cert-manager, ingress-nginx, monitoring, shop-* — all created by root</code></pre>
+<div class="callout warn"><p>Deleting the root app with its finalizer cascades to <em>every</em> child Application and, through their finalizers, to every workload. Protect it: <code>argocd.argoproj.io/sync-options: Prune=false</code> on child Applications you never want auto-removed, Argo CD RBAC that denies <code>delete</code> on <code>root</code>, and <code>preserveResourcesOnDeletion</code> on ApplicationSets.</p></div>
+
+<h2>ApplicationSets: generating Applications</h2>
+<figure data-anim="appset-fanout"></figure>
+<p>An <code>ApplicationSet</code> is a <strong>template</strong> plus <strong>generators</strong> that produce parameter sets; the controller creates one Application per set and keeps them in step — add a directory or a cluster and an app appears, remove it and the app goes.</p>
+<pre><code class="lang-yaml">apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata: { name: shop-apps, namespace: argocd }
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+  - matrix:
+      generators:
+      - git:                                               # one entry per app directory
+          repoURL: https://github.com/acme/platform-config
+          revision: main
+          directories: [{ path: "apps/*" }]
+      - clusters:                                          # one entry per registered cluster with this label
+          selector: { matchLabels: { env: prod } }
+  template:
+    metadata:
+      name: "{{.path.basename}}-{{.name}}"                 # api-prod-eu, api-prod-us, web-prod-eu…
+      labels: { team: shop }
+    spec:
+      project: shop
+      source:
+        repoURL: https://github.com/acme/platform-config
+        targetRevision: main
+        path: "{{.path.path}}/overlays/{{.metadata.labels.env}}"
+      destination: { server: "{{.server}}", namespace: "{{.path.basename}}" }
+      syncPolicy: { automated: { prune: true, selfHeal: true }, syncOptions: [CreateNamespace=true] }
+  syncPolicy:
+    preserveResourcesOnDeletion: true                      # removing an app from the set does not delete its workloads
+  strategy:
+    type: RollingSync                                      # progressive: sync by label group, wait for health
+    rollingSync:
+      steps:
+      - matchExpressions: [{ key: env, operator: In, values: [staging] }]
+      - matchExpressions: [{ key: env, operator: In, values: [prod] }]</code></pre>
+<div class="tbl-wrap"><table>
+<thead><tr><th>Generator</th><th>Produces one set per…</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>list</code></td><td>Literal element you write</td><td>A few environments with explicit values</td></tr>
+<tr><td><code>git</code> (directories / files)</td><td>Directory matching a glob, or a JSON/YAML config file found in the repo</td><td>"Every folder under <code>apps/</code> is an app"; per-app <code>config.json</code></td></tr>
+<tr><td><code>clusters</code></td><td>Registered cluster (Secret) matching a label selector</td><td>Deploy the same thing to every prod cluster</td></tr>
+<tr><td><code>matrix</code> / <code>merge</code></td><td>Cartesian product / join of two generators</td><td>apps × clusters; clusters enriched with per-cluster config</td></tr>
+<tr><td><code>pullRequest</code></td><td>Open PR on the app repo</td><td>Preview environment per PR: namespace <code>pr-123</code>, deleted on merge</td></tr>
+<tr><td><code>scmProvider</code></td><td>Repository in a GitHub/GitLab org</td><td>Every repo with a <code>deploy/</code> directory gets an app</td></tr>
+<tr><td><code>plugin</code></td><td>Whatever your HTTP plugin returns</td><td>An inventory system, a CMDB</td></tr>
+</tbody></table></div>
+<div class="callout connect" data-ref="d39,d40"><p>An ApplicationSet is a controller that creates other custom resources — the same layered-operator pattern as a Deployment creating ReplicaSets creating Pods (<a href="../lessons/d40-operators.html">Day 40</a>). The generated Applications are owned (<code>ownerReferences</code>) by the set; edit one by hand and the controller puts it back, exactly like editing a ReplicaSet under a Deployment.</p></div>
+
+<h2>Many clusters</h2>
+<div class="compare">
+<div><h4>Hub and spoke</h4><p>One Argo CD manages N clusters through stored credentials (<code>argocd cluster add</code>, C7). One UI, one RBAC, cluster generators. Costs: the hub must reach every API server; the hub's cluster Secrets are powerful; the hub is a single point of failure for deploys (not for running workloads).</p></div>
+<div><h4>Per-cluster Argo CD</h4><p>Each cluster runs its own instance pulling the same repo (often via an ApplicationSet whose cluster generator only matches "in-cluster"). No cross-cluster credentials, no hub reachability, survives hub loss. Costs: N UIs and N upgrades — mitigated by managing all instances from git.</p></div>
+</div>
+<pre><code class="lang-yaml"># a cluster Secret (what `argocd cluster add` creates); labels drive the cluster generator
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prod-eu
+  namespace: argocd
+  labels: { argocd.argoproj.io/secret-type: cluster, env: prod, region: eu }
+stringData:
+  name: prod-eu
+  server: https://prod-eu.k8s.acme.internal:6443
+  config: |
+    { "bearerToken": "…argocd-manager SA token…", "tlsClientConfig": { "insecure": false, "caData": "…" } }</code></pre>
+<div class="callout connect" data-ref="d36,d37,d32"><p>The <code>config</code> field is a kubeconfig in JSON (<a href="../lessons/d32-tls-part2-kubeconfig.html">Day 32</a>). <code>cluster add</code> binds <code>argocd-manager</code> to <code>cluster-admin</code> in the spoke — convenient and too much. For production, create the ServiceAccount yourself with a ClusterRole limited to the kinds your apps deploy (<a href="../lessons/d36-rbac.html">Day 36</a>), and rotate the token (<a href="../lessons/d37-service-accounts.html">Day 37</a>) — or use the cloud's IAM-based exec auth in <code>config.execProviderConfig</code>.</p></div>
+<pre><code class="lang-bash"># sharding: spread apps across controller replicas (each replica owns a subset of clusters)
+$ kubectl -n argocd scale sts/argocd-application-controller --replicas=3
+$ kubectl -n argocd patch cm argocd-cmd-params-cm -p '{"data":{"controller.sharding.algorithm":"round-robin","controller.status.processors":"50","controller.operation.processors":"25"}}'
+# repo-server: more replicas for render throughput; a webhook instead of 3-minute polling
+$ kubectl -n argocd scale deploy/argocd-repo-server --replicas=3
+$ kubectl -n argocd patch cm argocd-cm -p '{"data":{"timeout.reconciliation":"300s","resource.exclusions":"- apiGroups: [\"metrics.k8s.io\"]\n  kinds: [\"*\"]\n  clusters: [\"*\"]"}}'</code></pre>
+
+<h2>Getting new images in: three options</h2>
+<dl class="kv">
+<dt>CI commits the tag</dt><dd>The C6 handoff. Explicit, reviewed if you want, works with any renderer. The default answer.</dd>
+<dt>Argo CD Image Updater</dt><dd>A controller that polls the registry for tags matching a policy and writes the change — ideally <em>back to git</em> (<code>write-back-method: git</code>), producing the commit CI would have made. Configure with annotations on the Application: <code>argocd-image-updater.argoproj.io/image-list: api=ghcr.io/acme/api</code>, <code>…/api.update-strategy: semver</code> (or <code>digest</code>, <code>latest</code>, <code>name</code>), <code>…/api.allow-tags: regexp:^v[0-9]+</code>. Good for dev environments that should always run the newest build.</dd>
+<dt>Kustomize/Helm parameter override (<code>argocd</code> write-back)</dt><dd>The updater (or <code>argocd app set --kustomize-image</code>) patches the Application instead of git. Fast, but the repo no longer describes what runs — not GitOps. Avoid outside experiments.</dd>
+</dl>
+
+<h2>Progressive delivery: Argo Rollouts</h2>
+<figure data-anim="canary-rollout"></figure>
+<p>A Deployment's rolling update (<a href="../lessons/d10-replicasets-deployments.html">Day 10</a>) replaces Pods as fast as probes allow; it cannot send 10 % of users to the new version, watch error rates for ten minutes and back out. <strong>Argo Rollouts</strong> adds a <code>Rollout</code> CRD — a drop-in for Deployment with a <code>strategy</code> of <code>canary</code> or <code>blueGreen</code> steps — plus <code>AnalysisTemplate</code>s that query Prometheus (<a href="../lessons/d56-monitoring-logging.html">Day 56</a>) and traffic shaping through an Ingress, Gateway API or a mesh (<a href="../lessons/d49-ingress-part1.html">Days 49</a>–<a href="../lessons/d52-gateway-api-part1.html">52</a>).</p>
+<pre><code class="lang-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: api }
+spec:
+  replicas: 10
+  selector: { matchLabels: { app: api } }
+  template: { … same Pod template as the Deployment … }
+  strategy:
+    canary:
+      canaryService: api-canary            # Rollouts manages selectors on these two Services
+      stableService: api
+      trafficRouting:
+        nginx: { stableIngress: api }      # writes canary-weight annotations on a generated Ingress
+      steps:
+      - setWeight: 10
+      - pause: { duration: 5m }
+      - analysis: { templates: [{ templateName: error-rate }] }
+      - setWeight: 50
+      - pause: {}                          # manual promotion: kubectl argo rollouts promote api
+      - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata: { name: error-rate }
+spec:
+  metrics:
+  - name: 5xx-ratio
+    interval: 1m
+    count: 5
+    failureLimit: 1
+    successCondition: result[0] &lt; 0.01
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: sum(rate(http_requests_total{app="api",canary="true",code=~"5.."}[2m])) / sum(rate(http_requests_total{app="api",canary="true"}[2m]))</code></pre>
+<pre><code class="lang-bash">$ kubectl create ns argo-rollouts && kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+$ kubectl argo rollouts get rollout api -w          # the kubectl plugin: live view of steps, weights, analysis runs
+$ kubectl argo rollouts promote api                 # release a manual pause
+$ kubectl argo rollouts abort api                   # back to stable; Argo CD shows the Rollout as Degraded until the manifest is fixed</code></pre>
+<div class="callout connect" data-ref="d10,d12,d49,d56"><p>A Rollout is <a href="../lessons/d10-replicasets-deployments.html">Day 10</a> with the decisions externalised: it still manages ReplicaSets; the canary and stable Services (<a href="../lessons/d12-services.html">Day 12</a>) select Pods by a pod-template hash label; the Ingress controller (<a href="../lessons/d49-ingress-part1.html">Day 49</a>) does the weighted split; Prometheus (<a href="../lessons/d56-monitoring-logging.html">Day 56</a>) supplies the verdict. Argo CD knows Rollouts' health natively — <em>Suspended</em> while paused, <em>Degraded</em> when aborted — so the GitOps loop and the delivery loop compose. Flagger does the same job with a Deployment left in place.</p></div>
+
+<h2>Notifications</h2>
+<pre><code class="lang-yaml"># argocd-notifications-cm (excerpt) — triggers, templates, services
+data:
+  service.slack: |
+    token: $slack-token                       # from argocd-notifications-secret
+  trigger.on-health-degraded: |
+    - when: app.status.health.status == 'Degraded'
+      send: [app-degraded]
+  template.app-degraded: |
+    message: "🚨 {{.app.metadata.name}} is Degraded ({{.app.status.sync.revision | trunc 7}}) {{.context.argocdUrl}}/applications/{{.app.metadata.name}}"
+# subscribe an Application (or a whole AppProject) with an annotation:
+#   notifications.argoproj.io/subscribe.on-health-degraded.slack: shop-alerts</code></pre>
+<p>Built-in triggers cover sync succeeded/failed/running, health degraded, and deployment of a new revision; GitHub commit statuses are a service too, closing the loop back to the PR.</p>
+
+<div class="lab"><h3>Hands-on lab (40 min) — from one app to a generated fleet</h3>
+<ol class="steps">
+<li><strong>Kustomize layout</strong>: in your config repo make <code>apps/api/{base,overlays/dev,overlays/prod}</code> and <code>apps/web/…</code> (any two images, e.g. nginx and httpd). Commit.</li>
+<li><strong>Environments as a list</strong>: KIND has only the in-cluster destination and Argo CD keeps no Secret for it by default, so instead of a <code>clusters</code> generator use <code>list: { elements: [{env: dev}, {env: prod}] }</code> with <code>destination.server: https://kubernetes.default.svc</code>. (On a real fleet you would label cluster Secrets and swap the list for <code>clusters</code>.)</li>
+<li><strong>ApplicationSet</strong> with a <code>matrix</code> of <code>git directories: apps/*</code> × <code>list: [{env: dev}, {env: prod}]</code>, template path <code>{{.path.path}}/overlays/{{.env}}</code>, namespace <code>{{.path.basename}}-{{.env}}</code>. Apply; <code>argocd app list</code> shows four apps. Open the UI.</li>
+<li><strong>Grow the fleet</strong>: add <code>apps/worker/…</code>, commit — two more apps appear without touching Argo CD. Delete the directory — they disappear; with <code>preserveResourcesOnDeletion</code> the namespaces stay.</li>
+<li><strong>Helm multi-source</strong>: create the ingress-nginx Application above with your own <code>values.yaml</code> (set <code>controller.service.type: NodePort</code> for KIND). Confirm <code>helm list -A</code> is empty even though the chart is deployed.</li>
+<li><strong>App of Apps</strong>: move the ApplicationSet and the ingress-nginx Application into <code>argocd/apps/</code>, create <code>root.yaml</code>, delete the objects you applied by hand, apply only <code>root.yaml</code>. Everything comes back. Now delete your KIND cluster, create a new one, install Argo CD, apply root: your platform is rebuilt from git.</li>
+<li><strong>Optional — canary</strong>: install Argo Rollouts, convert <code>api</code>'s Deployment into a Rollout with <code>setWeight: 20 → pause: {}</code> (no traffic routing needed for a pause-only canary), commit a new tag, watch <code>kubectl argo rollouts get rollout api -w</code>, and note Argo CD's health as <em>Suspended</em> until you <code>promote</code>.</li>
+</ol></div>
+
+<details class="quiz"><summary>Your ApplicationSet uses a <code>clusters</code> generator with <code>matchLabels: {env: prod}</code>. You register a new prod cluster with <code>argocd cluster add</code> and nothing deploys there. Why?</summary><div><p>The cluster Secret has no <code>env: prod</code> label — <code>cluster add</code> does not know your labels. Add it (<code>kubectl -n argocd label secret cluster-… env=prod</code>) and the generator produces the new parameter sets on its next reconcile.</p></div></details>
+<details class="quiz"><summary>An app rendered from a Helm chart is perpetually OutOfSync on a Secret whose value changes every sync. What is happening?</summary><div><p>The chart generates a random value (<code>randAlphaNum</code>) when no value is supplied, so every <code>helm template</code> differs. Supply the value (from a sealed/external secret), or ignore the field with <code>ignoreDifferences</code> (<a href="c08-argocd-sync.html">C8</a>).</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Argo CD renders with <code>kustomize build</code>/<code>helm template</code> and applies the result itself — no Helm releases; values, overlays and multi-source combine third-party charts with your config.</li>
+<li>App of Apps: one root Application (with waves) bootstraps Argo CD itself, infrastructure and team apps from a directory of Applications.</li>
+<li>ApplicationSets stamp out Applications from generators (git, clusters, list, matrix, PRs); the set owns them like a Deployment owns ReplicaSets.</li>
+<li>Multi-cluster is a Secret per cluster (a kubeconfig) with labels; scope the spoke ServiceAccount, shard controllers, prefer webhooks to polling.</li>
+<li>New images arrive via CI commits (default) or Image Updater writing to git; avoid non-git write-back.</li>
+<li>Argo Rollouts turns Day 10's rolling update into canary/blue-green steps judged by Prometheus, with traffic split by your Ingress or Gateway; Argo CD understands its health.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- app-of-apps ---------- */
+  let svg = S.box('root', 15, 30, 170, 60, ['Application root', 'path: argocd/  (recurse)'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.term('dir', 15, 110, 170, 110, ['argocd/', ' projects/shop.yaml', ' apps/argocd.yaml     -3', ' apps/cert-manager    -2', ' apps/ingress-nginx   -1', ' apps/shop-apps        0'], { fs: 9.5 })
+    + S.zone('ns', 225, 15, 250, 255, 'namespace argocd  (Applications)')
+    + S.box('p', 240, 45, 220, 30, ['AppProject shop'], { fs: 10, cls: 'soft', hidden: true })
+    + S.box('c1', 240, 85, 220, 30, ['Application argocd  (self)'], { fs: 10, cls: 'soft', hidden: true })
+    + S.box('c2', 240, 125, 220, 30, ['Application cert-manager'], { fs: 10, cls: 'soft', hidden: true })
+    + S.box('c3', 240, 165, 220, 30, ['Application ingress-nginx'], { fs: 10, cls: 'soft', hidden: true })
+    + S.box('c4', 240, 205, 220, 30, ['ApplicationSet shop-apps'], { fs: 10, cls: 'soft', hidden: true })
+    + S.node('cl', 510, 15, 195, 255, 'cluster')
+    + S.pod('w1', 607, 70, 'argocd (helm)', { w: 120, h: 26, cls: 'dim' })
+    + S.pod('w2', 607, 110, 'cert-manager', { w: 120, h: 26, cls: 'dim' })
+    + S.pod('w3', 607, 150, 'ingress-nginx', { w: 120, h: 26, cls: 'dim' })
+    + S.pod('w4', 607, 190, 'api · web · worker', { w: 130, h: 26, cls: 'dim' })
+    + S.arrow('a0', 185, 60, 238, 60, { cls: 'hid', label: 'sync', ly: 50 })
+    + S.arrow('b1', 460, 100, 545, 70, { d: 'M 460 100 L 545 72', cls: 'hid' })
+    + S.arrow('b2', 460, 140, 545, 110, { d: 'M 460 140 L 545 112', cls: 'hid' })
+    + S.arrow('b3', 460, 180, 545, 150, { d: 'M 460 180 L 545 152', cls: 'hid' })
+    + S.arrow('b4', 460, 220, 540, 190, { d: 'M 460 220 L 540 192', cls: 'hid' })
+    + S.text('m', 360, 285, '', { cls: 'sm b' });
+  const W = (q, id, cls) => q('#' + id + ' rect').set(cls);
+  Anim.define('app-of-apps', { w: 720, h: 295, title: 'One Application to bootstrap them all', ms: 2500, svg, steps: [
+    { c: 'Day 0: Argo CD is installed and you apply exactly one manifest — <b>root</b>, an Application whose source is the <code>argocd/</code> directory of the config repo.', on(q){ q('#root rect').set('pur'); q('#m').text('kubectl apply -f argocd/root.yaml'); } },
+    { c: 'root syncs. Its "resources" are Applications and AppProjects — created in the <code>argocd</code> namespace like any other object, in <b>wave order</b> (annotations on each file).', on(q){ q('#a0').show().set('hl'); q('#p').show(); q('#c1,#c2,#c3,#c4').show(); q('#dir-l1').style('fill', 'var(--accent)'); q('#m').text('root: Synced — 5 children created'); } },
+    { c: 'Wave −3: the <b>argocd</b> Application manages Argo CD itself from a Helm chart + values in git. From now on, upgrading Argo CD is a version bump in a values file.', on(q){ W(q, 'c1', 'hl'); q('#b1').show().set('ok'); q('#w1 rect').set('ok'); q('#dir-l2').style('fill', 'var(--accent)'); q('#m').text('wave -3: Argo CD manages Argo CD'); } },
+    { c: 'Wave −2 and −1: cert-manager, then ingress-nginx (it needs cert-manager\'s CRDs first). Each child Application syncs its own source; root only waits for each child to be Healthy before the next wave.', on(q){ W(q, 'c1', 'ok'); W(q, 'c2', 'ok'); W(q, 'c3', 'ok'); q('#b2,#b3').show().set('ok'); q('#w2 rect,#w3 rect').set('ok'); q('#dir-l3,#dir-l4').style('fill', 'var(--accent)'); q('#m').text('infrastructure in dependency order'); } },
+    { c: 'Wave 0: the team\'s <b>ApplicationSet</b>, which in turn generates one Application per service. The whole platform came from git; nothing was clicked.', on(q){ W(q, 'c4', 'ok'); q('#b4').show().set('ok'); q('#w4 rect').set('ok'); q('#dir-l5').style('fill', 'var(--accent)'); q('#m').text('cluster rebuilt from one commit'); } },
+    { c: 'Danger, in the same picture: delete <b>root</b> with its finalizer and the cascade runs the other way — children, then every workload. Protect root with RBAC, and mark children you must keep with <code>Prune=false</code>.', on(q){ q('#root rect').set('bad'); q('#m').text('finalizer cascade: root → apps → workloads'); } },
+  ]});
+
+  /* ---------- appset-fanout ---------- */
+  svg = S.box('set', 15, 30, 200, 64, ['ApplicationSet shop-apps', 'generators × template'], { fs: 11, subfs: 9, subcls: 'muted', cls: 'pur' })
+    + S.term('g1', 15, 110, 200, 62, ['git directories apps/*', ' → api', ' → web'], { fs: 9.5 })
+    + S.term('g2', 15, 182, 200, 62, ['clusters env=prod', ' → prod-eu', ' → prod-us'], { fs: 9.5 })
+    + S.box('mx', 250, 130, 110, 44, ['matrix', '2 × 2 = 4'], { fs: 11, subfs: 9.5, subcls: 'mono muted' })
+    + S.box('t1', 400, 30, 150, 34, ['api-prod-eu'], { fs: 10.5, lcls: 'mono', hidden: true })
+    + S.box('t2', 400, 74, 150, 34, ['api-prod-us'], { fs: 10.5, lcls: 'mono', hidden: true })
+    + S.box('t3', 400, 118, 150, 34, ['web-prod-eu'], { fs: 10.5, lcls: 'mono', hidden: true })
+    + S.box('t4', 400, 162, 150, 34, ['web-prod-us'], { fs: 10.5, lcls: 'mono', hidden: true })
+    + S.box('t5', 400, 206, 150, 34, ['billing-prod-eu'], { fs: 10.5, lcls: 'mono', hidden: true })
+    + S.box('t6', 400, 250, 150, 34, ['billing-prod-us'], { fs: 10.5, lcls: 'mono', hidden: true })
+    + S.node('eu', 590, 30, 155, 110, 'prod-eu')
+    + S.node('us', 590, 160, 155, 110, 'prod-us')
+    + S.pod('e1', 667, 80, 'api', { w: 50, h: 24, cls: 'ok', hidden: true }) + S.pod('e2', 667, 112, 'web', { w: 50, h: 24, cls: 'ok', hidden: true }) + S.pod('e3', 725, 96, 'bill', { w: 40, h: 24, cls: 'ok', hidden: true })
+    + S.pod('u1', 667, 210, 'api', { w: 50, h: 24, cls: 'ok', hidden: true }) + S.pod('u2', 667, 242, 'web', { w: 50, h: 24, cls: 'ok', hidden: true }) + S.pod('u3', 725, 226, 'bill', { w: 40, h: 24, cls: 'ok', hidden: true })
+    + S.arrow('a1', 215, 140, 248, 148, { d: 'M 215 140 L 248 148', cls: 'hid' }) + S.arrow('a2', 215, 212, 248, 160, { d: 'M 215 212 L 248 160', cls: 'hid' })
+    + S.arrow('a3', 360, 152, 398, 152, { cls: 'hid', label: 'template', ly: 142 })
+    + S.text('m', 380, 295, '', { cls: 'sm b' });
+  Anim.define('appset-fanout', { w: 760, h: 305, title: 'Generators → parameters → Applications', ms: 2500, svg, steps: [
+    { c: 'Two generators: a <b>git</b> generator lists directories under <code>apps/</code>; a <b>clusters</b> generator lists registered clusters labelled <code>env=prod</code>.', on(q){ q('#g1 rect,#g2 rect').set('hl'); q('#m').text('params: {path: apps/api}, {path: apps/web} · {name: prod-eu}, {name: prod-us}'); } },
+    { c: 'A <b>matrix</b> combines them: every directory with every cluster — four parameter sets.', on(q){ q('#a1,#a2').show().set('hl'); q('#mx rect').set('hl'); q('#m').text('2 apps × 2 clusters = 4 parameter sets'); } },
+    { c: 'The <b>template</b> is rendered once per set: name, path (<code>{{.path.path}}/overlays/prod</code>), destination server. The controller creates the four Applications and owns them.', on(q){ q('#a3').show().set('hl'); q('#t1,#t2,#t3,#t4').show(); q('#t1 rect,#t2 rect,#t3 rect,#t4 rect').set('ok'); q('#m').text('4 Applications created (ownerReferences → the set)'); } },
+    { c: 'Each Application then does what C7/C8 described: render, diff, sync — to <em>its</em> cluster.', on(q){ q('#e1,#e2,#u1,#u2').show(); q('#eu rect,#us rect').set('ok'); q('#m').text('each app syncs to its own destination'); } },
+    { c: 'A team adds <code>apps/billing/</code> and commits. The git generator sees a new directory; two more parameter sets; two more Applications; two more deployments. Nobody edited Argo CD.', on(q){ q('#g1-l3').text(' → billing  (new)').style('fill', 'var(--green)'); q('#mx text:nth-of-type(2)').text('3 × 2 = 6'); q('#t5,#t6').show(); q('#t5 rect,#t6 rect').set('hl'); q('#e3,#u3').show(); q('#m').text('a directory is an app'); } },
+    { c: 'Remove the directory and the Applications are deleted. With <code>preserveResourcesOnDeletion</code> the workloads stay (safe); without it they are pruned. Editing a generated Application by hand is undone by the controller — like editing a ReplicaSet under a Deployment.', on(q){ q('#g1-l3').text('').style('fill', 'var(--faint)'); q('#mx text:nth-of-type(2)').text('2 × 2 = 4'); q('#t5 rect,#t6 rect').set('bad'); q('#t5,#t6').hide(); q('#e3 rect,#u3 rect').set('dim'); q('#m').text('the set owns its Applications'); } },
+  ]});
+
+  /* ---------- canary-rollout ---------- */
+  svg = S.box('ro', 15, 25, 210, 74, ['Rollout api', 'strategy: canary', 'step: —'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.term('steps', 15, 115, 210, 108, ['steps:', ' 1 setWeight 10', ' 2 pause 5m', ' 3 analysis error-rate', ' 4 setWeight 50 · pause', ' 5 setWeight 100'], { fs: 9.5 })
+    + S.box('ing', 265, 25, 200, 44, ['Ingress api (nginx)', 'canary-weight: 0'], { fs: 11, subfs: 9, subcls: 'mono muted', cls: 'cy' })
+    + S.bar('trf', 300, 92, 160, 14, { label: 'canary', v: 0, cls: 'pur' })
+    + S.box('stable', 265, 125, 95, 60, ['stable RS', 'v1 · 10 pods'], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'ok' })
+    + S.box('canary', 370, 125, 95, 60, ['canary RS', 'v2 · 0 pods'], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('an', 265, 200, 200, 40, ['AnalysisRun error-rate', 'idle'], { fs: 10.5, subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('prom', 505, 200, 130, 40, ['Prometheus', '5xx ratio'], { fs: 10.5, subfs: 9, subcls: 'mono muted' })
+    + S.box('argo', 505, 25, 240, 44, ['Argo CD health', 'Healthy'], { fs: 10.5, subfs: 11, subcls: 'b', cls: 'ok' })
+    + S.arrow('a1', 465, 220, 503, 220, { cls: 'hid dashed' })
+    + S.text('m', 380, 262, '', { cls: 'sm b' }) + S.text('m2', 380, 282, '', { cls: 'xs muted' });
+  const ST = (q, s) => q('#ro text:nth-of-type(3)').text('step: ' + s);
+  const WT = (q, w) => { q('#ing text:nth-of-type(2)').text('canary-weight: ' + w); q('#trf-fill').attr('width', 160 * w / 100); };
+  const H = (q, s, cls) => { q('#argo text:nth-of-type(2)').text(s); q('#argo rect').set(cls); };
+  Anim.define('canary-rollout', { w: 760, h: 295, title: 'A canary release, judged by metrics', ms: 2600, svg, steps: [
+    { c: 'Git changes the Rollout\'s image to v2 and Argo CD syncs it. Unlike a Deployment, the Rollout does not replace Pods — it follows its <b>steps</b>.', on(q){ q('#ro rect').set('hl'); ST(q, '1 setWeight 10'); H(q, 'Progressing', 'warn'); q('#m').text('Synced · Progressing'); } },
+    { c: 'Step 1: a canary ReplicaSet with one v2 Pod; the controller sets the Ingress canary weight to 10 % — one in ten requests hits v2, via the same Ingress-controller mechanism as Day 49.', on(q){ q('#canary rect').set('warn'); q('#canary text:nth-of-type(2)').text('v2 · 1 pod'); WT(q, 10); q('#steps-l1').style('fill', 'var(--accent)'); q('#m').text('10% of traffic → v2'); } },
+    { c: 'Step 2: pause five minutes. Step 3: an <b>AnalysisRun</b> queries Prometheus every minute for the canary\'s 5xx ratio. Argo CD reports the Rollout as Progressing throughout.', on(q){ ST(q, '3 analysis'); q('#an rect').set('hl'); q('#an text:nth-of-type(2)').text('running · 0.002 < 0.01 ✓'); q('#a1').show(); q('#prom rect').set('hl'); q('#steps-l2,#steps-l3').style('fill', 'var(--accent)'); q('#m').text('metrics decide, not humans'); } },
+    { c: 'Analysis passes → step 4: weight 50 %, five canary Pods, then an <b>indefinite pause</b>. A paused Rollout is <em>Suspended</em> in Argo CD — visible, not alarming. Someone runs <code>promote</code>.', on(q){ ST(q, '4 setWeight 50 · pause'); q('#an rect').set('ok'); q('#an text:nth-of-type(2)').text('Successful'); q('#canary text:nth-of-type(2)').text('v2 · 5 pods'); q('#stable text:nth-of-type(2)').text('v1 · 5 pods'); WT(q, 50); H(q, 'Suspended', 'warn'); q('#steps-l4').style('fill', 'var(--accent)'); q('#m').text('kubectl argo rollouts promote api'); } },
+    { c: 'Step 5: 100 %. The canary RS becomes the stable RS, v1 scales to zero, the weight annotation is removed. Healthy. The whole thing was one git commit plus one promote.', on(q){ ST(q, 'done'); q('#canary rect').set('ok'); q('#canary text:nth-of-type(2)').text('v2 · 10 pods ★'); q('#stable text:nth-of-type(2)').text('v1 · 0 pods'); q('#stable rect').set('dim'); WT(q, 0); H(q, 'Healthy', 'ok'); q('#steps-l5').style('fill', 'var(--accent)'); q('#m').text('promoted'); } },
+    { c: 'Rewind to step 3 with a bad v2: the 5xx ratio breaches <code>failureLimit</code>. The Rollout <b>aborts</b>: weight back to 0, canary scaled down, v1 untouched — 90 % of users never saw it. Argo CD shows Degraded until git is reverted or fixed.', on(q){ ST(q, 'aborted'); q('#an rect').set('bad'); q('#an text:nth-of-type(2)').text('Failed · 0.08 > 0.01'); q('#canary rect').set('bad'); q('#canary text:nth-of-type(2)').text('v2 · 0 pods'); q('#stable rect').set('ok'); q('#stable text:nth-of-type(2)').text('v1 · 10 pods'); WT(q, 0); H(q, 'Degraded', 'bad'); q('#m').text('abort: automatic, before most users noticed'); q('#m2').text('fix = git revert; Rollout resumes stable'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

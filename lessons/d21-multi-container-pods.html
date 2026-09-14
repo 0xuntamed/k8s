@@ -165,7 +165,7 @@ $ kubectl delete pod multi $now</code></pre></div>
   const S = Anim.S;
 
   let s1 = S.zone('pod', 20, 20, 680, 290, 'Pod api · 10.244.1.9 · node worker-2', { cls: 'hl' })
-    + S.box('pause', 300, 45, 120, 36, ['pause', 'owns net + ipc ns'], { subfs: 8, subcls: 'muted', cls: 'soft' })
+    + S.box('pause', 300, 45, 120, 36, ['pause', 'owns net + ipc ns'], { subfs: 9, subcls: 'muted', cls: 'soft' })
     + S.box('c1', 60, 110, 200, 120, ['container: app', 'rootfs: myapi:2.1', 'PID ns: own'], { subfs: 9, subcls: 'mono muted' })
     + S.box('c2', 460, 110, 200, 120, ['container: shipper', 'rootfs: fluent-bit', 'PID ns: own'], { subfs: 9, subcls: 'mono muted' })
     + S.box('vol', 285, 250, 150, 40, ['volume: logs (emptyDir)'], { fs: 10, cls: 'warn' })

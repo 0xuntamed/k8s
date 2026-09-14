@@ -148,12 +148,12 @@ $ kubectl delete ingress hosts; kubectl delete deploy web api; kubectl delete sv
 <script>
 (function(){
   const S = Anim.S;
-  let svg = S.icon('u1', 50, 80, 'user', { label: 'https://shop.example.com', ly: 28, lcls: 'mono' }) + S.icon('u2', 50, 220, 'user', { label: 'https://api.example.com', ly: 28, lcls: 'mono' })
-    + S.box('lb', 200, 120, 160, 70, ['load balancer / proxy', '203.0.113.7:443', 'SNI → cert · Host → rule'], { subfs: 8.5, subcls: 'mono muted', cls: 'pur' })
-    + S.term('certs', 200, 210, 160, 70, ['certificates', ' shop.example.com', ' api.example.com'], { fs: 8.5 })
+  let svg = S.icon('u1', 80, 80, 'user', { label: 'https://shop.example.com', ly: 28, lcls: 'mono' }) + S.icon('u2', 80, 220, 'user', { label: 'https://api.example.com', ly: 28, lcls: 'mono' })
+    + S.box('lb', 200, 120, 160, 70, ['load balancer / proxy', '203.0.113.7:443', 'SNI → cert · Host → rule'], { subfs: 9, subcls: 'mono muted', cls: 'pur' })
+    + S.term('certs', 200, 210, 160, 70, ['certificates', ' shop.example.com', ' api.example.com'], { fs: 9 })
     + S.box('web', 480, 60, 100, 44, ['svc web', ':80 http'], { subfs: 9, subcls: 'mono muted' }) + S.box('api', 480, 200, 100, 44, ['svc api', ':5678 http'], { subfs: 9, subcls: 'mono muted' })
     + S.box('dns', 200, 30, 160, 40, ['DNS: both hosts', '→ 203.0.113.7'], { subfs: 9, subcls: 'mono muted' })
-    + S.arrow('a1', 90, 90, 198, 140, { d: 'M 90 90 L 198 140', cls: 'hid', label: 'TLS ClientHello SNI=shop', lx: 120, ly: 120 }) + S.arrow('a2', 90, 210, 198, 170, { d: 'M 90 210 L 198 172', cls: 'hid', label: 'SNI=api', lx: 120, ly: 200 })
+    + S.arrow('a1', 110, 90, 198, 140, { d: 'M 110 90 L 198 140', cls: 'hid', label: 'TLS ClientHello SNI=shop', lx: 135, ly: 120 }) + S.arrow('a2', 110, 210, 198, 170, { d: 'M 110 210 L 198 172', cls: 'hid', label: 'SNI=api', lx: 130, ly: 200 })
     + S.arrow('a3', 360, 140, 478, 85, { d: 'M 360 140 L 478 85', cls: 'hid', label: 'HTTP + X-Forwarded-Proto: https', lx: 430, ly: 100 }) + S.arrow('a4', 360, 170, 478, 220, { d: 'M 360 170 L 478 220', cls: 'hid' })
     + S.text('m', 360, 300, '', { cls: 'sm b' });
   Anim.define('tls-ingress', { w: 720, h: 315, title: 'SNI + TLS termination + host routing', ms: 2800, svg, steps: [
